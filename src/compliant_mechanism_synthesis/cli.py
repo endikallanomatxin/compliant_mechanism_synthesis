@@ -41,6 +41,7 @@ class TrainConfig:
     train_model_candidates: int = 2
     train_random_candidates: int = 6
     train_sample_steps: int = 6
+    log_every_steps: int = 5
     log_dir: str = "runs/prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
     seed: int = 7
@@ -83,6 +84,10 @@ def _timestamped_run_dir(log_dir: str) -> Path:
     return base.parent / f"{timestamp}-{base.name}"
 
 
+def _progress(message: str) -> None:
+    print(message, flush=True)
+
+
 def candidate_scores(
     designs: torch.Tensor, target_props: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
@@ -100,6 +105,12 @@ def candidate_scores(
 def train(config: TrainConfig) -> tuple[Path, Path]:
     _seed_everything(config.seed)
     device = _device()
+    _progress(
+        "train:start "
+        f"device={device} epochs={config.epochs} dataset_size={config.dataset_size} "
+        f"batch_size={config.batch_size} model_candidates={config.train_model_candidates} "
+        f"random_candidates={config.train_random_candidates}"
+    )
 
     designs = generate_dataset(config.dataset_size, config.grid_size, config.seed)
     targets = mechanical_terms(threshold_occupancy(designs))["properties"]
@@ -126,6 +137,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
     for epoch in range(config.epochs):
         model.train()
+        _progress(f"train:epoch_start epoch={epoch + 1}/{config.epochs}")
         epoch_totals = {
             "total": 0.0,
             "recon": 0.0,
@@ -138,7 +150,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             "model_elite_fraction": 0.0,
         }
 
-        for (target_props,) in loader:
+        for batch_idx, (target_props,) in enumerate(loader, start=1):
             target_props = target_props.to(device)
 
             with torch.no_grad():
@@ -215,9 +227,30 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             global_step += 1
 
+            if config.log_every_steps > 0 and (
+                batch_idx % config.log_every_steps == 0 or batch_idx == len(loader)
+            ):
+                _progress(
+                    "train:step "
+                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx}/{len(loader)} "
+                    f"global_step={global_step} total={total.item():.4f} "
+                    f"recon={recon.item():.4f} prop_err={property_error_mean.item():.4f} "
+                    f"elite={elite_scores.mean().item():.4f} model_elites={model_elite_fraction:.2f}"
+                )
+
         num_batches = max(len(loader), 1)
         for name, value in epoch_totals.items():
             writer.add_scalar(f"epoch/{name}", value / num_batches, epoch)
+
+        _progress(
+            "train:epoch_end "
+            f"epoch={epoch + 1}/{config.epochs} "
+            f"total={epoch_totals['total'] / num_batches:.4f} "
+            f"recon={epoch_totals['recon'] / num_batches:.4f} "
+            f"prop_err={epoch_totals['property_error'] / num_batches:.4f} "
+            f"elite={epoch_totals['elite_score'] / num_batches:.4f} "
+            f"model_elites={epoch_totals['model_elite_fraction'] / num_batches:.2f}"
+        )
 
         model.eval()
         with torch.no_grad():
@@ -267,6 +300,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     }
     torch.save(payload, checkpoint_path)
     writer.close()
+    _progress(f"train:done checkpoint={checkpoint_path} log_dir={log_dir}")
     return checkpoint_path, log_dir
 
 
@@ -426,11 +460,12 @@ def local_search_refine(
     reference_probs: torch.Tensor,
     iterations: int,
     proposal_count: int,
+    log_every: int = 0,
 ) -> torch.Tensor:
     current = initial_design.clone()
     current_score = candidate_score(current, target_props)
 
-    for _ in range(iterations):
+    for iteration in range(iterations):
         best_candidate = None
         best_score = current_score
         for row, col in _proposal_coordinates(current, reference_probs, proposal_count):
@@ -443,10 +478,23 @@ def local_search_refine(
                 best_candidate = candidate
 
         if best_candidate is None:
+            if log_every > 0:
+                _progress(
+                    "sample:local_search_stop "
+                    f"iteration={iteration + 1}/{iterations} score={current_score:.4f}"
+                )
             break
 
         current = best_candidate
         current_score = best_score
+
+        if log_every > 0 and (
+            (iteration + 1) % log_every == 0 or iteration + 1 == iterations
+        ):
+            _progress(
+                "sample:local_search "
+                f"iteration={iteration + 1}/{iterations} score={current_score:.4f}"
+            )
 
     return current
 
@@ -461,8 +509,14 @@ def sample(
     random_candidates: int,
     search_iterations: int,
     proposal_count: int,
+    log_every_steps: int,
 ) -> dict[str, object]:
     device = _device()
+    _progress(
+        "sample:start "
+        f"target={target_props} steps={steps} model_candidates={model_candidates} "
+        f"random_candidates={random_candidates} search_iterations={search_iterations}"
+    )
     payload = torch.load(checkpoint_path, map_location=device)
     config = TrainConfig(**payload["config"])
     _seed_everything(config.seed)
@@ -487,6 +541,10 @@ def sample(
             random_candidates=random_candidates,
             steps=steps,
         )
+    _progress(
+        "sample:elite "
+        f"source={elite_search['sources'][0]} score={elite_search['scores'][0].item():.4f}"
+    )
 
     design = local_search_refine(
         elite_search["designs"],
@@ -494,6 +552,7 @@ def sample(
         elite_search["reference_probs"],
         iterations=search_iterations,
         proposal_count=proposal_count,
+        log_every=log_every_steps,
     )
     with torch.no_grad():
         terms = mechanical_terms(design)
@@ -525,6 +584,12 @@ def sample(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(result, output)
+    _progress(
+        "sample:done "
+        f"source={result['source']} kx={terms['properties'][0, 0].item():.3f} "
+        f"ky={terms['properties'][0, 1].item():.3f} "
+        f"ktheta={terms['properties'][0, 2].item():.3f} log_dir={log_path}"
+    )
     return result
 
 
@@ -548,6 +613,7 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-model-candidates", type=int, default=2)
     parser.add_argument("--train-random-candidates", type=int, default=6)
     parser.add_argument("--train-sample-steps", type=int, default=6)
+    parser.add_argument("--log-every-steps", type=int, default=5)
     parser.add_argument("--log-dir", default="runs/prototype")
     parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
     parser.add_argument("--seed", type=int, default=7)
@@ -567,6 +633,7 @@ def _sample_parser() -> argparse.ArgumentParser:
     parser.add_argument("--random-candidates", type=int, default=10)
     parser.add_argument("--search-iterations", type=int, default=10)
     parser.add_argument("--proposal-count", type=int, default=12)
+    parser.add_argument("--log-every-steps", type=int, default=2)
     parser.add_argument("--log-dir", default="runs/sample")
     parser.add_argument("--output-path", default="artifacts/sample.pt")
     return parser
@@ -591,6 +658,7 @@ def sample_main() -> None:
         random_candidates=args.random_candidates,
         search_iterations=args.search_iterations,
         proposal_count=args.proposal_count,
+        log_every_steps=args.log_every_steps,
     )
     print(f"log_dir={result['log_dir']}")
     properties = result["properties"][0].tolist()

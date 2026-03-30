@@ -91,7 +91,7 @@ uv sync
 ```bash
 uv run cms-train --epochs 8 --dataset-size 256 --batch-size 16 \
   --train-model-candidates 2 --train-random-candidates 6 \
-  --train-sample-steps 6 --log-dir runs/prototype
+  --train-sample-steps 6 --log-every-steps 5 --log-dir runs/prototype
 ```
 
 This training loop now also includes a binarization penalty so the continuous
@@ -104,8 +104,12 @@ to define which stiffness triplets the search loop practices against.
 
 ```bash
 uv run cms-sample --checkpoint-path artifacts/prototype.pt \
-  --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18
+  --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18 \
+  --log-every-steps 2
 ```
+
+Both commands print periodic progress to stdout so long searches are visible
+while they run.
 
 ## TensorBoard
 
@@ -130,7 +134,8 @@ If you want faster sampling, reduce the search budget:
 uv run cms-sample --checkpoint-path artifacts/prototype.pt \
   --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18 \
   --model-candidates 2 --random-candidates 6 \
-  --search-iterations 6 --proposal-count 8
+  --search-iterations 6 --proposal-count 8 \
+  --log-every-steps 2
 ```
 
 ## Verified Commands
@@ -148,7 +153,7 @@ Run a verified training pass:
 ```bash
 uv run cms-train --epochs 3 --dataset-size 96 --batch-size 8 \
   --train-model-candidates 2 --train-random-candidates 4 \
-  --train-sample-steps 4 \
+  --train-sample-steps 4 --log-every-steps 2 \
   --log-dir runs/fem-verify-train \
   --checkpoint-path artifacts/fem-verify.pt
 ```
@@ -159,7 +164,7 @@ Run a verified sampling pass:
 uv run cms-sample --checkpoint-path artifacts/fem-verify.pt \
   --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18 \
   --model-candidates 2 --random-candidates 6 \
-  --search-iterations 6 --proposal-count 8 \
+  --search-iterations 6 --proposal-count 8 --log-every-steps 2 \
   --log-dir runs/fem-verify-sample \
   --output-path artifacts/fem-verify-sample.pt
 ```
