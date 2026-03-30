@@ -1,0 +1,25 @@
+[project]
+name = "compliant-mechanism-synthesis"
+version = "0.1.0"
+description = "First prototype for compliant mechanism synthesis"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "tensorboard>=2.16",
+  "torch>=2.3",
+]
+
+[project.scripts]
+cms-train = "compliant_mechanism_synthesis.cli:train_main"
+cms-sample = "compliant_mechanism_synthesis.cli:sample_main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

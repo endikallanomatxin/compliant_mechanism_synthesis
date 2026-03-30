@@ -1,0 +1,17 @@
+## Project Notes
+
+- Use `uv` for all Python environment and run commands.
+- Keep Python code under `src/compliant_mechanism_synthesis/`.
+- Use TensorBoard for training and sampling logs. Default log directory: `runs/`.
+- Preferred entrypoints:
+  - `uv run cms-train ...`
+  - `uv run cms-sample ...`
+- The current prototype is intentionally lightweight and CPU-friendly.
+- When extending the project, prefer small incremental changes over broad rewrites.
+
+## Prototype Scope
+
+- Binary 2D topology grid with fixed bottom plate and movable top plate.
+- Patch-based transformer denoiser conditioned on target `k_x`, `k_y`, `k_theta`.
+- Differentiable surrogate mechanics model instead of full FEA for the first prototype.
+- Training logs and sample images are written to TensorBoard.

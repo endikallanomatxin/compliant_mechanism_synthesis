@@ -1,3 +1,13 @@
+Metadata-Version: 2.4
+Name: compliant-mechanism-synthesis
+Version: 0.1.0
+Summary: First prototype for compliant mechanism synthesis
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.26
+Requires-Dist: tensorboard>=2.16
+Requires-Dist: torch>=2.3
+
 # Compliant mechanism synthesis
 
 Objective: Synthesize compliant mechanisms that achieve:
@@ -63,7 +73,7 @@ uv run cms-train --epochs 8 --dataset-size 512 --log-dir runs/prototype
 
 ```bash
 uv run cms-sample --checkpoint-path artifacts/prototype.pt \
-  --target-kx 0.55 --target-ky 0.60 --target-ktheta 0.18
+  --target-kx 0.45 --target-ky 0.70 --target-ktheta 0.35
 ```
 
 ## TensorBoard
@@ -74,41 +84,3 @@ uv run tensorboard --logdir runs
 
 Artifacts are written under `artifacts/` and logs under `runs/`.
 
-## Verified Commands
-
-These are the exact commands used to verify the first end-to-end prototype in this repository.
-
-Install dependencies:
-
-```bash
-uv sync
-```
-
-Run a verified training pass:
-
-```bash
-uv run cms-train --epochs 4 --dataset-size 256 --batch-size 16 \
-  --log-dir runs/verify-train-mass \
-  --checkpoint-path artifacts/verify-mass.pt
-```
-
-Run a verified sampling pass:
-
-```bash
-uv run cms-sample --checkpoint-path artifacts/verify-mass.pt \
-  --target-kx 0.55 --target-ky 0.60 --target-ktheta 0.18 \
-  --log-dir runs/verify-sample-mass \
-  --output-path artifacts/verify-sample-mass.pt
-```
-
-Open TensorBoard for all runs:
-
-```bash
-uv run tensorboard --logdir runs
-```
-
-The verified sampling run produced:
-
-```text
-achieved_properties=kx:0.562,ky:0.589,ktheta:0.202
-```
