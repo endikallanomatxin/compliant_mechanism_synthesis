@@ -34,18 +34,19 @@ to the loss.
 ## Prototype implemented here
 
 This repository now includes a first runnable prototype built around the same
-core idea, but with a lightweight differentiable surrogate instead of full FEA.
+core idea, using a lightweight spring-network FEM evaluator instead of the
+earlier heuristic mechanics surrogate.
 
 What the prototype does:
 
-- Generates connected binary 2D designs on a square grid.
-- Computes surrogate `k_x`, `k_y`, and `k_theta` values from the topology.
+- Generates connected binary 2D designs on a larger square grid.
+- Computes FEM-based `k_x`, `k_y`, and `k_theta` values from the topology.
 - Trains a patch-based transformer denoiser conditioned on target properties.
 - Logs losses and generated samples to TensorBoard.
-- Samples a design for a requested target triple.
+- Samples a design for a requested target triple using FEM scoring and local search.
 
 This is meant to validate the end-to-end workflow before investing in a more
-physical solver and a more faithful diffusion process.
+physical continuum solver and a more faithful diffusion process.
 
 ## Setup
 
@@ -56,14 +57,14 @@ uv sync
 ## Train
 
 ```bash
-uv run cms-train --epochs 8 --dataset-size 512 --log-dir runs/prototype
+uv run cms-train --epochs 8 --dataset-size 256 --batch-size 16 --log-dir runs/prototype
 ```
 
 ## Sample
 
 ```bash
 uv run cms-sample --checkpoint-path artifacts/prototype.pt \
-  --target-kx 0.55 --target-ky 0.60 --target-ktheta 0.18
+  --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18
 ```
 
 ## TensorBoard
@@ -73,6 +74,22 @@ uv run tensorboard --logdir runs
 ```
 
 Artifacts are written under `artifacts/` and logs under `runs/`.
+Each training or sampling run automatically creates a timestamped directory like
+`runs/20260330-154500-prototype`, so runs stay ordered lexicographically.
+
+## Sampling Budget
+
+The sampler now uses a bounded FEM-guided search by default so it does not sit
+for a long time looking stuck.
+
+If you want faster sampling, reduce the search budget:
+
+```bash
+uv run cms-sample --checkpoint-path artifacts/prototype.pt \
+  --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18 \
+  --model-candidates 2 --random-candidates 6 \
+  --search-iterations 6 --proposal-count 8
+```
 
 ## Verified Commands
 
@@ -87,18 +104,20 @@ uv sync
 Run a verified training pass:
 
 ```bash
-uv run cms-train --epochs 4 --dataset-size 256 --batch-size 16 \
-  --log-dir runs/verify-train-mass \
-  --checkpoint-path artifacts/verify-mass.pt
+uv run cms-train --epochs 3 --dataset-size 96 --batch-size 8 \
+  --log-dir runs/fem-verify-train \
+  --checkpoint-path artifacts/fem-verify.pt
 ```
 
 Run a verified sampling pass:
 
 ```bash
-uv run cms-sample --checkpoint-path artifacts/verify-mass.pt \
-  --target-kx 0.55 --target-ky 0.60 --target-ktheta 0.18 \
-  --log-dir runs/verify-sample-mass \
-  --output-path artifacts/verify-sample-mass.pt
+uv run cms-sample --checkpoint-path artifacts/fem-verify.pt \
+  --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18 \
+  --model-candidates 3 --random-candidates 10 \
+  --search-iterations 10 --proposal-count 12 \
+  --log-dir runs/fem-verify-sample \
+  --output-path artifacts/fem-verify-sample.pt
 ```
 
 Open TensorBoard for all runs:
@@ -110,5 +129,5 @@ uv run tensorboard --logdir runs
 The verified sampling run produced:
 
 ```text
-achieved_properties=kx:0.562,ky:0.589,ktheta:0.202
+achieved_properties=kx:0.135,ky:0.254,ktheta:0.191
 ```

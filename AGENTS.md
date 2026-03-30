@@ -13,5 +13,5 @@
 
 - Binary 2D topology grid with fixed bottom plate and movable top plate.
 - Patch-based transformer denoiser conditioned on target `k_x`, `k_y`, `k_theta`.
-- Differentiable surrogate mechanics model instead of full FEA for the first prototype.
+- Spring-network FEM evaluator for topology stiffness instead of the earlier heuristic surrogate.
 - Training logs and sample images are written to TensorBoard.

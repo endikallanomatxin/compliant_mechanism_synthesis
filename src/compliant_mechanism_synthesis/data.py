@@ -25,7 +25,7 @@ def _draw_segment(
 
 
 def _random_polyline(grid_size: int) -> list[tuple[int, int]]:
-    n_midpoints = random.randint(1, 3)
+    n_midpoints = random.randint(2, max(2, min(5, grid_size // 4)))
     interior_rows = sorted(
         random.sample(range(2, grid_size - 2), k=n_midpoints), reverse=True
     )
@@ -36,7 +36,7 @@ def _random_polyline(grid_size: int) -> list[tuple[int, int]]:
 
 
 def generate_design(
-    grid_size: int, min_paths: int = 1, max_paths: int = 3
+    grid_size: int, min_paths: int = 2, max_paths: int = 5
 ) -> torch.Tensor:
     grid = torch.zeros((grid_size, grid_size), dtype=torch.float32)
 
@@ -61,6 +61,11 @@ def generate_design(
                 (1.0 - grid)[None, None], kernel_size=3, stride=1, padding=1
             )[0, 0]
         )
+
+    if random.random() < 0.35:
+        branch_row = random.randrange(1, grid_size - 1)
+        branch_col = random.randrange(grid_size)
+        _draw_segment(grid, (branch_row, branch_col), (0, random.randrange(grid_size)))
 
     # The plates are always present in this first prototype.
     grid[0, :] = 1.0
