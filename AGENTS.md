@@ -15,4 +15,5 @@
 - Patch-based transformer denoiser conditioned on target `k_x`, `k_y`, `k_theta`.
 - Spring-network FEM evaluator for topology stiffness instead of the earlier heuristic surrogate.
 - Occupancy values in `[0, 1]` are an internal relaxed representation; all official mechanical evaluation uses a hard threshold at `0.5`.
+- Training uses search-and-imitation: sample candidates, evaluate them with FEM, keep elites, and train the denoiser on those elites.
 - Training logs and sample images are written to TensorBoard.

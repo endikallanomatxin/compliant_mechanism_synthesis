@@ -42,7 +42,7 @@ What the prototype does:
 - Generates connected binary 2D designs on a larger square grid.
 - Represents occupancies internally in continuous `[0, 1]` space during denoising.
 - Computes FEM-based `k_x`, `k_y`, and `k_theta` values from the topology.
-- Trains a patch-based transformer denoiser conditioned on target properties.
+- Trains a patch-based transformer denoiser with an elite-search training loop conditioned on target properties.
 - Logs losses and generated samples to TensorBoard.
 - Samples a design for a requested target triple using FEM scoring and local search.
 
@@ -62,6 +62,24 @@ This lets the model reason in a smooth space internally while still forcing a
 clear binary decision whenever we ask the mechanics model for `k_x`, `k_y`, and
 `k_theta`.
 
+## Training Loop
+
+The current training loop is closer to policy improvement than plain supervised
+reconstruction.
+
+For each batch of target properties:
+
+- Sample candidate designs from the current model.
+- Sample additional random structural candidates for exploration.
+- Threshold every candidate at `0.5`.
+- Evaluate all candidates with the spring-network FEM.
+- Keep the best candidate per target as an elite.
+- Train the denoiser to reconstruct those elites from noisy continuous inputs.
+
+This means exploration comes from both the model sampler and the random
+candidate pool, while learning happens by imitating the best FEM-scored designs
+found so far.
+
 ## Setup
 
 ```bash
@@ -71,11 +89,16 @@ uv sync
 ## Train
 
 ```bash
-uv run cms-train --epochs 8 --dataset-size 256 --batch-size 16 --log-dir runs/prototype
+uv run cms-train --epochs 8 --dataset-size 256 --batch-size 16 \
+  --train-model-candidates 2 --train-random-candidates 6 \
+  --train-sample-steps 6 --log-dir runs/prototype
 ```
 
 This training loop now also includes a binarization penalty so the continuous
 occupancies are pushed away from ambiguous gray values.
+
+The `dataset-size` here is the size of the synthetic target-property pool used
+to define which stiffness triplets the search loop practices against.
 
 ## Sample
 
@@ -124,6 +147,8 @@ Run a verified training pass:
 
 ```bash
 uv run cms-train --epochs 3 --dataset-size 96 --batch-size 8 \
+  --train-model-candidates 2 --train-random-candidates 4 \
+  --train-sample-steps 4 \
   --log-dir runs/fem-verify-train \
   --checkpoint-path artifacts/fem-verify.pt
 ```
@@ -133,8 +158,8 @@ Run a verified sampling pass:
 ```bash
 uv run cms-sample --checkpoint-path artifacts/fem-verify.pt \
   --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18 \
-  --model-candidates 3 --random-candidates 10 \
-  --search-iterations 10 --proposal-count 12 \
+  --model-candidates 2 --random-candidates 6 \
+  --search-iterations 6 --proposal-count 8 \
   --log-dir runs/fem-verify-sample \
   --output-path artifacts/fem-verify-sample.pt
 ```
@@ -148,5 +173,9 @@ uv run tensorboard --logdir runs
 The verified sampling run produced:
 
 ```text
-achieved_properties=kx:0.135,ky:0.254,ktheta:0.191
+achieved_properties depends on the current checkpoint and search budget.
 ```
+
+The current prototype validates the search-and-imitation loop end to end, but
+it is still mechanically weak. Better targets usually require either more
+training epochs, a larger target pool, or a larger search budget.
