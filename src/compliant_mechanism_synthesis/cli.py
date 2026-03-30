@@ -15,7 +15,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.data import generate_dataset, generate_design
 from compliant_mechanism_synthesis.mechanics import (
+    binarization_penalty,
     mechanical_terms,
+    threshold_occupancy,
     topology_regularizers,
 )
 from compliant_mechanism_synthesis.model import ConditionedDenoiser
@@ -35,6 +37,7 @@ class TrainConfig:
     surface_weight: float = 0.05
     connectivity_weight: float = 0.2
     mass_weight: float = 0.15
+    binarization_weight: float = 0.1
     log_dir: str = "runs/prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
     seed: int = 7
@@ -82,7 +85,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     device = _device()
 
     designs = generate_dataset(config.dataset_size, config.grid_size, config.seed)
-    targets = mechanical_terms(designs)["properties"]
+    targets = mechanical_terms(threshold_occupancy(designs))["properties"]
     dataset = TensorDataset(designs, targets)
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
@@ -112,6 +115,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             "surface": 0.0,
             "connectivity": 0.0,
             "mass": 0.0,
+            "binarization": 0.0,
         }
 
         for clean_grids, target_props in loader:
@@ -128,11 +132,13 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             surface = regularizers["surface"].mean()
             connectivity = regularizers["connectivity_penalty"].mean()
             mass = regularizers["occupancy_mass"].mean()
+            binarization = binarization_penalty(probs).mean()
             total = (
                 recon
                 + config.surface_weight * surface
                 + config.connectivity_weight * connectivity
                 + config.mass_weight * mass
+                + config.binarization_weight * binarization
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -144,6 +150,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             epoch_totals["surface"] += surface.item()
             epoch_totals["connectivity"] += connectivity.item()
             epoch_totals["mass"] += mass.item()
+            epoch_totals["binarization"] += binarization.item()
 
             writer.add_scalar("train/total_loss", total.item(), global_step)
             writer.add_scalar("train/reconstruction_loss", recon.item(), global_step)
@@ -152,6 +159,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 "train/connectivity_penalty", connectivity.item(), global_step
             )
             writer.add_scalar("train/occupancy_mass", mass.item(), global_step)
+            writer.add_scalar(
+                "train/binarization_penalty", binarization.item(), global_step
+            )
             global_step += 1
 
         num_batches = max(len(loader), 1)
@@ -166,7 +176,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 device=device,
             )
             sample = sample_from_model(model, preview_targets, preview_noise, steps=8)
-            preview_binary = _force_plates((sample > 0.5).float())
+            preview_binary = _force_plates(threshold_occupancy(sample))
             preview_terms = mechanical_terms(preview_binary)
             property_error = F.mse_loss(preview_terms["properties"], preview_targets)
             _write_samples(writer, "samples/generated", preview_binary.cpu(), epoch)
@@ -214,20 +224,8 @@ def sample_from_model(
     return _force_plates(current)
 
 
-def binarize_design(probs: torch.Tensor, target_props: torch.Tensor) -> torch.Tensor:
-    best_design = None
-    best_error = None
-    for threshold in torch.linspace(0.3, 0.8, steps=11, device=probs.device):
-        candidate = _force_plates((probs > threshold).float())
-        score = candidate_score(candidate, target_props)
-        if best_error is None or score < best_error:
-            best_error = score
-            best_design = candidate
-
-    if best_design is None:
-        raise RuntimeError("failed to binarize sample")
-
-    return best_design
+def binarize_design(probs: torch.Tensor) -> torch.Tensor:
+    return _force_plates(threshold_occupancy(probs))
 
 
 def candidate_score(design: torch.Tensor, target_props: torch.Tensor) -> float:
@@ -362,7 +360,7 @@ def sample(
     binary_candidates = []
     refined_images = []
     for candidate_probs in initial_candidates:
-        binary = binarize_design(candidate_probs, target)
+        binary = binarize_design(candidate_probs)
         refined = local_search_refine(
             binary,
             target,
@@ -425,6 +423,7 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--surface-weight", type=float, default=0.05)
     parser.add_argument("--connectivity-weight", type=float, default=0.2)
     parser.add_argument("--mass-weight", type=float, default=0.15)
+    parser.add_argument("--binarization-weight", type=float, default=0.1)
     parser.add_argument("--log-dir", default="runs/prototype")
     parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
     parser.add_argument("--seed", type=int, default=7)

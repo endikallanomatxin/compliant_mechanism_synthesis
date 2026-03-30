@@ -40,6 +40,7 @@ earlier heuristic mechanics surrogate.
 What the prototype does:
 
 - Generates connected binary 2D designs on a larger square grid.
+- Represents occupancies internally in continuous `[0, 1]` space during denoising.
 - Computes FEM-based `k_x`, `k_y`, and `k_theta` values from the topology.
 - Trains a patch-based transformer denoiser conditioned on target properties.
 - Logs losses and generated samples to TensorBoard.
@@ -47,6 +48,19 @@ What the prototype does:
 
 This is meant to validate the end-to-end workflow before investing in a more
 physical continuum solver and a more faithful diffusion process.
+
+## Occupancy Semantics
+
+The current repository treats occupancies in two different roles on purpose:
+
+- During generation and denoising, the design lives in continuous `[0, 1]` space.
+- Values between `0` and `1` are not interpreted as partial physical material.
+- The official manufacturable design is the hard-thresholded topology `x >= 0.5`.
+- All official FEM property evaluation uses that thresholded binary design.
+
+This lets the model reason in a smooth space internally while still forcing a
+clear binary decision whenever we ask the mechanics model for `k_x`, `k_y`, and
+`k_theta`.
 
 ## Setup
 
@@ -59,6 +73,9 @@ uv sync
 ```bash
 uv run cms-train --epochs 8 --dataset-size 256 --batch-size 16 --log-dir runs/prototype
 ```
+
+This training loop now also includes a binarization penalty so the continuous
+occupancies are pushed away from ambiguous gray values.
 
 ## Sample
 
@@ -81,6 +98,8 @@ Each training or sampling run automatically creates a timestamped directory like
 
 The sampler now uses a bounded FEM-guided search by default so it does not sit
 for a long time looking stuck.
+
+All candidate evaluation in sampling is done after thresholding at `0.5`.
 
 If you want faster sampling, reduce the search budget:
 

@@ -10,6 +10,16 @@ import torch.nn.functional as F
 SPRING_NEIGHBORS = ((1, 0), (0, 1), (1, 1), (1, -1))
 
 
+def threshold_occupancy(
+    occupancy: torch.Tensor, threshold: float = 0.5
+) -> torch.Tensor:
+    return (occupancy >= threshold).to(dtype=torch.float32)
+
+
+def binarization_penalty(occupancy: torch.Tensor) -> torch.Tensor:
+    return (occupancy * (1.0 - occupancy)).mean(dim=(1, 2, 3))
+
+
 def _bridge_component_ratio(mask: np.ndarray) -> tuple[float, float]:
     height, width = mask.shape
     top_coords = [(0, c) for c in range(width) if mask[0, c]]
@@ -195,12 +205,12 @@ def _single_sample_terms(mask: np.ndarray) -> tuple[np.ndarray, float, float]:
     return scaled.astype(np.float32), float(connected_mass), float(connectivity_penalty)
 
 
-def mechanical_terms(occupancy: torch.Tensor) -> dict[str, torch.Tensor]:
-    device = occupancy.device
-    occupancy = occupancy.float()
-    regularizers = topology_regularizers(occupancy)
+def mechanical_terms(binary_occupancy: torch.Tensor) -> dict[str, torch.Tensor]:
+    device = binary_occupancy.device
+    binary_occupancy = binary_occupancy.float()
+    regularizers = topology_regularizers(binary_occupancy)
 
-    batch_masks = occupancy.detach().cpu().numpy()[:, 0] > 0.5
+    batch_masks = binary_occupancy.detach().cpu().numpy()[:, 0].astype(bool)
     properties: list[np.ndarray] = []
     connected_mass: list[float] = []
     connectivity_penalty: list[float] = []
