@@ -1,3 +1,0 @@
-[console_scripts]
-cms-sample = compliant_mechanism_synthesis.cli:sample_main
-cms-train = compliant_mechanism_synthesis.cli:train_main
