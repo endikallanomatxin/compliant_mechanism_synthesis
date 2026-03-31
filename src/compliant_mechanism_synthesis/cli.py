@@ -91,11 +91,21 @@ def _progress(message: str) -> None:
     print(message, flush=True)
 
 
-def _canonical_target_specs() -> list[tuple[str, tuple[float, float, float]]]:
+def _canonical_target_specs(
+    target_pool: torch.Tensor,
+) -> list[tuple[str, tuple[float, float, float]]]:
+    positive = target_pool[target_pool > 1e-6]
+    if len(positive) == 0:
+        low = 0.05
+        high = 0.20
+    else:
+        low = float(torch.quantile(positive, 0.20).item())
+        high = float(torch.quantile(positive, 0.80).item())
+
     return [
-        ("0-1-1", (0.0, 1.0, 1.0)),
-        ("1-0-1", (1.0, 0.0, 1.0)),
-        ("1-1-0", (1.0, 1.0, 0.0)),
+        ("low-kx_high-ky-ktheta", (low, high, high)),
+        ("high-kx_low-ky-high-ktheta", (high, low, high)),
+        ("high-kx-ky_low-ktheta", (high, high, low)),
     ]
 
 
@@ -119,10 +129,10 @@ def _log_canonical_evaluation(
     config: TrainConfig,
     step: int,
     device: torch.device,
+    canonical_specs: list[tuple[str, tuple[float, float, float]]],
 ) -> None:
-    specs = _canonical_target_specs()
     targets = torch.tensor(
-        [values for _, values in specs], dtype=torch.float32, device=device
+        [values for _, values in canonical_specs], dtype=torch.float32, device=device
     )
     search = search_elite_batch(
         model=model,
@@ -133,7 +143,7 @@ def _log_canonical_evaluation(
         steps=config.canonical_sample_steps,
     )
 
-    for idx, (name, target_values) in enumerate(specs):
+    for idx, (name, target_values) in enumerate(canonical_specs):
         design = search["designs"][idx : idx + 1].cpu()
         achieved = search["terms"]["properties"][idx]
         error = search["property_error"][idx].item()
@@ -153,9 +163,9 @@ def _log_canonical_evaluation(
 
     _progress(
         "train:canonical_eval "
-        f"step={step} err_0-1-1={search['property_error'][0].item():.4f} "
-        f"err_1-0-1={search['property_error'][1].item():.4f} "
-        f"err_1-1-0={search['property_error'][2].item():.4f}"
+        f"step={step} {canonical_specs[0][0]}={search['property_error'][0].item():.4f} "
+        f"{canonical_specs[1][0]}={search['property_error'][1].item():.4f} "
+        f"{canonical_specs[2][0]}={search['property_error'][2].item():.4f}"
     )
 
 
@@ -171,8 +181,23 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
     designs = generate_dataset(config.dataset_size, config.grid_size, config.seed)
     targets = mechanical_terms(threshold_occupancy(designs))["properties"]
+    canonical_reference_size = max(128, config.dataset_size)
+    canonical_reference_designs = generate_dataset(
+        canonical_reference_size, config.grid_size, config.seed + 1
+    )
+    canonical_reference_targets = mechanical_terms(
+        threshold_occupancy(canonical_reference_designs)
+    )["properties"]
+    canonical_specs = _canonical_target_specs(canonical_reference_targets)
     dataset = TensorDataset(targets)
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    _progress(
+        "train:canonical_targets "
+        + " ".join(
+            f"{name}=({values[0]:.3f},{values[1]:.3f},{values[2]:.3f})"
+            for name, values in canonical_specs
+        )
+    )
 
     model = ConditionedDenoiser(
         grid_size=config.grid_size,
@@ -288,7 +313,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 config.canonical_eval_every_steps > 0
                 and global_step % config.canonical_eval_every_steps == 0
             ):
-                _log_canonical_evaluation(writer, model, config, global_step, device)
+                _log_canonical_evaluation(
+                    writer, model, config, global_step, device, canonical_specs
+                )
 
             if config.log_every_steps > 0 and (
                 batch_idx % config.log_every_steps == 0 or batch_idx == len(loader)

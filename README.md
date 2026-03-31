@@ -83,9 +83,10 @@ candidate pool, while learning happens by imitating the best FEM-scored designs
 found so far.
 
 During training, the prototype can also run periodic canonical evaluations for
-the targets `(0,1,1)`, `(1,0,1)`, and `(1,1,0)`. Those snapshots are written to
-TensorBoard so you can visually track whether the model is learning distinct
-families of mechanisms instead of collapsing to trivial patches.
+representative in-distribution targets derived from a larger synthetic
+reference pool. Those snapshots are written to TensorBoard so you can visually
+track whether the model is learning distinct families of mechanisms instead of
+collapsing to trivial patches.
 
 ## Setup
 
@@ -129,12 +130,20 @@ Canonical evaluations are controlled with:
 --canonical-sample-steps 6
 ```
 
+The current code computes a single `low=q20` and a single `high=q80` over the
+positive property values in the reference pool, then evaluates these three
+canonical patterns:
+
+- low `k_x`, higher `k_y` and `k_theta`
+- higher `k_x`, low `k_y`, higher `k_theta`
+- higher `k_x`, higher `k_y`, low `k_theta`
+
 Those runs are logged under TensorBoard tags like:
 
 ```text
-canonical/0-1-1/design
-canonical/1-0-1/design
-canonical/1-1-0/design
+canonical/low-kx_high-ky-ktheta/design
+canonical/high-kx_low-ky-high-ktheta/design
+canonical/high-kx-ky_low-ktheta/design
 ```
 
 ## Sample
