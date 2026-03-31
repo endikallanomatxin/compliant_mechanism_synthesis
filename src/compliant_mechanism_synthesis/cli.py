@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
@@ -29,23 +28,19 @@ class TrainConfig:
     d_model: int = 128
     nhead: int = 4
     num_layers: int = 4
-    dataset_size: int = 256
+    dataset_size: int = 512
     batch_size: int = 16
-    epochs: int = 8
+    epochs: int = 50
     learning_rate: float = 3e-4
+    rollout_steps: int = 5
+    rollout_step_size: float = 1.0
     property_weight: float = 2.0
     surface_weight: float = 0.02
     connectivity_weight: float = 0.08
     mass_weight: float = 0.15
     binarization_weight: float = 0.1
-    train_model_candidates: int = 2
-    train_random_candidates: int = 6
-    train_sample_steps: int = 6
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
-    canonical_model_candidates: int = 2
-    canonical_random_candidates: int = 4
-    canonical_sample_steps: int = 6
     name: str = "prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
     seed: int = 7
@@ -63,10 +58,13 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _add_noise(grids: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-    noise = torch.rand_like(grids)
-    mixing = timesteps[:, None, None, None]
-    return grids * (1.0 - mixing) + noise * mixing
+def _fixed_noise(
+    batch_size: int, grid_size: int, seed: int, device: torch.device
+) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    noise = torch.rand((batch_size, 1, grid_size, grid_size), generator=generator)
+    return noise.to(device)
 
 
 def _force_plates(grids: torch.Tensor) -> torch.Tensor:
@@ -109,6 +107,11 @@ def _canonical_target_specs(
     ]
 
 
+def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
+    weights = torch.linspace(1.0, float(steps), steps=steps, device=device)
+    return weights / weights.sum()
+
+
 def candidate_scores(
     designs: torch.Tensor, target_props: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
@@ -134,21 +137,28 @@ def _log_canonical_evaluation(
     targets = torch.tensor(
         [values for _, values in canonical_specs], dtype=torch.float32, device=device
     )
-    search = search_elite_batch(
-        model=model,
-        target_props=targets,
-        grid_size=config.grid_size,
-        model_candidates=config.canonical_model_candidates,
-        random_candidates=config.canonical_random_candidates,
-        steps=config.canonical_sample_steps,
+    noise = _fixed_noise(
+        len(canonical_specs), config.grid_size, config.seed + 101, device
     )
+    probs = sample_from_model(
+        model,
+        targets,
+        noise,
+        steps=config.rollout_steps,
+        step_size=config.rollout_step_size,
+    )
+    design = binarize_design(probs)
+    search_scores, property_error, terms = candidate_scores(design, targets)
 
     for idx, (name, target_values) in enumerate(canonical_specs):
-        design = search["designs"][idx : idx + 1].cpu()
-        achieved = search["terms"]["properties"][idx]
-        error = search["property_error"][idx].item()
+        design_image = design[idx : idx + 1].cpu()
+        achieved = terms["properties"][idx]
+        error = property_error[idx].item()
         writer.add_images(
-            f"canonical/{name}/design", design, global_step=step, dataformats="NCHW"
+            f"canonical/{name}/design",
+            design_image,
+            global_step=step,
+            dataformats="NCHW",
         )
         writer.add_scalar(f"canonical/{name}/target_kx", target_values[0], step)
         writer.add_scalar(f"canonical/{name}/target_ky", target_values[1], step)
@@ -157,15 +167,13 @@ def _log_canonical_evaluation(
         writer.add_scalar(f"canonical/{name}/achieved_ky", achieved[1].item(), step)
         writer.add_scalar(f"canonical/{name}/achieved_ktheta", achieved[2].item(), step)
         writer.add_scalar(f"canonical/{name}/property_error", error, step)
-        writer.add_scalar(
-            f"canonical/{name}/elite_score", search["scores"][idx].item(), step
-        )
+        writer.add_scalar(f"canonical/{name}/score", search_scores[idx].item(), step)
 
     _progress(
         "train:canonical_eval "
-        f"step={step} {canonical_specs[0][0]}={search['property_error'][0].item():.4f} "
-        f"{canonical_specs[1][0]}={search['property_error'][1].item():.4f} "
-        f"{canonical_specs[2][0]}={search['property_error'][2].item():.4f}"
+        f"step={step} {canonical_specs[0][0]}={property_error[0].item():.4f} "
+        f"{canonical_specs[1][0]}={property_error[1].item():.4f} "
+        f"{canonical_specs[2][0]}={property_error[2].item():.4f}"
     )
 
 
@@ -175,8 +183,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     _progress(
         "train:start "
         f"device={device} epochs={config.epochs} dataset_size={config.dataset_size} "
-        f"batch_size={config.batch_size} model_candidates={config.train_model_candidates} "
-        f"random_candidates={config.train_random_candidates}"
+        f"batch_size={config.batch_size} rollout_steps={config.rollout_steps}"
     )
 
     designs = generate_dataset(config.dataset_size, config.grid_size, config.seed)
@@ -207,7 +214,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         num_layers=config.num_layers,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-    reconstruction_loss = nn.BCEWithLogitsLoss()
 
     log_dir = _timestamped_run_dir(config.name)
     checkpoint_path = Path(config.checkpoint_path)
@@ -222,57 +228,49 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         _progress(f"train:epoch_start epoch={epoch + 1}/{config.epochs}")
         epoch_totals = {
             "total": 0.0,
-            "recon": 0.0,
             "property": 0.0,
             "surface": 0.0,
             "connectivity": 0.0,
             "mass": 0.0,
             "binarization": 0.0,
             "binary_property_error": 0.0,
-            "elite_score": 0.0,
-            "model_elite_fraction": 0.0,
         }
 
         for batch_idx, (target_props,) in enumerate(loader, start=1):
             target_props = target_props.to(device)
-
-            with torch.no_grad():
-                elite_search = search_elite_batch(
-                    model=model,
-                    target_props=target_props,
-                    grid_size=config.grid_size,
-                    model_candidates=config.train_model_candidates,
-                    random_candidates=config.train_random_candidates,
-                    steps=config.train_sample_steps,
-                )
-                elite_designs = elite_search["designs"]
-                elite_sources = elite_search["sources"]
-                elite_scores = elite_search["scores"]
-
-            timesteps = torch.rand(elite_designs.shape[0], device=device)
-            noisy_grids = _add_noise(elite_designs, timesteps)
-
-            logits = model(noisy_grids, target_props, timesteps)
-            probs = _force_plates(torch.sigmoid(logits))
-            fem_terms = mechanical_terms(probs)
-            binary_predictions = _force_plates(threshold_occupancy(probs))
+            noise = torch.rand(
+                (target_props.shape[0], 1, config.grid_size, config.grid_size),
+                device=device,
+            )
+            rollout = rollout_model(
+                model,
+                target_props,
+                noise,
+                steps=config.rollout_steps,
+                step_size=config.rollout_step_size,
+            )
+            final_probs = rollout[-1]
+            final_terms = mechanical_terms(final_probs)
+            binary_predictions = _force_plates(threshold_occupancy(final_probs))
             _, binary_property_error, _ = candidate_scores(
                 binary_predictions, target_props
             )
 
-            recon = reconstruction_loss(logits, elite_designs)
-            property_loss = F.mse_loss(fem_terms["properties"], target_props)
-            surface = fem_terms["surface"].mean()
-            connectivity = fem_terms["connectivity_penalty"].mean()
-            mass = fem_terms["occupancy_mass"].mean()
-            binarization = binarization_penalty(probs).mean()
+            step_weights = _step_weights(config.rollout_steps, device)
+            property_loss = torch.zeros((), device=device)
+            for step_idx, probs in enumerate(rollout):
+                step_terms = mechanical_terms(probs)
+                property_loss = property_loss + step_weights[step_idx] * F.mse_loss(
+                    step_terms["properties"], target_props
+                )
+
+            surface = final_terms["surface"].mean()
+            connectivity = final_terms["connectivity_penalty"].mean()
+            mass = final_terms["occupancy_mass"].mean()
+            binarization = binarization_penalty(final_probs).mean()
             binary_property_error_mean = binary_property_error.mean()
-            model_elite_fraction = sum(
-                source == "model" for source in elite_sources
-            ) / len(elite_sources)
             total = (
-                recon
-                + config.property_weight * property_loss
+                config.property_weight * property_loss
                 + config.surface_weight * surface
                 + config.connectivity_weight * connectivity
                 + config.mass_weight * mass
@@ -284,18 +282,14 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             optimizer.step()
 
             epoch_totals["total"] += total.item()
-            epoch_totals["recon"] += recon.item()
             epoch_totals["property"] += property_loss.item()
             epoch_totals["surface"] += surface.item()
             epoch_totals["connectivity"] += connectivity.item()
             epoch_totals["mass"] += mass.item()
             epoch_totals["binarization"] += binarization.item()
             epoch_totals["binary_property_error"] += binary_property_error_mean.item()
-            epoch_totals["elite_score"] += elite_scores.mean().item()
-            epoch_totals["model_elite_fraction"] += model_elite_fraction
 
             writer.add_scalar("train/total_loss", total.item(), global_step)
-            writer.add_scalar("train/reconstruction_loss", recon.item(), global_step)
             writer.add_scalar("train/property_loss", property_loss.item(), global_step)
             writer.add_scalar("train/surface_loss", surface.item(), global_step)
             writer.add_scalar(
@@ -309,12 +303,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 "train/binary_property_error",
                 binary_property_error_mean.item(),
                 global_step,
-            )
-            writer.add_scalar(
-                "train/elite_score", elite_scores.mean().item(), global_step
-            )
-            writer.add_scalar(
-                "train/model_elite_fraction", model_elite_fraction, global_step
             )
             global_step += 1
 
@@ -333,9 +321,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     "train:step "
                     f"epoch={epoch + 1}/{config.epochs} batch={batch_idx}/{len(loader)} "
                     f"global_step={global_step} total={total.item():.4f} "
-                    f"recon={recon.item():.4f} prop={property_loss.item():.4f} "
-                    f"bin_prop={binary_property_error_mean.item():.4f} "
-                    f"elite={elite_scores.mean().item():.4f} model_elites={model_elite_fraction:.2f}"
+                    f"prop={property_loss.item():.4f} bin_prop={binary_property_error_mean.item():.4f} "
+                    f"surface={surface.item():.4f} conn={connectivity.item():.4f}"
                 )
 
         num_batches = max(len(loader), 1)
@@ -346,39 +333,30 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             "train:epoch_end "
             f"epoch={epoch + 1}/{config.epochs} "
             f"total={epoch_totals['total'] / num_batches:.4f} "
-            f"recon={epoch_totals['recon'] / num_batches:.4f} "
             f"prop={epoch_totals['property'] / num_batches:.4f} "
             f"bin_prop={epoch_totals['binary_property_error'] / num_batches:.4f} "
-            f"elite={epoch_totals['elite_score'] / num_batches:.4f} "
-            f"model_elites={epoch_totals['model_elite_fraction'] / num_batches:.2f}"
+            f"surface={epoch_totals['surface'] / num_batches:.4f} "
+            f"conn={epoch_totals['connectivity'] / num_batches:.4f}"
         )
 
         model.eval()
         with torch.no_grad():
             preview_targets = targets[:8].to(device)
-            preview_search = search_elite_batch(
-                model=model,
-                target_props=preview_targets,
-                grid_size=config.grid_size,
-                model_candidates=config.train_model_candidates,
-                random_candidates=config.train_random_candidates,
-                steps=config.train_sample_steps,
+            preview_noise = _fixed_noise(
+                preview_targets.shape[0], config.grid_size, config.seed + 202, device
             )
-            preview_binary = preview_search["designs"]
-            preview_terms = preview_search["terms"]
-            property_error = preview_search["property_error"].mean()
-            _write_samples(writer, "samples/elites", preview_binary.cpu(), epoch)
-            _write_samples(writer, "samples/target_pool_reference", designs[:8], epoch)
+            preview_probs = sample_from_model(
+                model,
+                preview_targets,
+                preview_noise,
+                steps=config.rollout_steps,
+                step_size=config.rollout_step_size,
+            )
+            preview_binary = binarize_design(preview_probs)
+            preview_terms = mechanical_terms(preview_binary)
+            property_error = F.mse_loss(preview_terms["properties"], preview_targets)
+            _write_samples(writer, "samples/generated", preview_binary.cpu(), epoch)
             writer.add_scalar("samples/property_error", property_error.item(), epoch)
-            writer.add_scalar(
-                "samples/elite_score", preview_search["scores"].mean().item(), epoch
-            )
-            writer.add_scalar(
-                "samples/model_elite_fraction",
-                sum(source == "model" for source in preview_search["sources"])
-                / len(preview_search["sources"]),
-                epoch,
-            )
             writer.add_scalar(
                 "samples/kx_mean",
                 preview_terms["properties"][:, 0].mean().item(),
@@ -405,21 +383,44 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     return checkpoint_path, log_dir
 
 
+def rollout_model(
+    model: ConditionedDenoiser,
+    target_props: torch.Tensor,
+    initial_noise: torch.Tensor,
+    steps: int,
+    step_size: float,
+) -> list[torch.Tensor]:
+    current_logits = torch.logit(initial_noise.clamp(1e-4, 1.0 - 1e-4))
+    states: list[torch.Tensor] = []
+
+    for step_idx in range(steps):
+        current_probs = _force_plates(torch.sigmoid(current_logits))
+        timestep = torch.full(
+            (initial_noise.shape[0],),
+            (step_idx + 1) / steps,
+            device=initial_noise.device,
+        )
+        delta_logits = model(current_probs, target_props, timestep)
+        current_logits = current_logits + step_size * delta_logits
+        states.append(_force_plates(torch.sigmoid(current_logits)))
+
+    return states
+
+
 def sample_from_model(
     model: ConditionedDenoiser,
     target_props: torch.Tensor,
     initial_noise: torch.Tensor,
     steps: int,
+    step_size: float = 1.0,
 ) -> torch.Tensor:
-    current = initial_noise
-    device = current.device
-    for step in reversed(range(steps)):
-        t_value = torch.full((current.shape[0],), (step + 1) / steps, device=device)
-        logits = model(current, target_props, t_value)
-        probs = _force_plates(torch.sigmoid(logits))
-        blend = 0.6 if step > 0 else 1.0
-        current = blend * probs + (1.0 - blend) * current
-    return _force_plates(current)
+    return rollout_model(
+        model,
+        target_props,
+        initial_noise,
+        steps=steps,
+        step_size=step_size,
+    )[-1]
 
 
 def binarize_design(probs: torch.Tensor) -> torch.Tensor:
@@ -438,6 +439,7 @@ def search_elite_batch(
     model_candidates: int,
     random_candidates: int,
     steps: int,
+    step_size: float,
 ) -> dict[str, torch.Tensor | list[str]]:
     if model_candidates <= 0 and random_candidates <= 0:
         raise ValueError("at least one candidate source must be enabled")
@@ -463,7 +465,11 @@ def search_elite_batch(
                 )
                 repeated_target = target.repeat(model_candidates, 1)
                 model_probs = sample_from_model(
-                    model, repeated_target, noises, steps=steps
+                    model,
+                    repeated_target,
+                    noises,
+                    steps=steps,
+                    step_size=step_size,
                 )
                 model_designs = binarize_design(model_probs)
                 scores, _, _ = candidate_scores(model_designs, repeated_target)
@@ -641,6 +647,7 @@ def sample(
             model_candidates=model_candidates,
             random_candidates=random_candidates,
             steps=steps,
+            step_size=config.rollout_step_size,
         )
     _progress(
         "sample:elite "
@@ -703,23 +710,19 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=4)
-    parser.add_argument("--dataset-size", type=int, default=256)
+    parser.add_argument("--dataset-size", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--rollout-steps", type=int, default=5)
+    parser.add_argument("--rollout-step-size", type=float, default=1.0)
     parser.add_argument("--property-weight", type=float, default=2.0)
     parser.add_argument("--surface-weight", type=float, default=0.02)
     parser.add_argument("--connectivity-weight", type=float, default=0.08)
     parser.add_argument("--mass-weight", type=float, default=0.15)
     parser.add_argument("--binarization-weight", type=float, default=0.1)
-    parser.add_argument("--train-model-candidates", type=int, default=2)
-    parser.add_argument("--train-random-candidates", type=int, default=6)
-    parser.add_argument("--train-sample-steps", type=int, default=6)
     parser.add_argument("--log-every-steps", type=int, default=5)
     parser.add_argument("--canonical-eval-every-steps", type=int, default=20)
-    parser.add_argument("--canonical-model-candidates", type=int, default=2)
-    parser.add_argument("--canonical-random-candidates", type=int, default=4)
-    parser.add_argument("--canonical-sample-steps", type=int, default=6)
     parser.add_argument("--name", default="prototype")
     parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
     parser.add_argument("--seed", type=int, default=7)

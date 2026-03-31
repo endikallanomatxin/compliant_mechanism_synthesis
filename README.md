@@ -66,23 +66,19 @@ clear binary decision whenever we ask the mechanics model for `k_x`, `k_y`, and
 
 ## Training Loop
 
-The current training loop is closer to policy improvement than plain supervised
-reconstruction.
+The current training loop is an iterative target-conditioned generator trained
+with mechanical gradients.
 
 For each batch of target properties:
 
-- Sample candidate designs from the current model.
-- Sample additional random structural candidates for exploration.
-- Threshold every candidate at `0.5`.
-- Evaluate all candidates with the spring-network FEM.
-- Keep the best candidate per target as an elite.
-- Train the denoiser to reconstruct those elites from noisy continuous inputs.
-- Backpropagate property loss through the same differentiable FEM on the relaxed occupancy field.
+- Sample a fresh noise grid.
+- Roll that noise forward through several learned refinement steps.
+- Evaluate the same differentiable FEM directly on the intermediate and final relaxed occupancy fields.
+- Backpropagate property loss across the rollout plus lightweight final-step topology regularization.
 
-This means exploration comes from both the model sampler and the random
-candidate pool, while learning happens by imitating the best FEM-scored designs
-found so far and by using direct mechanical gradients from the differentiable
-FEM.
+This keeps the training objective focused on the core problem: generate a
+topology whose mechanical response matches the requested target, while staying
+simple, connected, and close to binary.
 
 During training, the prototype can also run periodic canonical evaluations for
 representative in-distribution targets derived from a larger synthetic
@@ -99,9 +95,9 @@ uv sync
 ## Train
 
 ```bash
-uv run cms-train --epochs 8 --dataset-size 256 --batch-size 16 \
-  --train-model-candidates 2 --train-random-candidates 6 \
-  --train-sample-steps 6 --log-every-steps 5 \
+uv run cms-train --epochs 50 --dataset-size 512 --batch-size 16 \
+  --rollout-steps 5 --rollout-step-size 1.0 \
+  --property-weight 2.0 --log-every-steps 5 \
   --canonical-eval-every-steps 20 \
   --name prototype
 ```
@@ -113,7 +109,11 @@ The property loss is now computed directly through the differentiable FEM, so
 `--property-weight` controls how strongly the model is pushed to match the
 target stiffness triplet on the relaxed occupancy field.
 
-The default surface regularization is intentionally light so the search loop is
+`--rollout-steps` controls how many learned refinement steps the generator takes
+ from noise to the final relaxed design, and `--rollout-step-size` scales each
+ logits update.
+
+The default surface regularization is intentionally light so the generator is
 less tempted to collapse into nearly empty or nearly full patches.
 
 The default connectivity regularization is also intentionally modest. It still
@@ -125,15 +125,12 @@ full structural connection, the spring-network FEM uses weak diagonal springs in
 addition to the main axial ones.
 
 The `dataset-size` here is the size of the synthetic target-property pool used
-to define which stiffness triplets the search loop practices against.
+to define which stiffness triplets the generator practices against.
 
 Canonical evaluations are controlled with:
 
 ```bash
 --canonical-eval-every-steps 20
---canonical-model-candidates 2
---canonical-random-candidates 4
---canonical-sample-steps 6
 ```
 
 The current code computes a single `low=q20` and a single `high=q80` over the
@@ -177,8 +174,8 @@ ordered lexicographically without needing to pass a path-like log name.
 
 ## Sampling Budget
 
-The sampler now uses a bounded FEM-guided search by default so it does not sit
-for a long time looking stuck.
+Training is now direct and gradient-based, but the sampler still uses a bounded
+FEM-guided search by default so final candidates can be refined a bit more.
 
 All candidate evaluation in sampling is done after thresholding at `0.5`.
 
@@ -207,8 +204,8 @@ Run a verified training pass:
 
 ```bash
 uv run cms-train --epochs 3 --dataset-size 96 --batch-size 8 \
-  --train-model-candidates 2 --train-random-candidates 4 \
-  --train-sample-steps 4 --log-every-steps 2 \
+  --rollout-steps 5 --rollout-step-size 1.0 \
+  --property-weight 2.0 --log-every-steps 2 \
   --canonical-eval-every-steps 4 \
   --name fem-verify-train \
   --checkpoint-path artifacts/fem-verify.pt
@@ -237,6 +234,6 @@ The verified sampling run produced:
 achieved_properties depends on the current checkpoint and search budget.
 ```
 
-The current prototype validates the search-and-imitation loop end to end, but
-it is still mechanically weak. Better targets usually require either more
-training epochs, a larger target pool, or a larger search budget.
+The current prototype validates the differentiable-FEM training loop end to
+end, but it is still mechanically weak. Better targets usually require either
+more training epochs, a larger target pool, or a larger sampling search budget.
