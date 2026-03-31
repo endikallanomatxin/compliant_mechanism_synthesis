@@ -132,8 +132,9 @@ hard that the model prefers trivial fully-solid-like solutions.
 
 That connectivity term is now a soft disconnect-distance penalty: it measures
 how many 4-neighbor dilations would be needed for the regions reachable from
-the top and bottom plates to meet, which gives a smoother signal than a simple
-connected/disconnected check.
+the top and bottom plates to meet, using strong axial propagation and weaker
+diagonal propagation, which gives a smoother signal than a simple
+connected/disconnected check while reducing grid-direction bias.
 
 To reduce lattice anisotropy without letting corner-touching pixels count as a
 full structural connection, the spring-network FEM uses weak diagonal springs in

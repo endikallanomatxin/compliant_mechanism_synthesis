@@ -30,7 +30,8 @@ class ConditionedDenoiser(nn.Module):
         self.grid_size = grid_size
         self.patch_size = patch_size
         self.patch_dim = patch_size * patch_size
-        self.num_patches = (grid_size // patch_size) ** 2
+        self.patch_grid_size = grid_size // patch_size
+        self.num_patches = self.patch_grid_size**2
 
         self.patch_in = nn.Linear(self.patch_dim, d_model)
         self.target_mlp = nn.Sequential(
@@ -43,7 +44,12 @@ class ConditionedDenoiser(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
-        self.position = nn.Parameter(torch.randn(1, self.num_patches, d_model) * 0.02)
+        self.row_position = nn.Parameter(
+            torch.randn(1, self.patch_grid_size, 1, d_model) * 0.02
+        )
+        self.col_position = nn.Parameter(
+            torch.randn(1, 1, self.patch_grid_size, d_model) * 0.02
+        )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -74,11 +80,14 @@ class ConditionedDenoiser(nn.Module):
         self, noisy_grids: torch.Tensor, targets: torch.Tensor, timesteps: torch.Tensor
     ) -> torch.Tensor:
         tokens = self.patch_in(self._patchify(noisy_grids))
+        position = (self.row_position + self.col_position).reshape(
+            1, self.num_patches, -1
+        )
         target_cond = self.target_mlp(targets)[:, None, :]
         time_cond = self.time_mlp(sinusoidal_embedding(timesteps, tokens.shape[-1]))[
             :, None, :
         ]
-        hidden = tokens + self.position + target_cond + time_cond
+        hidden = tokens + position + target_cond + time_cond
         hidden = self.encoder(hidden)
         hidden = self.norm(hidden)
         patches = self.patch_out(hidden)

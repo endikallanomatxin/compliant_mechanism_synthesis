@@ -11,6 +11,7 @@ AXIAL_SPRING_NEIGHBORS = ((1, 0), (0, 1))
 DIAGONAL_SPRING_NEIGHBORS = ((1, 1), (1, -1))
 GRID_NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 DIAGONAL_STIFFNESS_SCALE = 0.25
+DIAGONAL_CONNECTIVITY_SCALE = 0.5
 
 
 @dataclass(frozen=True)
@@ -42,10 +43,28 @@ def _cross_neighbor_max(values: torch.Tensor) -> torch.Tensor:
     return torch.maximum(torch.maximum(up, down), torch.maximum(left, right))
 
 
+def _weighted_neighbor_max(values: torch.Tensor) -> torch.Tensor:
+    padded = F.pad(values, (1, 1, 1, 1), mode="constant", value=0.0)
+    up = padded[:, :, :-2, 1:-1]
+    down = padded[:, :, 2:, 1:-1]
+    left = padded[:, :, 1:-1, :-2]
+    right = padded[:, :, 1:-1, 2:]
+    up_left = padded[:, :, :-2, :-2]
+    up_right = padded[:, :, :-2, 2:]
+    down_left = padded[:, :, 2:, :-2]
+    down_right = padded[:, :, 2:, 2:]
+
+    axial = torch.maximum(torch.maximum(up, down), torch.maximum(left, right))
+    diagonal = torch.maximum(
+        torch.maximum(up_left, up_right), torch.maximum(down_left, down_right)
+    )
+    return torch.maximum(axial, DIAGONAL_CONNECTIVITY_SCALE * diagonal)
+
+
 def _solid_reachability(occupancy: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
     reach = occupancy * seeds
     for _ in range(occupancy.shape[-2]):
-        reach = occupancy * torch.maximum(reach, _cross_neighbor_max(reach))
+        reach = occupancy * torch.maximum(reach, _weighted_neighbor_max(reach))
     return reach
 
 
@@ -59,9 +78,9 @@ def _disconnect_distance_penalty(
     for _ in range(top_reach.shape[-2]):
         overlap = (expanded_top * expanded_bottom).amax(dim=(1, 2, 3))
         penalties.append(1.0 - overlap)
-        expanded_top = torch.maximum(expanded_top, _cross_neighbor_max(expanded_top))
+        expanded_top = torch.maximum(expanded_top, _weighted_neighbor_max(expanded_top))
         expanded_bottom = torch.maximum(
-            expanded_bottom, _cross_neighbor_max(expanded_bottom)
+            expanded_bottom, _weighted_neighbor_max(expanded_bottom)
         )
 
     return torch.stack(penalties, dim=0).mean(dim=0).clamp(0.0, 1.0)
