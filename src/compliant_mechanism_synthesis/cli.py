@@ -18,7 +18,6 @@ from compliant_mechanism_synthesis.mechanics import (
     binarization_penalty,
     mechanical_terms,
     threshold_occupancy,
-    topology_regularizers,
 )
 from compliant_mechanism_synthesis.model import ConditionedDenoiser
 
@@ -34,6 +33,7 @@ class TrainConfig:
     batch_size: int = 16
     epochs: int = 8
     learning_rate: float = 3e-4
+    property_weight: float = 2.0
     surface_weight: float = 0.02
     connectivity_weight: float = 0.08
     mass_weight: float = 0.15
@@ -223,11 +223,12 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         epoch_totals = {
             "total": 0.0,
             "recon": 0.0,
+            "property": 0.0,
             "surface": 0.0,
             "connectivity": 0.0,
             "mass": 0.0,
             "binarization": 0.0,
-            "property_error": 0.0,
+            "binary_property_error": 0.0,
             "elite_score": 0.0,
             "model_elite_fraction": 0.0,
         }
@@ -253,21 +254,25 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
             logits = model(noisy_grids, target_props, timesteps)
             probs = _force_plates(torch.sigmoid(logits))
-            regularizers = topology_regularizers(probs)
+            fem_terms = mechanical_terms(probs)
             binary_predictions = _force_plates(threshold_occupancy(probs))
-            _, property_error, _ = candidate_scores(binary_predictions, target_props)
+            _, binary_property_error, _ = candidate_scores(
+                binary_predictions, target_props
+            )
 
             recon = reconstruction_loss(logits, elite_designs)
-            surface = regularizers["surface"].mean()
-            connectivity = regularizers["connectivity_penalty"].mean()
-            mass = regularizers["occupancy_mass"].mean()
+            property_loss = F.mse_loss(fem_terms["properties"], target_props)
+            surface = fem_terms["surface"].mean()
+            connectivity = fem_terms["connectivity_penalty"].mean()
+            mass = fem_terms["occupancy_mass"].mean()
             binarization = binarization_penalty(probs).mean()
-            property_error_mean = property_error.mean()
+            binary_property_error_mean = binary_property_error.mean()
             model_elite_fraction = sum(
                 source == "model" for source in elite_sources
             ) / len(elite_sources)
             total = (
                 recon
+                + config.property_weight * property_loss
                 + config.surface_weight * surface
                 + config.connectivity_weight * connectivity
                 + config.mass_weight * mass
@@ -280,16 +285,18 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
             epoch_totals["total"] += total.item()
             epoch_totals["recon"] += recon.item()
+            epoch_totals["property"] += property_loss.item()
             epoch_totals["surface"] += surface.item()
             epoch_totals["connectivity"] += connectivity.item()
             epoch_totals["mass"] += mass.item()
             epoch_totals["binarization"] += binarization.item()
-            epoch_totals["property_error"] += property_error_mean.item()
+            epoch_totals["binary_property_error"] += binary_property_error_mean.item()
             epoch_totals["elite_score"] += elite_scores.mean().item()
             epoch_totals["model_elite_fraction"] += model_elite_fraction
 
             writer.add_scalar("train/total_loss", total.item(), global_step)
             writer.add_scalar("train/reconstruction_loss", recon.item(), global_step)
+            writer.add_scalar("train/property_loss", property_loss.item(), global_step)
             writer.add_scalar("train/surface_loss", surface.item(), global_step)
             writer.add_scalar(
                 "train/connectivity_penalty", connectivity.item(), global_step
@@ -299,7 +306,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 "train/binarization_penalty", binarization.item(), global_step
             )
             writer.add_scalar(
-                "train/property_error", property_error_mean.item(), global_step
+                "train/binary_property_error",
+                binary_property_error_mean.item(),
+                global_step,
             )
             writer.add_scalar(
                 "train/elite_score", elite_scores.mean().item(), global_step
@@ -324,7 +333,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     "train:step "
                     f"epoch={epoch + 1}/{config.epochs} batch={batch_idx}/{len(loader)} "
                     f"global_step={global_step} total={total.item():.4f} "
-                    f"recon={recon.item():.4f} prop_err={property_error_mean.item():.4f} "
+                    f"recon={recon.item():.4f} prop={property_loss.item():.4f} "
+                    f"bin_prop={binary_property_error_mean.item():.4f} "
                     f"elite={elite_scores.mean().item():.4f} model_elites={model_elite_fraction:.2f}"
                 )
 
@@ -337,7 +347,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             f"epoch={epoch + 1}/{config.epochs} "
             f"total={epoch_totals['total'] / num_batches:.4f} "
             f"recon={epoch_totals['recon'] / num_batches:.4f} "
-            f"prop_err={epoch_totals['property_error'] / num_batches:.4f} "
+            f"prop={epoch_totals['property'] / num_batches:.4f} "
+            f"bin_prop={epoch_totals['binary_property_error'] / num_batches:.4f} "
             f"elite={epoch_totals['elite_score'] / num_batches:.4f} "
             f"model_elites={epoch_totals['model_elite_fraction'] / num_batches:.2f}"
         )
@@ -696,6 +707,7 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--property-weight", type=float, default=2.0)
     parser.add_argument("--surface-weight", type=float, default=0.02)
     parser.add_argument("--connectivity-weight", type=float, default=0.08)
     parser.add_argument("--mass-weight", type=float, default=0.15)

@@ -34,14 +34,14 @@ to the loss.
 ## Prototype implemented here
 
 This repository now includes a first runnable prototype built around the same
-core idea, using a lightweight spring-network FEM evaluator instead of the
-earlier heuristic mechanics surrogate.
+core idea, using a single differentiable spring-network FEM evaluator in
+PyTorch instead of the earlier heuristic mechanics surrogate.
 
 What the prototype does:
 
 - Generates connected binary 2D designs on a larger square grid.
 - Represents occupancies internally in continuous `[0, 1]` space during denoising.
-- Computes FEM-based `k_x`, `k_y`, and `k_theta` values from the topology.
+- Computes FEM-based `k_x`, `k_y`, and `k_theta` values from the topology with one differentiable evaluator.
 - Trains a patch-based transformer denoiser with an elite-search training loop conditioned on target properties.
 - Logs losses and generated samples to TensorBoard.
 - Samples a design for a requested target triple using FEM scoring and local search.
@@ -57,7 +57,7 @@ The current repository treats occupancies in two different roles on purpose:
 - During generation and denoising, the design lives in continuous `[0, 1]` space.
 - Values between `0` and `1` are not interpreted as partial physical material.
 - The official manufacturable design is the hard-thresholded topology `x >= 0.5`.
-- All official FEM property evaluation uses that thresholded binary design.
+- The same differentiable FEM can be evaluated on relaxed occupancies during training or on thresholded binary designs during candidate selection and reporting.
 - Topological connectivity is still judged with 4-neighbor adjacency; diagonal contact alone does not count as a valid bridge.
 
 This lets the model reason in a smooth space internally while still forcing a
@@ -77,10 +77,12 @@ For each batch of target properties:
 - Evaluate all candidates with the spring-network FEM.
 - Keep the best candidate per target as an elite.
 - Train the denoiser to reconstruct those elites from noisy continuous inputs.
+- Backpropagate property loss through the same differentiable FEM on the relaxed occupancy field.
 
 This means exploration comes from both the model sampler and the random
 candidate pool, while learning happens by imitating the best FEM-scored designs
-found so far.
+found so far and by using direct mechanical gradients from the differentiable
+FEM.
 
 During training, the prototype can also run periodic canonical evaluations for
 representative in-distribution targets derived from a larger synthetic
@@ -106,6 +108,10 @@ uv run cms-train --epochs 8 --dataset-size 256 --batch-size 16 \
 
 This training loop now also includes a binarization penalty so the continuous
 occupancies are pushed away from ambiguous gray values.
+
+The property loss is now computed directly through the differentiable FEM, so
+`--property-weight` controls how strongly the model is pushed to match the
+target stiffness triplet on the relaxed occupancy field.
 
 The default surface regularization is intentionally light so the search loop is
 less tempted to collapse into nearly empty or nearly full patches.

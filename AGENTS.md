@@ -14,7 +14,7 @@
 
 - Binary 2D topology grid with fixed bottom plate and movable top plate.
 - Patch-based transformer denoiser conditioned on target `k_x`, `k_y`, `k_theta`.
-- Spring-network FEM evaluator for topology stiffness instead of the earlier heuristic surrogate.
-- Occupancy values in `[0, 1]` are an internal relaxed representation; all official mechanical evaluation uses a hard threshold at `0.5`.
+- A single differentiable spring-network FEM evaluator in PyTorch is used throughout the project.
+- Occupancy values in `[0, 1]` are an internal relaxed representation; training uses the differentiable FEM directly on relaxed occupancies, while candidate selection and final reporting can still threshold at `0.5` when a hard binary design is needed.
 - Training uses search-and-imitation: sample candidates, evaluate them with FEM, keep elites, and train the denoiser on those elites.
 - Training logs and sample images are written to TensorBoard.
