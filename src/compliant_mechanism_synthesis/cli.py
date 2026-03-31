@@ -32,11 +32,11 @@ class TrainConfig:
     batch_size: int = 16
     epochs: int = 50
     learning_rate: float = 3e-4
-    rollout_steps: int = 5
-    rollout_step_size: float = 1.0
+    rollout_steps: int = 8
+    rollout_step_size: float = 0.5
     property_weight: float = 2.0
     surface_weight: float = 0.02
-    connectivity_weight: float = 0.08
+    connectivity_weight: float = 0.12
     mass_weight: float = 0.15
     binarization_weight: float = 0.1
     log_every_steps: int = 5
@@ -714,11 +714,11 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--rollout-steps", type=int, default=5)
-    parser.add_argument("--rollout-step-size", type=float, default=1.0)
+    parser.add_argument("--rollout-steps", type=int, default=8)
+    parser.add_argument("--rollout-step-size", type=float, default=0.5)
     parser.add_argument("--property-weight", type=float, default=2.0)
     parser.add_argument("--surface-weight", type=float, default=0.02)
-    parser.add_argument("--connectivity-weight", type=float, default=0.08)
+    parser.add_argument("--connectivity-weight", type=float, default=0.12)
     parser.add_argument("--mass-weight", type=float, default=0.15)
     parser.add_argument("--binarization-weight", type=float, default=0.1)
     parser.add_argument("--log-every-steps", type=int, default=5)

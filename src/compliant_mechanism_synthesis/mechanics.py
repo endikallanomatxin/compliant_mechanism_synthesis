@@ -42,6 +42,31 @@ def _cross_neighbor_max(values: torch.Tensor) -> torch.Tensor:
     return torch.maximum(torch.maximum(up, down), torch.maximum(left, right))
 
 
+def _solid_reachability(occupancy: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
+    reach = occupancy * seeds
+    for _ in range(occupancy.shape[-2]):
+        reach = occupancy * torch.maximum(reach, _cross_neighbor_max(reach))
+    return reach
+
+
+def _disconnect_distance_penalty(
+    top_reach: torch.Tensor, bottom_reach: torch.Tensor
+) -> torch.Tensor:
+    expanded_top = top_reach
+    expanded_bottom = bottom_reach
+    penalties: list[torch.Tensor] = []
+
+    for _ in range(top_reach.shape[-2]):
+        overlap = (expanded_top * expanded_bottom).amax(dim=(1, 2, 3))
+        penalties.append(1.0 - overlap)
+        expanded_top = torch.maximum(expanded_top, _cross_neighbor_max(expanded_top))
+        expanded_bottom = torch.maximum(
+            expanded_bottom, _cross_neighbor_max(expanded_bottom)
+        )
+
+    return torch.stack(penalties, dim=0).mean(dim=0).clamp(0.0, 1.0)
+
+
 def interface_length(occupancy: torch.Tensor) -> torch.Tensor:
     dx = torch.abs(occupancy[:, :, :, 1:] - occupancy[:, :, :, :-1]).mean(dim=(1, 2, 3))
     dy = torch.abs(occupancy[:, :, 1:, :] - occupancy[:, :, :-1, :]).mean(dim=(1, 2, 3))
@@ -51,14 +76,15 @@ def interface_length(occupancy: torch.Tensor) -> torch.Tensor:
 def topology_regularizers(occupancy: torch.Tensor) -> dict[str, torch.Tensor]:
     occupancy_mass = occupancy.mean(dim=(1, 2, 3))
     top = torch.zeros_like(occupancy)
+    bottom = torch.zeros_like(occupancy)
     top[:, :, 0, :] = 1.0
+    bottom[:, :, -1, :] = 1.0
 
-    reach = occupancy * top
-    for _ in range(occupancy.shape[-2]):
-        reach = occupancy * _cross_neighbor_max(reach)
+    top_reach = _solid_reachability(occupancy, top)
+    bottom_reach = _solid_reachability(occupancy, bottom)
 
-    bridge_fraction = reach[:, :, -1, :].mean(dim=(1, 2))
-    connectivity_penalty = (1.0 - bridge_fraction).clamp(0.0, 1.0)
+    bridge_fraction = top_reach[:, :, -1, :].mean(dim=(1, 2))
+    connectivity_penalty = _disconnect_distance_penalty(top_reach, bottom_reach)
     return {
         "surface": interface_length(occupancy),
         "connectivity_penalty": connectivity_penalty,

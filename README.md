@@ -96,7 +96,7 @@ uv sync
 
 ```bash
 uv run cms-train --epochs 50 --dataset-size 512 --batch-size 16 \
-  --rollout-steps 5 --rollout-step-size 1.0 \
+  --rollout-steps 8 --rollout-step-size 0.5 \
   --property-weight 2.0 --log-every-steps 5 \
   --canonical-eval-every-steps 20 \
   --name prototype
@@ -110,8 +110,8 @@ The property loss is now computed directly through the differentiable FEM, so
 target stiffness triplet on the relaxed occupancy field.
 
 `--rollout-steps` controls how many learned refinement steps the generator takes
- from noise to the final relaxed design, and `--rollout-step-size` scales each
- logits update.
+from noise to the final relaxed design, and `--rollout-step-size` scales each
+logits update.
 
 The default surface regularization is intentionally light so the generator is
 less tempted to collapse into nearly empty or nearly full patches.
@@ -119,6 +119,11 @@ less tempted to collapse into nearly empty or nearly full patches.
 The default connectivity regularization is also intentionally modest. It still
 discourages disconnected structures, but it should not dominate the search so
 hard that the model prefers trivial fully-solid-like solutions.
+
+That connectivity term is now a soft disconnect-distance penalty: it measures
+how many 4-neighbor dilations would be needed for the regions reachable from
+the top and bottom plates to meet, which gives a smoother signal than a simple
+connected/disconnected check.
 
 To reduce lattice anisotropy without letting corner-touching pixels count as a
 full structural connection, the spring-network FEM uses weak diagonal springs in
@@ -204,7 +209,7 @@ Run a verified training pass:
 
 ```bash
 uv run cms-train --epochs 3 --dataset-size 96 --batch-size 8 \
-  --rollout-steps 5 --rollout-step-size 1.0 \
+  --rollout-steps 8 --rollout-step-size 0.5 \
   --property-weight 2.0 --log-every-steps 2 \
   --canonical-eval-every-steps 4 \
   --name fem-verify-train \
