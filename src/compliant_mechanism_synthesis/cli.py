@@ -36,6 +36,7 @@ class TrainConfig:
     rollout_step_size: float = 0.5
     rollout_noise_scale: float = 0.03
     property_weight: float = 2.0
+    improvement_weight: float = 0.25
     surface_weight: float = 0.02
     connectivity_weight: float = 0.12
     mass_weight: float = 0.15
@@ -137,6 +138,15 @@ def _softmin_weights(losses: torch.Tensor, temperature: float) -> torch.Tensor:
     return torch.softmax(scaled, dim=1)
 
 
+def _monotonic_improvement_penalty(step_errors: list[torch.Tensor]) -> torch.Tensor:
+    penalties = []
+    for previous, current in zip(step_errors, step_errors[1:]):
+        penalties.append(F.relu(current - previous))
+    if not penalties:
+        return torch.zeros_like(step_errors[0])
+    return torch.stack(penalties, dim=0).mean(dim=0)
+
+
 def candidate_scores(
     designs: torch.Tensor, target_props: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
@@ -165,15 +175,23 @@ def _log_canonical_evaluation(
     noise = _fixed_noise(
         len(canonical_specs), config.grid_size, config.seed + 101, device
     )
-    probs = sample_from_model(
+    rollout = rollout_model(
         model,
         targets,
         noise,
         steps=config.rollout_steps,
         step_size=config.rollout_step_size,
     )
+    probs = rollout[-1]
     design = binarize_design(probs)
     search_scores, property_error, terms = candidate_scores(design, targets)
+
+    step_errors = []
+    for probs_step in rollout:
+        step_terms = mechanical_terms(probs_step)
+        step_errors.append(
+            ((step_terms["properties"] - targets).square().mean(dim=1)).cpu()
+        )
 
     for idx, (name, target_values) in enumerate(canonical_specs):
         design_image = design[idx : idx + 1].cpu()
@@ -193,6 +211,12 @@ def _log_canonical_evaluation(
         writer.add_scalar(f"canonical/{name}/achieved_ktheta", achieved[2].item(), step)
         writer.add_scalar(f"canonical/{name}/property_error", error, step)
         writer.add_scalar(f"canonical/{name}/score", search_scores[idx].item(), step)
+        for rollout_idx, errors in enumerate(step_errors, start=1):
+            writer.add_scalar(
+                f"canonical/{name}/property_error_step_{rollout_idx}",
+                errors[idx].item(),
+                step,
+            )
 
     _progress(
         "train:canonical_eval "
@@ -265,6 +289,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             "connectivity": 0.0,
             "mass": 0.0,
             "binarization": 0.0,
+            "improvement": 0.0,
             "binary_property_error": 0.0,
             "best_binary_property_error": 0.0,
             "candidate_spread": 0.0,
@@ -303,17 +328,22 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             per_candidate_property = torch.zeros(
                 expanded_targets.shape[0], device=device
             )
+            per_step_errors: list[torch.Tensor] = []
             for step_idx, probs in enumerate(rollout):
                 step_terms = mechanical_terms(probs)
                 step_error = (
                     (step_terms["properties"] - expanded_targets).square().mean(dim=1)
                 )
+                per_step_errors.append(step_error)
                 per_candidate_property = (
                     per_candidate_property + step_weights[step_idx] * step_error
                 )
 
+            improvement_penalty = _monotonic_improvement_penalty(per_step_errors)
+
             per_candidate_total = (
                 config.property_weight * per_candidate_property
+                + config.improvement_weight * improvement_penalty
                 + config.surface_weight * final_terms["surface"]
                 + config.connectivity_weight * final_terms["connectivity_penalty"]
                 + config.mass_weight * final_terms["occupancy_mass"]
@@ -347,10 +377,14 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
 
             property_loss = (soft_weights * per_target_property).sum(dim=1).mean()
+            per_target_improvement = improvement_penalty.view(
+                target_props.shape[0], config.train_samples_per_target
+            )
             surface = (soft_weights * per_target_surface).sum(dim=1).mean()
             connectivity = (soft_weights * per_target_connectivity).sum(dim=1).mean()
             mass = (soft_weights * per_target_mass).sum(dim=1).mean()
             binarization = (soft_weights * per_target_binarization).sum(dim=1).mean()
+            improvement = (soft_weights * per_target_improvement).sum(dim=1).mean()
             binary_property_error_mean = (
                 (soft_weights * per_target_binary_property).sum(dim=1).mean()
             )
@@ -369,6 +403,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             epoch_totals["connectivity"] += connectivity.item()
             epoch_totals["mass"] += mass.item()
             epoch_totals["binarization"] += binarization.item()
+            epoch_totals["improvement"] += improvement.item()
             epoch_totals["binary_property_error"] += binary_property_error_mean.item()
             epoch_totals["best_binary_property_error"] += (
                 best_binary_property_error.item()
@@ -384,6 +419,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             writer.add_scalar("train/occupancy_mass", mass.item(), global_step)
             writer.add_scalar(
                 "train/binarization_penalty", binarization.item(), global_step
+            )
+            writer.add_scalar(
+                "train/improvement_penalty", improvement.item(), global_step
             )
             writer.add_scalar(
                 "train/binary_property_error",
@@ -416,7 +454,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     f"epoch={epoch + 1}/{config.epochs} batch={batch_idx}/{len(loader)} "
                     f"global_step={global_step} total={total.item():.4f} "
                     f"prop={property_loss.item():.4f} bin_prop={binary_property_error_mean.item():.4f} "
-                    f"best_bin={best_binary_property_error.item():.4f} spread={candidate_spread.item():.4f}"
+                    f"best_bin={best_binary_property_error.item():.4f} improve={improvement.item():.4f} "
+                    f"spread={candidate_spread.item():.4f}"
                 )
 
         num_batches = max(len(loader), 1)
@@ -429,6 +468,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             f"total={epoch_totals['total'] / num_batches:.4f} "
             f"prop={epoch_totals['property'] / num_batches:.4f} "
             f"bin_prop={epoch_totals['binary_property_error'] / num_batches:.4f} "
+            f"improve={epoch_totals['improvement'] / num_batches:.4f} "
             f"best_bin={epoch_totals['best_binary_property_error'] / num_batches:.4f} "
             f"spread={epoch_totals['candidate_spread'] / num_batches:.4f}"
         )
@@ -818,6 +858,7 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-step-size", type=float, default=0.5)
     parser.add_argument("--rollout-noise-scale", type=float, default=0.03)
     parser.add_argument("--property-weight", type=float, default=2.0)
+    parser.add_argument("--improvement-weight", type=float, default=0.25)
     parser.add_argument("--surface-weight", type=float, default=0.02)
     parser.add_argument("--connectivity-weight", type=float, default=0.12)
     parser.add_argument("--mass-weight", type=float, default=0.15)

@@ -76,6 +76,7 @@ For each batch of target properties:
 - Roll each of them forward through several learned refinement steps.
 - Evaluate the same differentiable FEM directly on the intermediate and final relaxed occupancy fields.
 - Aggregate candidates with a softmin objective so promising alternatives still contribute gradient.
+- Penalize rollout steps that get worse instead of better.
 - Backpropagate property loss across the rollout plus lightweight final-step topology regularization.
 
 This keeps the training objective focused on the core problem: generate a
@@ -123,6 +124,9 @@ during training, and `--train-samples-per-target` with
 `--train-softmin-temperature` controls how strongly the optimizer explores and
 selects among multiple candidates for the same target.
 
+`--improvement-weight` controls a soft monotonicity penalty that discourages the
+rollout from making no progress until the final step.
+
 The default surface regularization is intentionally light so the generator is
 less tempted to collapse into nearly empty or nearly full patches.
 
@@ -164,6 +168,9 @@ canonical/low-kx_high-ky-ktheta/design
 canonical/high-kx_low-ky-high-ktheta/design
 canonical/high-kx-ky_low-ktheta/design
 ```
+
+Each canonical target also logs per-step property error, so you can see whether
+the rollout actually improves over time or just makes a late correction.
 
 ## Sample
 
