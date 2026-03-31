@@ -34,14 +34,18 @@ class TrainConfig:
     batch_size: int = 16
     epochs: int = 8
     learning_rate: float = 3e-4
-    surface_weight: float = 0.05
-    connectivity_weight: float = 0.2
+    surface_weight: float = 0.02
+    connectivity_weight: float = 0.08
     mass_weight: float = 0.15
     binarization_weight: float = 0.1
     train_model_candidates: int = 2
     train_random_candidates: int = 6
     train_sample_steps: int = 6
     log_every_steps: int = 5
+    canonical_eval_every_steps: int = 20
+    canonical_model_candidates: int = 2
+    canonical_random_candidates: int = 4
+    canonical_sample_steps: int = 6
     log_dir: str = "runs/prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
     seed: int = 7
@@ -88,6 +92,14 @@ def _progress(message: str) -> None:
     print(message, flush=True)
 
 
+def _canonical_target_specs() -> list[tuple[str, tuple[float, float, float]]]:
+    return [
+        ("0-1-1", (0.0, 1.0, 1.0)),
+        ("1-0-1", (1.0, 0.0, 1.0)),
+        ("1-1-0", (1.0, 1.0, 0.0)),
+    ]
+
+
 def candidate_scores(
     designs: torch.Tensor, target_props: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
@@ -97,9 +109,55 @@ def candidate_scores(
         property_error
         + 0.10 * terms["connectivity_penalty"]
         + 0.02 * terms["occupancy_mass"]
-        + 0.02 * terms["surface"]
+        + 0.005 * terms["surface"]
     )
     return score, property_error, terms
+
+
+def _log_canonical_evaluation(
+    writer: SummaryWriter,
+    model: ConditionedDenoiser,
+    config: TrainConfig,
+    step: int,
+    device: torch.device,
+) -> None:
+    specs = _canonical_target_specs()
+    targets = torch.tensor(
+        [values for _, values in specs], dtype=torch.float32, device=device
+    )
+    search = search_elite_batch(
+        model=model,
+        target_props=targets,
+        grid_size=config.grid_size,
+        model_candidates=config.canonical_model_candidates,
+        random_candidates=config.canonical_random_candidates,
+        steps=config.canonical_sample_steps,
+    )
+
+    for idx, (name, target_values) in enumerate(specs):
+        design = search["designs"][idx : idx + 1].cpu()
+        achieved = search["terms"]["properties"][idx]
+        error = search["property_error"][idx].item()
+        writer.add_images(
+            f"canonical/{name}/design", design, global_step=step, dataformats="NCHW"
+        )
+        writer.add_scalar(f"canonical/{name}/target_kx", target_values[0], step)
+        writer.add_scalar(f"canonical/{name}/target_ky", target_values[1], step)
+        writer.add_scalar(f"canonical/{name}/target_ktheta", target_values[2], step)
+        writer.add_scalar(f"canonical/{name}/achieved_kx", achieved[0].item(), step)
+        writer.add_scalar(f"canonical/{name}/achieved_ky", achieved[1].item(), step)
+        writer.add_scalar(f"canonical/{name}/achieved_ktheta", achieved[2].item(), step)
+        writer.add_scalar(f"canonical/{name}/property_error", error, step)
+        writer.add_scalar(
+            f"canonical/{name}/elite_score", search["scores"][idx].item(), step
+        )
+
+    _progress(
+        "train:canonical_eval "
+        f"step={step} err_0-1-1={search['property_error'][0].item():.4f} "
+        f"err_1-0-1={search['property_error'][1].item():.4f} "
+        f"err_1-1-0={search['property_error'][2].item():.4f}"
+    )
 
 
 def train(config: TrainConfig) -> tuple[Path, Path]:
@@ -226,6 +284,12 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 "train/model_elite_fraction", model_elite_fraction, global_step
             )
             global_step += 1
+
+            if (
+                config.canonical_eval_every_steps > 0
+                and global_step % config.canonical_eval_every_steps == 0
+            ):
+                _log_canonical_evaluation(writer, model, config, global_step, device)
 
             if config.log_every_steps > 0 and (
                 batch_idx % config.log_every_steps == 0 or batch_idx == len(loader)
@@ -606,14 +670,18 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--surface-weight", type=float, default=0.05)
-    parser.add_argument("--connectivity-weight", type=float, default=0.2)
+    parser.add_argument("--surface-weight", type=float, default=0.02)
+    parser.add_argument("--connectivity-weight", type=float, default=0.08)
     parser.add_argument("--mass-weight", type=float, default=0.15)
     parser.add_argument("--binarization-weight", type=float, default=0.1)
     parser.add_argument("--train-model-candidates", type=int, default=2)
     parser.add_argument("--train-random-candidates", type=int, default=6)
     parser.add_argument("--train-sample-steps", type=int, default=6)
     parser.add_argument("--log-every-steps", type=int, default=5)
+    parser.add_argument("--canonical-eval-every-steps", type=int, default=20)
+    parser.add_argument("--canonical-model-candidates", type=int, default=2)
+    parser.add_argument("--canonical-random-candidates", type=int, default=4)
+    parser.add_argument("--canonical-sample-steps", type=int, default=6)
     parser.add_argument("--log-dir", default="runs/prototype")
     parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
     parser.add_argument("--seed", type=int, default=7)

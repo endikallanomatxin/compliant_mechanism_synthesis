@@ -45,6 +45,7 @@ What the prototype does:
 - Trains a patch-based transformer denoiser with an elite-search training loop conditioned on target properties.
 - Logs losses and generated samples to TensorBoard.
 - Samples a design for a requested target triple using FEM scoring and local search.
+- Uses 4-neighbor connectivity for topology validity, while the FEM adds weak diagonal springs to reduce grid anisotropy.
 
 This is meant to validate the end-to-end workflow before investing in a more
 physical continuum solver and a more faithful diffusion process.
@@ -57,6 +58,7 @@ The current repository treats occupancies in two different roles on purpose:
 - Values between `0` and `1` are not interpreted as partial physical material.
 - The official manufacturable design is the hard-thresholded topology `x >= 0.5`.
 - All official FEM property evaluation uses that thresholded binary design.
+- Topological connectivity is still judged with 4-neighbor adjacency; diagonal contact alone does not count as a valid bridge.
 
 This lets the model reason in a smooth space internally while still forcing a
 clear binary decision whenever we ask the mechanics model for `k_x`, `k_y`, and
@@ -80,6 +82,11 @@ This means exploration comes from both the model sampler and the random
 candidate pool, while learning happens by imitating the best FEM-scored designs
 found so far.
 
+During training, the prototype can also run periodic canonical evaluations for
+the targets `(0,1,1)`, `(1,0,1)`, and `(1,1,0)`. Those snapshots are written to
+TensorBoard so you can visually track whether the model is learning distinct
+families of mechanisms instead of collapsing to trivial patches.
+
 ## Setup
 
 ```bash
@@ -91,14 +98,44 @@ uv sync
 ```bash
 uv run cms-train --epochs 8 --dataset-size 256 --batch-size 16 \
   --train-model-candidates 2 --train-random-candidates 6 \
-  --train-sample-steps 6 --log-every-steps 5 --log-dir runs/prototype
+  --train-sample-steps 6 --log-every-steps 5 \
+  --canonical-eval-every-steps 20 \
+  --log-dir runs/prototype
 ```
 
 This training loop now also includes a binarization penalty so the continuous
 occupancies are pushed away from ambiguous gray values.
 
+The default surface regularization is intentionally light so the search loop is
+less tempted to collapse into nearly empty or nearly full patches.
+
+The default connectivity regularization is also intentionally modest. It still
+discourages disconnected structures, but it should not dominate the search so
+hard that the model prefers trivial fully-solid-like solutions.
+
+To reduce lattice anisotropy without letting corner-touching pixels count as a
+full structural connection, the spring-network FEM uses weak diagonal springs in
+addition to the main axial ones.
+
 The `dataset-size` here is the size of the synthetic target-property pool used
 to define which stiffness triplets the search loop practices against.
+
+Canonical evaluations are controlled with:
+
+```bash
+--canonical-eval-every-steps 20
+--canonical-model-candidates 2
+--canonical-random-candidates 4
+--canonical-sample-steps 6
+```
+
+Those runs are logged under TensorBoard tags like:
+
+```text
+canonical/0-1-1/design
+canonical/1-0-1/design
+canonical/1-1-0/design
+```
 
 ## Sample
 
@@ -154,6 +191,7 @@ Run a verified training pass:
 uv run cms-train --epochs 3 --dataset-size 96 --batch-size 8 \
   --train-model-candidates 2 --train-random-candidates 4 \
   --train-sample-steps 4 --log-every-steps 2 \
+  --canonical-eval-every-steps 4 \
   --log-dir runs/fem-verify-train \
   --checkpoint-path artifacts/fem-verify.pt
 ```

@@ -7,7 +7,10 @@ import torch
 import torch.nn.functional as F
 
 
-SPRING_NEIGHBORS = ((1, 0), (0, 1), (1, 1), (1, -1))
+AXIAL_SPRING_NEIGHBORS = ((1, 0), (0, 1))
+DIAGONAL_SPRING_NEIGHBORS = ((1, 1), (1, -1))
+GRID_NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+DIAGONAL_STIFFNESS_SCALE = 0.25
 
 
 def threshold_occupancy(
@@ -18,6 +21,15 @@ def threshold_occupancy(
 
 def binarization_penalty(occupancy: torch.Tensor) -> torch.Tensor:
     return (occupancy * (1.0 - occupancy)).mean(dim=(1, 2, 3))
+
+
+def _cross_neighbor_max(values: torch.Tensor) -> torch.Tensor:
+    padded = F.pad(values, (1, 1, 1, 1), mode="constant", value=0.0)
+    up = padded[:, :, :-2, 1:-1]
+    down = padded[:, :, 2:, 1:-1]
+    left = padded[:, :, 1:-1, :-2]
+    right = padded[:, :, 1:-1, 2:]
+    return torch.maximum(torch.maximum(up, down), torch.maximum(left, right))
 
 
 def _bridge_component_ratio(mask: np.ndarray) -> tuple[float, float]:
@@ -32,19 +44,16 @@ def _bridge_component_ratio(mask: np.ndarray) -> tuple[float, float]:
 
     while stack:
         r, c = stack.pop()
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                nr = r + dr
-                nc = c + dc
-                if nr < 0 or nr >= height or nc < 0 or nc >= width:
-                    continue
-                if not mask[nr, nc] or (nr, nc) in visited:
-                    continue
-                visited.add((nr, nc))
-                touches_bottom = touches_bottom or nr == height - 1
-                stack.append((nr, nc))
+        for dr, dc in GRID_NEIGHBORS:
+            nr = r + dr
+            nc = c + dc
+            if nr < 0 or nr >= height or nc < 0 or nc >= width:
+                continue
+            if not mask[nr, nc] or (nr, nc) in visited:
+                continue
+            visited.add((nr, nc))
+            touches_bottom = touches_bottom or nr == height - 1
+            stack.append((nr, nc))
 
     active = int(mask.sum())
     bridge_mass = len(visited) if touches_bottom else 0
@@ -69,7 +78,7 @@ def topology_regularizers(occupancy: torch.Tensor) -> dict[str, torch.Tensor]:
 
     reach = occupancy * top
     for _ in range(occupancy.shape[-2]):
-        reach = occupancy * F.max_pool2d(reach, kernel_size=3, stride=1, padding=1)
+        reach = occupancy * _cross_neighbor_max(reach)
 
     bridge_fraction = reach[:, :, -1, :].mean(dim=(1, 2))
     connectivity_penalty = (1.0 - bridge_fraction).clamp(0.0, 1.0)
@@ -80,12 +89,12 @@ def topology_regularizers(occupancy: torch.Tensor) -> dict[str, torch.Tensor]:
     }
 
 
-def _spring_matrix(dr: int, dc: int) -> np.ndarray:
+def _spring_matrix(dr: int, dc: int, scale: float = 1.0) -> np.ndarray:
     direction = np.array([float(dc), float(-dr)], dtype=np.float64)
     length = np.linalg.norm(direction)
     unit = direction / length
     axial = np.outer(unit, unit)
-    stiffness = 1.0 / length
+    stiffness = scale / length
     return stiffness * np.block([[axial, -axial], [-axial, axial]])
 
 
@@ -103,7 +112,7 @@ def _assemble_stiffness(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     for r, c in coords:
         source = node_ids[r, c]
-        for dr, dc in SPRING_NEIGHBORS:
+        for dr, dc in AXIAL_SPRING_NEIGHBORS:
             nr = r + dr
             nc = c + dc
             if nr < 0 or nr >= mask.shape[0] or nc < 0 or nc >= mask.shape[1]:
@@ -113,6 +122,21 @@ def _assemble_stiffness(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
             target = node_ids[nr, nc]
             element = _spring_matrix(dr, dc)
+            dofs = np.array(
+                [2 * source, 2 * source + 1, 2 * target, 2 * target + 1], dtype=np.int32
+            )
+            stiffness[np.ix_(dofs, dofs)] += element
+
+        for dr, dc in DIAGONAL_SPRING_NEIGHBORS:
+            nr = r + dr
+            nc = c + dc
+            if nr < 0 or nr >= mask.shape[0] or nc < 0 or nc >= mask.shape[1]:
+                continue
+            if not mask[nr, nc]:
+                continue
+
+            target = node_ids[nr, nc]
+            element = _spring_matrix(dr, dc, scale=DIAGONAL_STIFFNESS_SCALE)
             dofs = np.array(
                 [2 * source, 2 * source + 1, 2 * target, 2 * target + 1], dtype=np.int32
             )

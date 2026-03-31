@@ -18,10 +18,13 @@ def _draw_segment(
 ) -> None:
     r0, c0 = start
     r1, c1 = end
-    steps = max(abs(r1 - r0), abs(c1 - c0)) + 1
-    rows = torch.linspace(r0, r1, steps=steps).round().long()
-    cols = torch.linspace(c0, c1, steps=steps).round().long()
-    grid[rows, cols] = 1.0
+    row_step = 1 if r1 >= r0 else -1
+    col_step = 1 if c1 >= c0 else -1
+
+    for row in range(r0, r1 + row_step, row_step):
+        grid[row, c0] = 1.0
+    for col in range(c0, c1 + col_step, col_step):
+        grid[r1, col] = 1.0
 
 
 def _random_polyline(grid_size: int) -> list[tuple[int, int]]:
