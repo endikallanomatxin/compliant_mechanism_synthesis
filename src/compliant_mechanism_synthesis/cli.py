@@ -46,7 +46,7 @@ class TrainConfig:
     canonical_model_candidates: int = 2
     canonical_random_candidates: int = 4
     canonical_sample_steps: int = 6
-    log_dir: str = "runs/prototype"
+    name: str = "prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
     seed: int = 7
 
@@ -82,10 +82,9 @@ def _write_samples(
     writer.add_images(tag, grids[:8], global_step=step, dataformats="NCHW")
 
 
-def _timestamped_run_dir(log_dir: str) -> Path:
-    base = Path(log_dir)
+def _timestamped_run_dir(name: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return base.parent / f"{timestamp}-{base.name}"
+    return Path("runs") / f"{timestamp}-{name}"
 
 
 def _progress(message: str) -> None:
@@ -185,7 +184,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     reconstruction_loss = nn.BCEWithLogitsLoss()
 
-    log_dir = _timestamped_run_dir(config.log_dir)
+    log_dir = _timestamped_run_dir(config.name)
     checkpoint_path = Path(config.checkpoint_path)
     log_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -567,7 +566,7 @@ def sample(
     checkpoint_path: str,
     target_props: list[float],
     steps: int,
-    log_dir: str,
+    name: str,
     output_path: str,
     model_candidates: int,
     random_candidates: int,
@@ -621,7 +620,7 @@ def sample(
     with torch.no_grad():
         terms = mechanical_terms(design)
 
-    log_path = _timestamped_run_dir(log_dir)
+    log_path = _timestamped_run_dir(name)
     log_path.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(log_path))
     _write_samples(writer, "sample/final_design", design.cpu(), 0)
@@ -682,7 +681,7 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--canonical-model-candidates", type=int, default=2)
     parser.add_argument("--canonical-random-candidates", type=int, default=4)
     parser.add_argument("--canonical-sample-steps", type=int, default=6)
-    parser.add_argument("--log-dir", default="runs/prototype")
+    parser.add_argument("--name", default="prototype")
     parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
     parser.add_argument("--seed", type=int, default=7)
     return parser
@@ -702,7 +701,7 @@ def _sample_parser() -> argparse.ArgumentParser:
     parser.add_argument("--search-iterations", type=int, default=10)
     parser.add_argument("--proposal-count", type=int, default=12)
     parser.add_argument("--log-every-steps", type=int, default=2)
-    parser.add_argument("--log-dir", default="runs/sample")
+    parser.add_argument("--name", default="sample")
     parser.add_argument("--output-path", default="artifacts/sample.pt")
     return parser
 
@@ -720,7 +719,7 @@ def sample_main() -> None:
         checkpoint_path=args.checkpoint_path,
         target_props=[args.target_kx, args.target_ky, args.target_ktheta],
         steps=args.steps,
-        log_dir=args.log_dir,
+        name=args.name,
         output_path=args.output_path,
         model_candidates=args.model_candidates,
         random_candidates=args.random_candidates,

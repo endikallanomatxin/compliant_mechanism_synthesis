@@ -100,7 +100,7 @@ uv run cms-train --epochs 8 --dataset-size 256 --batch-size 16 \
   --train-model-candidates 2 --train-random-candidates 6 \
   --train-sample-steps 6 --log-every-steps 5 \
   --canonical-eval-every-steps 20 \
-  --log-dir runs/prototype
+  --name prototype
 ```
 
 This training loop now also includes a binarization penalty so the continuous
@@ -142,6 +142,7 @@ canonical/1-1-0/design
 ```bash
 uv run cms-sample --checkpoint-path artifacts/prototype.pt \
   --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18 \
+  --name sample \
   --log-every-steps 2
 ```
 
@@ -155,8 +156,9 @@ uv run tensorboard --logdir runs
 ```
 
 Artifacts are written under `artifacts/` and logs under `runs/`.
-Each training or sampling run automatically creates a timestamped directory like
-`runs/20260330-154500-prototype`, so runs stay ordered lexicographically.
+Each training or sampling run uses `--name` and automatically creates a
+timestamped directory like `runs/20260330-154500-prototype`, so runs stay
+ordered lexicographically without needing to pass a path-like log name.
 
 ## Sampling Budget
 
@@ -172,6 +174,7 @@ uv run cms-sample --checkpoint-path artifacts/prototype.pt \
   --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18 \
   --model-candidates 2 --random-candidates 6 \
   --search-iterations 6 --proposal-count 8 \
+  --name fast-sample \
   --log-every-steps 2
 ```
 
@@ -192,7 +195,7 @@ uv run cms-train --epochs 3 --dataset-size 96 --batch-size 8 \
   --train-model-candidates 2 --train-random-candidates 4 \
   --train-sample-steps 4 --log-every-steps 2 \
   --canonical-eval-every-steps 4 \
-  --log-dir runs/fem-verify-train \
+  --name fem-verify-train \
   --checkpoint-path artifacts/fem-verify.pt
 ```
 
@@ -203,7 +206,7 @@ uv run cms-sample --checkpoint-path artifacts/fem-verify.pt \
   --target-kx 0.20 --target-ky 0.28 --target-ktheta 0.18 \
   --model-candidates 2 --random-candidates 6 \
   --search-iterations 6 --proposal-count 8 --log-every-steps 2 \
-  --log-dir runs/fem-verify-sample \
+  --name fem-verify-sample \
   --output-path artifacts/fem-verify-sample.pt
 ```
 

@@ -8,6 +8,7 @@
   - `uv run cms-sample ...`
 - The current prototype is intentionally lightweight and CPU-friendly.
 - When extending the project, prefer small incremental changes over broad rewrites.
+- This project is green-field: do not add backward-compatibility code, fallback paths, or migration shims unless explicitly requested.
 
 ## Prototype Scope
 
