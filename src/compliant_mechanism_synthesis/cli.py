@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.data import generate_dataset, generate_design
@@ -34,11 +34,14 @@ class TrainConfig:
     learning_rate: float = 3e-4
     rollout_steps: int = 8
     rollout_step_size: float = 0.5
+    rollout_noise_scale: float = 0.03
     property_weight: float = 2.0
     surface_weight: float = 0.02
     connectivity_weight: float = 0.12
     mass_weight: float = 0.15
     binarization_weight: float = 0.1
+    train_samples_per_target: int = 4
+    train_softmin_temperature: float = 0.25
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
     name: str = "prototype"
@@ -112,6 +115,28 @@ def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
     return weights / weights.sum()
 
 
+def _target_sampling_weights(
+    targets: torch.Tensor, bins_per_dim: int = 6
+) -> torch.Tensor:
+    weights = torch.zeros(targets.shape[0], dtype=torch.float32)
+    quantiles = torch.linspace(0.0, 1.0, steps=bins_per_dim + 1)
+    for dim in range(targets.shape[1]):
+        values = targets[:, dim].contiguous()
+        edges = torch.quantile(values, quantiles)
+        inner_edges = edges[1:-1].contiguous()
+        bin_ids = torch.bucketize(values, inner_edges)
+        counts = torch.bincount(bin_ids, minlength=bins_per_dim).clamp_min(1)
+        weights = weights + counts[bin_ids].float().reciprocal()
+
+    weights = weights / weights.mean().clamp_min(1e-6)
+    return weights
+
+
+def _softmin_weights(losses: torch.Tensor, temperature: float) -> torch.Tensor:
+    scaled = -losses / max(temperature, 1e-6)
+    return torch.softmax(scaled, dim=1)
+
+
 def candidate_scores(
     designs: torch.Tensor, target_props: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
@@ -183,7 +208,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     _progress(
         "train:start "
         f"device={device} epochs={config.epochs} dataset_size={config.dataset_size} "
-        f"batch_size={config.batch_size} rollout_steps={config.rollout_steps}"
+        f"batch_size={config.batch_size} rollout_steps={config.rollout_steps} "
+        f"samples_per_target={config.train_samples_per_target}"
     )
 
     designs = generate_dataset(config.dataset_size, config.grid_size, config.seed)
@@ -197,7 +223,13 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     )["properties"]
     canonical_specs = _canonical_target_specs(canonical_reference_targets)
     dataset = TensorDataset(targets)
-    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    sampling_weights = _target_sampling_weights(targets)
+    sampler = WeightedRandomSampler(
+        weights=sampling_weights,
+        num_samples=len(targets),
+        replacement=True,
+    )
+    loader = DataLoader(dataset, batch_size=config.batch_size, sampler=sampler)
     _progress(
         "train:canonical_targets "
         + " ".join(
@@ -234,48 +266,98 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             "mass": 0.0,
             "binarization": 0.0,
             "binary_property_error": 0.0,
+            "best_binary_property_error": 0.0,
+            "candidate_spread": 0.0,
         }
 
         for batch_idx, (target_props,) in enumerate(loader, start=1):
             target_props = target_props.to(device)
+            expanded_targets = target_props.repeat_interleave(
+                config.train_samples_per_target, dim=0
+            )
             noise = torch.rand(
-                (target_props.shape[0], 1, config.grid_size, config.grid_size),
+                (
+                    expanded_targets.shape[0],
+                    1,
+                    config.grid_size,
+                    config.grid_size,
+                ),
                 device=device,
             )
             rollout = rollout_model(
                 model,
-                target_props,
+                expanded_targets,
                 noise,
                 steps=config.rollout_steps,
                 step_size=config.rollout_step_size,
+                noise_scale=config.rollout_noise_scale,
             )
             final_probs = rollout[-1]
             final_terms = mechanical_terms(final_probs)
             binary_predictions = _force_plates(threshold_occupancy(final_probs))
             _, binary_property_error, _ = candidate_scores(
-                binary_predictions, target_props
+                binary_predictions, expanded_targets
             )
 
             step_weights = _step_weights(config.rollout_steps, device)
-            property_loss = torch.zeros((), device=device)
+            per_candidate_property = torch.zeros(
+                expanded_targets.shape[0], device=device
+            )
             for step_idx, probs in enumerate(rollout):
                 step_terms = mechanical_terms(probs)
-                property_loss = property_loss + step_weights[step_idx] * F.mse_loss(
-                    step_terms["properties"], target_props
+                step_error = (
+                    (step_terms["properties"] - expanded_targets).square().mean(dim=1)
+                )
+                per_candidate_property = (
+                    per_candidate_property + step_weights[step_idx] * step_error
                 )
 
-            surface = final_terms["surface"].mean()
-            connectivity = final_terms["connectivity_penalty"].mean()
-            mass = final_terms["occupancy_mass"].mean()
-            binarization = binarization_penalty(final_probs).mean()
-            binary_property_error_mean = binary_property_error.mean()
-            total = (
-                config.property_weight * property_loss
-                + config.surface_weight * surface
-                + config.connectivity_weight * connectivity
-                + config.mass_weight * mass
-                + config.binarization_weight * binarization
+            per_candidate_total = (
+                config.property_weight * per_candidate_property
+                + config.surface_weight * final_terms["surface"]
+                + config.connectivity_weight * final_terms["connectivity_penalty"]
+                + config.mass_weight * final_terms["occupancy_mass"]
+                + config.binarization_weight * binarization_penalty(final_probs)
             )
+            per_target_total = per_candidate_total.view(
+                target_props.shape[0], config.train_samples_per_target
+            )
+            soft_weights = _softmin_weights(
+                per_target_total, config.train_softmin_temperature
+            )
+            total = (soft_weights * per_target_total).sum(dim=1).mean()
+
+            per_target_property = per_candidate_property.view(
+                target_props.shape[0], config.train_samples_per_target
+            )
+            per_target_surface = final_terms["surface"].view(
+                target_props.shape[0], config.train_samples_per_target
+            )
+            per_target_connectivity = final_terms["connectivity_penalty"].view(
+                target_props.shape[0], config.train_samples_per_target
+            )
+            per_target_mass = final_terms["occupancy_mass"].view(
+                target_props.shape[0], config.train_samples_per_target
+            )
+            per_target_binarization = binarization_penalty(final_probs).view(
+                target_props.shape[0], config.train_samples_per_target
+            )
+            per_target_binary_property = binary_property_error.view(
+                target_props.shape[0], config.train_samples_per_target
+            )
+
+            property_loss = (soft_weights * per_target_property).sum(dim=1).mean()
+            surface = (soft_weights * per_target_surface).sum(dim=1).mean()
+            connectivity = (soft_weights * per_target_connectivity).sum(dim=1).mean()
+            mass = (soft_weights * per_target_mass).sum(dim=1).mean()
+            binarization = (soft_weights * per_target_binarization).sum(dim=1).mean()
+            binary_property_error_mean = (
+                (soft_weights * per_target_binary_property).sum(dim=1).mean()
+            )
+            best_binary_property_error = per_target_binary_property.min(
+                dim=1
+            ).values.mean()
+            candidate_spread = per_target_total.std(dim=1).mean()
 
             optimizer.zero_grad(set_to_none=True)
             total.backward()
@@ -288,6 +370,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             epoch_totals["mass"] += mass.item()
             epoch_totals["binarization"] += binarization.item()
             epoch_totals["binary_property_error"] += binary_property_error_mean.item()
+            epoch_totals["best_binary_property_error"] += (
+                best_binary_property_error.item()
+            )
+            epoch_totals["candidate_spread"] += candidate_spread.item()
 
             writer.add_scalar("train/total_loss", total.item(), global_step)
             writer.add_scalar("train/property_loss", property_loss.item(), global_step)
@@ -303,6 +389,14 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 "train/binary_property_error",
                 binary_property_error_mean.item(),
                 global_step,
+            )
+            writer.add_scalar(
+                "train/best_binary_property_error",
+                best_binary_property_error.item(),
+                global_step,
+            )
+            writer.add_scalar(
+                "train/candidate_spread", candidate_spread.item(), global_step
             )
             global_step += 1
 
@@ -322,7 +416,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     f"epoch={epoch + 1}/{config.epochs} batch={batch_idx}/{len(loader)} "
                     f"global_step={global_step} total={total.item():.4f} "
                     f"prop={property_loss.item():.4f} bin_prop={binary_property_error_mean.item():.4f} "
-                    f"surface={surface.item():.4f} conn={connectivity.item():.4f}"
+                    f"best_bin={best_binary_property_error.item():.4f} spread={candidate_spread.item():.4f}"
                 )
 
         num_batches = max(len(loader), 1)
@@ -335,8 +429,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             f"total={epoch_totals['total'] / num_batches:.4f} "
             f"prop={epoch_totals['property'] / num_batches:.4f} "
             f"bin_prop={epoch_totals['binary_property_error'] / num_batches:.4f} "
-            f"surface={epoch_totals['surface'] / num_batches:.4f} "
-            f"conn={epoch_totals['connectivity'] / num_batches:.4f}"
+            f"best_bin={epoch_totals['best_binary_property_error'] / num_batches:.4f} "
+            f"spread={epoch_totals['candidate_spread'] / num_batches:.4f}"
         )
 
         model.eval()
@@ -389,6 +483,7 @@ def rollout_model(
     initial_noise: torch.Tensor,
     steps: int,
     step_size: float,
+    noise_scale: float = 0.0,
 ) -> list[torch.Tensor]:
     current_logits = torch.logit(initial_noise.clamp(1e-4, 1.0 - 1e-4))
     states: list[torch.Tensor] = []
@@ -401,6 +496,11 @@ def rollout_model(
             device=initial_noise.device,
         )
         delta_logits = model(current_probs, target_props, timestep)
+        if noise_scale > 0.0:
+            step_noise_scale = noise_scale * (1.0 - step_idx / max(steps - 1, 1))
+            delta_logits = delta_logits + step_noise_scale * torch.randn_like(
+                delta_logits
+            )
         current_logits = current_logits + step_size * delta_logits
         states.append(_force_plates(torch.sigmoid(current_logits)))
 
@@ -716,11 +816,14 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--rollout-steps", type=int, default=8)
     parser.add_argument("--rollout-step-size", type=float, default=0.5)
+    parser.add_argument("--rollout-noise-scale", type=float, default=0.03)
     parser.add_argument("--property-weight", type=float, default=2.0)
     parser.add_argument("--surface-weight", type=float, default=0.02)
     parser.add_argument("--connectivity-weight", type=float, default=0.12)
     parser.add_argument("--mass-weight", type=float, default=0.15)
     parser.add_argument("--binarization-weight", type=float, default=0.1)
+    parser.add_argument("--train-samples-per-target", type=int, default=4)
+    parser.add_argument("--train-softmin-temperature", type=float, default=0.25)
     parser.add_argument("--log-every-steps", type=int, default=5)
     parser.add_argument("--canonical-eval-every-steps", type=int, default=20)
     parser.add_argument("--name", default="prototype")

@@ -72,13 +72,16 @@ with mechanical gradients.
 For each batch of target properties:
 
 - Sample a fresh noise grid.
-- Roll that noise forward through several learned refinement steps.
+- Sample several fresh noise grids per target.
+- Roll each of them forward through several learned refinement steps.
 - Evaluate the same differentiable FEM directly on the intermediate and final relaxed occupancy fields.
+- Aggregate candidates with a softmin objective so promising alternatives still contribute gradient.
 - Backpropagate property loss across the rollout plus lightweight final-step topology regularization.
 
 This keeps the training objective focused on the core problem: generate a
 topology whose mechanical response matches the requested target, while staying
-simple, connected, and close to binary.
+simple, connected, and close to binary, while still exploring more than one
+candidate family per target.
 
 During training, the prototype can also run periodic canonical evaluations for
 representative in-distribution targets derived from a larger synthetic
@@ -97,7 +100,9 @@ uv sync
 ```bash
 uv run cms-train --epochs 50 --dataset-size 512 --batch-size 16 \
   --rollout-steps 8 --rollout-step-size 0.5 \
+  --rollout-noise-scale 0.03 \
   --property-weight 2.0 --log-every-steps 5 \
+  --train-samples-per-target 4 --train-softmin-temperature 0.25 \
   --canonical-eval-every-steps 20 \
   --name prototype
 ```
@@ -112,6 +117,11 @@ target stiffness triplet on the relaxed occupancy field.
 `--rollout-steps` controls how many learned refinement steps the generator takes
 from noise to the final relaxed design, and `--rollout-step-size` scales each
 logits update.
+
+`--rollout-noise-scale` adds a small decaying perturbation inside the rollout
+during training, and `--train-samples-per-target` with
+`--train-softmin-temperature` controls how strongly the optimizer explores and
+selects among multiple candidates for the same target.
 
 The default surface regularization is intentionally light so the generator is
 less tempted to collapse into nearly empty or nearly full patches.
@@ -210,7 +220,9 @@ Run a verified training pass:
 ```bash
 uv run cms-train --epochs 3 --dataset-size 96 --batch-size 8 \
   --rollout-steps 8 --rollout-step-size 0.5 \
+  --rollout-noise-scale 0.03 \
   --property-weight 2.0 --log-every-steps 2 \
+  --train-samples-per-target 4 --train-softmin-temperature 0.25 \
   --canonical-eval-every-steps 4 \
   --name fem-verify-train \
   --checkpoint-path artifacts/fem-verify.pt

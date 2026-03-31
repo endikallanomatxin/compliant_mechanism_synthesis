@@ -17,4 +17,5 @@
 - A single differentiable spring-network FEM evaluator in PyTorch is used throughout the project.
 - Occupancy values in `[0, 1]` are an internal relaxed representation; training uses the differentiable FEM directly on relaxed occupancies, while candidate selection and final reporting can still threshold at `0.5` when a hard binary design is needed.
 - Training starts from random noise and refines it over multiple learned rollout steps, optimized end-to-end with differentiable FEM property loss plus lightweight topology regularization.
+- Each target is trained from multiple noise initializations, aggregated with a softmin objective to encourage exploration instead of collapsing to one easy family of solutions.
 - Training logs and sample images are written to TensorBoard.
