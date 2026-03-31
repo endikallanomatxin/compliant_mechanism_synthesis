@@ -77,6 +77,7 @@ For each batch of target properties:
 - Evaluate the same differentiable FEM directly on the intermediate and final relaxed occupancy fields.
 - Aggregate candidates with a softmin objective so promising alternatives still contribute gradient.
 - Penalize rollout steps that get worse instead of better.
+- Penalize candidates for the same target if they collapse to nearly identical final occupancies.
 - Backpropagate property loss across the rollout plus lightweight final-step topology regularization.
 
 This keeps the training objective focused on the core problem: generate a
@@ -126,6 +127,9 @@ selects among multiple candidates for the same target.
 
 `--improvement-weight` controls a soft monotonicity penalty that discourages the
 rollout from making no progress until the final step.
+
+`--diversity-weight` and `--diversity-scale` control a light anti-collapse term
+across the multiple samples drawn for the same target.
 
 The default surface regularization is intentionally light so the generator is
 less tempted to collapse into nearly empty or nearly full patches.

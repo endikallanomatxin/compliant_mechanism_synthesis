@@ -37,6 +37,8 @@ class TrainConfig:
     rollout_noise_scale: float = 0.03
     property_weight: float = 2.0
     improvement_weight: float = 0.25
+    diversity_weight: float = 0.05
+    diversity_scale: float = 0.15
     surface_weight: float = 0.02
     connectivity_weight: float = 0.12
     mass_weight: float = 0.15
@@ -145,6 +147,21 @@ def _monotonic_improvement_penalty(step_errors: list[torch.Tensor]) -> torch.Ten
     if not penalties:
         return torch.zeros_like(step_errors[0])
     return torch.stack(penalties, dim=0).mean(dim=0)
+
+
+def _diversity_penalty(grouped_probs: torch.Tensor, scale: float) -> torch.Tensor:
+    sample_count = grouped_probs.shape[1]
+    if sample_count < 2:
+        return torch.zeros(grouped_probs.shape[0], device=grouped_probs.device)
+
+    flattened = grouped_probs.reshape(grouped_probs.shape[0], sample_count, -1)
+    pair_penalties = []
+    for left in range(sample_count):
+        for right in range(left + 1, sample_count):
+            difference = (flattened[:, left] - flattened[:, right]).abs().mean(dim=1)
+            pair_penalties.append(torch.exp(-difference / max(scale, 1e-6)))
+
+    return torch.stack(pair_penalties, dim=0).mean(dim=0)
 
 
 def candidate_scores(
@@ -290,6 +307,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             "mass": 0.0,
             "binarization": 0.0,
             "improvement": 0.0,
+            "diversity": 0.0,
             "binary_property_error": 0.0,
             "best_binary_property_error": 0.0,
             "candidate_spread": 0.0,
@@ -372,8 +390,18 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             per_target_binarization = binarization_penalty(final_probs).view(
                 target_props.shape[0], config.train_samples_per_target
             )
+            grouped_final_probs = final_probs.view(
+                target_props.shape[0],
+                config.train_samples_per_target,
+                1,
+                config.grid_size,
+                config.grid_size,
+            )
             per_target_binary_property = binary_property_error.view(
                 target_props.shape[0], config.train_samples_per_target
+            )
+            diversity_penalty = _diversity_penalty(
+                grouped_final_probs, config.diversity_scale
             )
 
             property_loss = (soft_weights * per_target_property).sum(dim=1).mean()
@@ -385,6 +413,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             mass = (soft_weights * per_target_mass).sum(dim=1).mean()
             binarization = (soft_weights * per_target_binarization).sum(dim=1).mean()
             improvement = (soft_weights * per_target_improvement).sum(dim=1).mean()
+            diversity = diversity_penalty.mean()
             binary_property_error_mean = (
                 (soft_weights * per_target_binary_property).sum(dim=1).mean()
             )
@@ -392,6 +421,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 dim=1
             ).values.mean()
             candidate_spread = per_target_total.std(dim=1).mean()
+
+            total = total + config.diversity_weight * diversity_penalty.mean()
 
             optimizer.zero_grad(set_to_none=True)
             total.backward()
@@ -404,6 +435,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             epoch_totals["mass"] += mass.item()
             epoch_totals["binarization"] += binarization.item()
             epoch_totals["improvement"] += improvement.item()
+            epoch_totals["diversity"] += diversity.item()
             epoch_totals["binary_property_error"] += binary_property_error_mean.item()
             epoch_totals["best_binary_property_error"] += (
                 best_binary_property_error.item()
@@ -423,6 +455,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             writer.add_scalar(
                 "train/improvement_penalty", improvement.item(), global_step
             )
+            writer.add_scalar("train/diversity_penalty", diversity.item(), global_step)
             writer.add_scalar(
                 "train/binary_property_error",
                 binary_property_error_mean.item(),
@@ -455,7 +488,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     f"global_step={global_step} total={total.item():.4f} "
                     f"prop={property_loss.item():.4f} bin_prop={binary_property_error_mean.item():.4f} "
                     f"best_bin={best_binary_property_error.item():.4f} improve={improvement.item():.4f} "
-                    f"spread={candidate_spread.item():.4f}"
+                    f"div={diversity.item():.4f} spread={candidate_spread.item():.4f}"
                 )
 
         num_batches = max(len(loader), 1)
@@ -469,6 +502,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             f"prop={epoch_totals['property'] / num_batches:.4f} "
             f"bin_prop={epoch_totals['binary_property_error'] / num_batches:.4f} "
             f"improve={epoch_totals['improvement'] / num_batches:.4f} "
+            f"div={epoch_totals['diversity'] / num_batches:.4f} "
             f"best_bin={epoch_totals['best_binary_property_error'] / num_batches:.4f} "
             f"spread={epoch_totals['candidate_spread'] / num_batches:.4f}"
         )
@@ -859,6 +893,8 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-noise-scale", type=float, default=0.03)
     parser.add_argument("--property-weight", type=float, default=2.0)
     parser.add_argument("--improvement-weight", type=float, default=0.25)
+    parser.add_argument("--diversity-weight", type=float, default=0.05)
+    parser.add_argument("--diversity-scale", type=float, default=0.15)
     parser.add_argument("--surface-weight", type=float, default=0.02)
     parser.add_argument("--connectivity-weight", type=float, default=0.12)
     parser.add_argument("--mass-weight", type=float, default=0.15)
