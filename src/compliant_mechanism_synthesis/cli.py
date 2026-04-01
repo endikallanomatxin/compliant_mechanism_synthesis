@@ -42,7 +42,7 @@ class TrainConfig:
     learning_rate: float = 1e-5
     rollout_steps: int = 8
     position_step_size: float = 0.2
-    connectivity_step_size: float = 1.0
+    connectivity_step_size: float = 0.1
     rollout_position_noise: float = 0.01
     rollout_connectivity_noise: float = 0.05
     property_weight: float = 2.0

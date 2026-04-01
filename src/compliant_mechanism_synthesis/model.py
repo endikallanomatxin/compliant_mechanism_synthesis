@@ -160,7 +160,7 @@ class GraphRefinementModel(nn.Module):
         )
         delta_scores = symmetrize_adjacency(scores)
         predicted_adjacency = enforce_role_adjacency_constraints(
-            (current_adjacency + delta_scores).clamp(0.0, 1.0),
+            (current_adjacency + torch.tanh(delta_scores)).clamp(0.0, 1.0),
             roles,
         )
         return {

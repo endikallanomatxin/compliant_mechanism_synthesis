@@ -477,5 +477,5 @@ def refine_connectivity(
     delta_scores: torch.Tensor,
     step_size: float,
 ) -> torch.Tensor:
-    updated = adjacency + step_size * delta_scores
+    updated = adjacency + step_size * torch.tanh(delta_scores)
     return enforce_role_adjacency_constraints(updated.clamp(0.0, 1.0), roles)
