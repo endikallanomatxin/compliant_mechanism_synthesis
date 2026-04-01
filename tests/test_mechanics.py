@@ -151,11 +151,34 @@ def test_geometric_regularization_penalizes_node_clustering_and_boundary_crowdin
 
 def test_thresholded_connectivity_is_symmetric_and_zero_diagonal() -> None:
     positions, roles, adjacency = generate_graph_sample(10)
-    thresholded = threshold_connectivity(adjacency.unsqueeze(0), threshold=0.4)
+    thresholded = threshold_connectivity(
+        adjacency.unsqueeze(0), roles.unsqueeze(0), threshold=0.4
+    )
     assert thresholded.shape == (1, 10, 10)
     assert torch.allclose(thresholded, thresholded.transpose(1, 2))
     assert torch.allclose(torch.diagonal(thresholded[0]), torch.zeros(10))
     assert torch.allclose(thresholded, symmetrize_adjacency(thresholded))
+
+
+def test_rigid_endpoint_nodes_never_connect_directly() -> None:
+    positions, roles, adjacency = generate_graph_sample(10)
+    fixed = torch.where(roles == 0)[0]
+    mobile = torch.where(roles == 1)[0]
+    assert torch.isclose(adjacency[fixed[0], fixed[1]], torch.tensor(0.0))
+    assert torch.isclose(adjacency[mobile[0], mobile[1]], torch.tensor(0.0))
+    for fixed_idx in fixed.tolist():
+        for mobile_idx in mobile.tolist():
+            assert torch.isclose(adjacency[fixed_idx, mobile_idx], torch.tensor(0.0))
+
+    forced = torch.ones((1, 10, 10), dtype=torch.float32)
+    thresholded = threshold_connectivity(forced, roles.unsqueeze(0), threshold=0.4)
+    assert torch.isclose(thresholded[0, fixed[0], fixed[1]], torch.tensor(0.0))
+    assert torch.isclose(thresholded[0, mobile[0], mobile[1]], torch.tensor(0.0))
+    for fixed_idx in fixed.tolist():
+        for mobile_idx in mobile.tolist():
+            assert torch.isclose(
+                thresholded[0, fixed_idx, mobile_idx], torch.tensor(0.0)
+            )
 
 
 def test_sparsity_penalty_increases_with_more_active_edges() -> None:

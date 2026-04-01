@@ -10,6 +10,7 @@ from compliant_mechanism_synthesis.common import (
     ROLE_FIXED,
     ROLE_FREE,
     ROLE_MOBILE,
+    enforce_role_adjacency_constraints,
     role_masks,
     symmetrize_adjacency,
 )
@@ -34,9 +35,12 @@ class GeometryRegularizationConfig:
 
 
 def threshold_connectivity(
-    adjacency: torch.Tensor, threshold: float = 0.5
+    adjacency: torch.Tensor, roles: torch.Tensor, threshold: float = 0.5
 ) -> torch.Tensor:
-    return symmetrize_adjacency((adjacency >= threshold).to(dtype=adjacency.dtype))
+    thresholded = symmetrize_adjacency(
+        (adjacency >= threshold).to(dtype=adjacency.dtype)
+    )
+    return enforce_role_adjacency_constraints(thresholded, roles)
 
 
 def _edge_index_pairs(num_nodes: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -430,7 +434,10 @@ def mechanical_terms(
     geometry_config: GeometryRegularizationConfig | None = None,
 ) -> dict[str, torch.Tensor]:
     config = config or FrameFEMConfig()
-    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    adjacency = enforce_role_adjacency_constraints(
+        adjacency.float().clamp(0.0, 1.0),
+        roles,
+    )
     response_matrix, stiffness_matrix = effective_response(
         positions, roles, adjacency, config
     )
@@ -465,7 +472,10 @@ def mechanical_terms(
 
 
 def refine_connectivity(
-    adjacency: torch.Tensor, delta_scores: torch.Tensor, step_size: float
+    adjacency: torch.Tensor,
+    roles: torch.Tensor,
+    delta_scores: torch.Tensor,
+    step_size: float,
 ) -> torch.Tensor:
     updated = adjacency + step_size * delta_scores
-    return symmetrize_adjacency(updated.clamp(0.0, 1.0))
+    return enforce_role_adjacency_constraints(updated.clamp(0.0, 1.0), roles)

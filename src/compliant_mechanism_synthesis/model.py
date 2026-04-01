@@ -8,6 +8,7 @@ from torch import nn
 
 from compliant_mechanism_synthesis.common import (
     NUM_ROLES,
+    enforce_role_adjacency_constraints,
     symmetrize_adjacency,
 )
 
@@ -147,7 +148,7 @@ class GraphRefinementModel(nn.Module):
             ]
         )
 
-        current_adjacency = symmetrize_adjacency(adjacency)
+        current_adjacency = enforce_role_adjacency_constraints(adjacency, roles)
         for layer in self.layers:
             hidden = layer(hidden, current_adjacency)
 
@@ -158,8 +159,9 @@ class GraphRefinementModel(nn.Module):
             node_latents.shape[-1]
         )
         delta_scores = symmetrize_adjacency(scores)
-        predicted_adjacency = symmetrize_adjacency(
-            (current_adjacency + delta_scores).clamp(0.0, 1.0)
+        predicted_adjacency = enforce_role_adjacency_constraints(
+            (current_adjacency + delta_scores).clamp(0.0, 1.0),
+            roles,
         )
         return {
             "displacements": displacements,

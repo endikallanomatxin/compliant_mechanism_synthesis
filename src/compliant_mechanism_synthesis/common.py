@@ -22,6 +22,21 @@ def symmetrize_adjacency(adjacency: torch.Tensor) -> torch.Tensor:
     return symmetric - torch.diag_embed(diagonal)
 
 
+def enforce_role_adjacency_constraints(
+    adjacency: torch.Tensor,
+    roles: torch.Tensor,
+) -> torch.Tensor:
+    adjacency = symmetrize_adjacency(adjacency)
+    fixed, mobile, _ = role_masks(roles)
+    fixed_pair = fixed.unsqueeze(-1) & fixed.unsqueeze(-2)
+    mobile_pair = mobile.unsqueeze(-1) & mobile.unsqueeze(-2)
+    fixed_mobile_pair = (fixed.unsqueeze(-1) & mobile.unsqueeze(-2)) | (
+        mobile.unsqueeze(-1) & fixed.unsqueeze(-2)
+    )
+    forbidden = fixed_pair | mobile_pair | fixed_mobile_pair
+    return adjacency.masked_fill(forbidden, 0.0)
+
+
 def adjacency_logits(adjacency: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     clamped = adjacency.clamp(eps, 1.0 - eps)
     return torch.log(clamped) - torch.log1p(-clamped)

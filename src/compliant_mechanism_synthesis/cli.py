@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.common import (
+    enforce_role_adjacency_constraints,
     ROLE_FREE,
     apply_free_node_update,
     symmetric_matrix_unique_values,
@@ -314,7 +315,10 @@ def _inject_rollout_noise(
         adjacency_noise = torch.randn_like(adjacency) * (
             connectivity_noise_scale * time_fraction[:, None, None]
         )
-        adjacency = symmetrize_adjacency((adjacency + adjacency_noise).clamp(0.0, 1.0))
+        adjacency = enforce_role_adjacency_constraints(
+            (adjacency + adjacency_noise).clamp(0.0, 1.0),
+            roles,
+        )
     return positions, adjacency
 
 
@@ -390,6 +394,7 @@ def rollout_refinement(
         )
         current_adjacency = refine_connectivity(
             current_adjacency,
+            roles,
             outputs["delta_scores"],
             connectivity_step_size,
         )
@@ -459,6 +464,7 @@ def _log_canonical_evaluation(
             roles[idx],
             threshold_connectivity(
                 final_state["adjacency"][idx : idx + 1],
+                roles[idx : idx + 1],
                 threshold=config.sample_threshold,
             )[0],
             threshold=0.05,
@@ -739,7 +745,10 @@ def refine_sample_state(
     for _ in range(steps):
         current_positions = positions + free_mask * (position_param - positions)
         current_positions = current_positions.clamp(0.0, 1.0)
-        current_adjacency = symmetrize_adjacency(adjacency_param.clamp(0.0, 1.0))
+        current_adjacency = enforce_role_adjacency_constraints(
+            adjacency_param.clamp(0.0, 1.0),
+            roles,
+        )
         terms = mechanical_terms(
             current_positions,
             roles,
@@ -770,7 +779,10 @@ def refine_sample_state(
     refined_positions = (
         (positions + free_mask * (position_param - positions)).detach().clamp(0.0, 1.0)
     )
-    refined_adjacency = symmetrize_adjacency(adjacency_param.detach().clamp(0.0, 1.0))
+    refined_adjacency = enforce_role_adjacency_constraints(
+        adjacency_param.detach().clamp(0.0, 1.0),
+        roles,
+    )
     return refined_positions, refined_adjacency
 
 
@@ -834,7 +846,7 @@ def sample(
         config,
     )
     thresholded_adjacency = threshold_connectivity(
-        refined_adjacency, threshold=sample_threshold
+        refined_adjacency, roles, threshold=sample_threshold
     )
     terms = mechanical_terms(
         refined_positions,

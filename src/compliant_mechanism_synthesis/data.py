@@ -9,6 +9,7 @@ from compliant_mechanism_synthesis.common import (
     ROLE_FIXED,
     ROLE_FREE,
     ROLE_MOBILE,
+    enforce_role_adjacency_constraints,
     symmetrize_adjacency,
 )
 
@@ -202,7 +203,7 @@ def generate_connectivity(positions: torch.Tensor, roles: torch.Tensor) -> torch
         for free_idx in nearest_free:
             _activate_edge(adjacency, mobile_idx, free_idx, 0.45, 0.8)
 
-    return symmetrize_adjacency(adjacency)
+    return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)
 
 
 def generate_graph_sample(
@@ -213,14 +214,15 @@ def generate_graph_sample(
     return positions, roles, adjacency
 
 
-def generate_noise_connectivity(num_nodes: int) -> torch.Tensor:
+def generate_noise_connectivity(roles: torch.Tensor) -> torch.Tensor:
+    num_nodes = roles.shape[0]
     adjacency = torch.rand((num_nodes, num_nodes), dtype=torch.float32).pow(1.5)
-    return symmetrize_adjacency(adjacency)
+    return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)
 
 
 def generate_noise_sample(
     num_nodes: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     positions, roles = generate_points(num_nodes)
-    adjacency = generate_noise_connectivity(num_nodes)
+    adjacency = generate_noise_connectivity(roles)
     return positions, roles, adjacency
