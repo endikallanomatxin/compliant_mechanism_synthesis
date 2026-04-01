@@ -400,25 +400,6 @@ def mechanical_terms(
     }
 
 
-def noisy_state(
-    positions: torch.Tensor,
-    roles: torch.Tensor,
-    adjacency: torch.Tensor,
-    time: torch.Tensor,
-    sigma_x: float,
-    sigma_a: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    free_mask = (roles == ROLE_FREE).unsqueeze(-1).to(dtype=positions.dtype)
-    position_noise = torch.randn_like(positions) * (sigma_x * time[:, None, None])
-    noisy_positions = (positions + free_mask * position_noise).clamp(0.0, 1.0)
-
-    adjacency_noise = torch.randn_like(adjacency) * (sigma_a * time[:, None, None])
-    noisy_adjacency = symmetrize_adjacency(
-        (adjacency + adjacency_noise).clamp(0.0, 1.0)
-    )
-    return noisy_positions, noisy_adjacency
-
-
 def refine_connectivity(
     adjacency: torch.Tensor, delta_scores: torch.Tensor, step_size: float
 ) -> torch.Tensor:

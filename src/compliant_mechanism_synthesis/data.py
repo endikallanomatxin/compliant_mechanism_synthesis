@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
 
 import torch
 
@@ -11,13 +10,6 @@ from compliant_mechanism_synthesis.common import (
     ROLE_MOBILE,
     symmetrize_adjacency,
 )
-
-
-@dataclass(frozen=True)
-class GraphDataset:
-    positions: torch.Tensor
-    roles: torch.Tensor
-    adjacency: torch.Tensor
 
 
 def _sample_point(
@@ -163,23 +155,3 @@ def generate_noise_sample(
     positions, roles = generate_points(num_nodes)
     adjacency = generate_noise_connectivity(num_nodes)
     return positions, roles, adjacency
-
-
-def generate_dataset(num_samples: int, num_nodes: int, seed: int) -> GraphDataset:
-    random.seed(seed)
-    torch.manual_seed(seed)
-
-    positions = []
-    roles = []
-    adjacency = []
-    for _ in range(num_samples):
-        x, r, a = generate_graph_sample(num_nodes)
-        positions.append(x)
-        roles.append(r)
-        adjacency.append(a)
-
-    return GraphDataset(
-        positions=torch.stack(positions, dim=0),
-        roles=torch.stack(roles, dim=0),
-        adjacency=torch.stack(adjacency, dim=0),
-    )
