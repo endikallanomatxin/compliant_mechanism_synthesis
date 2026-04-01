@@ -2,292 +2,365 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import math
 
 import torch
-import torch.nn.functional as F
 
-
-AXIAL_SPRING_NEIGHBORS = ((1, 0), (0, 1))
-DIAGONAL_SPRING_NEIGHBORS = ((1, 1), (1, -1))
-GRID_NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
-DIAGONAL_STIFFNESS_SCALE = 0.25
-DIAGONAL_CONNECTIVITY_SCALE = 0.5
+from compliant_mechanism_synthesis.common import (
+    ROLE_FIXED,
+    ROLE_FREE,
+    ROLE_MOBILE,
+    adjacency_logits,
+    logits_to_adjacency,
+    role_masks,
+    symmetrize_adjacency,
+    upper_triangle_values,
+)
 
 
 @dataclass(frozen=True)
-class GridFEMData:
-    edge_sources: torch.Tensor
-    edge_targets: torch.Tensor
-    edge_flat_indices: torch.Tensor
-    edge_base_values: torch.Tensor
-    transform: torch.Tensor
-    free_count: int
+class FrameFEMConfig:
+    young_modulus: float = 1.0
+    r_max: float = 0.06
+    stiffness_regularization: float = 1e-4
+    diagonal_connectivity_scale: float = 0.5
 
 
-def threshold_occupancy(
-    occupancy: torch.Tensor, threshold: float = 0.5
+def threshold_connectivity(
+    adjacency: torch.Tensor, threshold: float = 0.5
 ) -> torch.Tensor:
-    return (occupancy >= threshold).to(dtype=torch.float32)
+    return symmetrize_adjacency((adjacency >= threshold).to(dtype=adjacency.dtype))
 
 
-def binarization_penalty(occupancy: torch.Tensor) -> torch.Tensor:
-    return (occupancy * (1.0 - occupancy)).mean(dim=(1, 2, 3))
+def binarization_penalty(adjacency: torch.Tensor) -> torch.Tensor:
+    return (
+        upper_triangle_values(adjacency) * (1.0 - upper_triangle_values(adjacency))
+    ).mean(dim=1)
 
 
-def _cross_neighbor_max(values: torch.Tensor) -> torch.Tensor:
-    padded = F.pad(values, (1, 1, 1, 1), mode="constant", value=0.0)
-    up = padded[:, :, :-2, 1:-1]
-    down = padded[:, :, 2:, 1:-1]
-    left = padded[:, :, 1:-1, :-2]
-    right = padded[:, :, 1:-1, 2:]
-    return torch.maximum(torch.maximum(up, down), torch.maximum(left, right))
+def _edge_index_pairs(num_nodes: int) -> tuple[torch.Tensor, torch.Tensor]:
+    pairs = torch.triu_indices(num_nodes, num_nodes, offset=1)
+    return pairs[0], pairs[1]
 
 
-def _weighted_neighbor_max(values: torch.Tensor) -> torch.Tensor:
-    padded = F.pad(values, (1, 1, 1, 1), mode="constant", value=0.0)
-    up = padded[:, :, :-2, 1:-1]
-    down = padded[:, :, 2:, 1:-1]
-    left = padded[:, :, 1:-1, :-2]
-    right = padded[:, :, 1:-1, 2:]
-    up_left = padded[:, :, :-2, :-2]
-    up_right = padded[:, :, :-2, 2:]
-    down_left = padded[:, :, 2:, :-2]
-    down_right = padded[:, :, 2:, 2:]
+@lru_cache(maxsize=32)
+def _cached_edge_index_pairs(num_nodes: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return _edge_index_pairs(num_nodes)
 
-    axial = torch.maximum(torch.maximum(up, down), torch.maximum(left, right))
-    diagonal = torch.maximum(
-        torch.maximum(up_left, up_right), torch.maximum(down_left, down_right)
+
+def _frame_local_stiffness(
+    length: torch.Tensor,
+    area: torch.Tensor,
+    inertia: torch.Tensor,
+    young_modulus: float,
+) -> torch.Tensor:
+    ea_over_l = young_modulus * area / length
+    ei = young_modulus * inertia
+    l2 = length.square()
+    l3 = l2 * length
+
+    k = torch.zeros((6, 6), device=length.device, dtype=length.dtype)
+    k[0, 0] = ea_over_l
+    k[0, 3] = -ea_over_l
+    k[3, 0] = -ea_over_l
+    k[3, 3] = ea_over_l
+
+    k[1, 1] = 12.0 * ei / l3
+    k[1, 2] = 6.0 * ei / l2
+    k[1, 4] = -12.0 * ei / l3
+    k[1, 5] = 6.0 * ei / l2
+
+    k[2, 1] = 6.0 * ei / l2
+    k[2, 2] = 4.0 * ei / length
+    k[2, 4] = -6.0 * ei / l2
+    k[2, 5] = 2.0 * ei / length
+
+    k[4, 1] = -12.0 * ei / l3
+    k[4, 2] = -6.0 * ei / l2
+    k[4, 4] = 12.0 * ei / l3
+    k[4, 5] = -6.0 * ei / l2
+
+    k[5, 1] = 6.0 * ei / l2
+    k[5, 2] = 2.0 * ei / length
+    k[5, 4] = -6.0 * ei / l2
+    k[5, 5] = 4.0 * ei / length
+    return k
+
+
+def _frame_transform(delta: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
+    c = delta[0] / length
+    s = delta[1] / length
+    transform = torch.zeros((6, 6), device=delta.device, dtype=delta.dtype)
+    transform[0, 0] = c
+    transform[0, 1] = s
+    transform[1, 0] = -s
+    transform[1, 1] = c
+    transform[2, 2] = 1.0
+    transform[3, 3] = c
+    transform[3, 4] = s
+    transform[4, 3] = -s
+    transform[4, 4] = c
+    transform[5, 5] = 1.0
+    return transform
+
+
+def _rigid_transform_for_sample(
+    positions: torch.Tensor, roles: torch.Tensor
+) -> torch.Tensor:
+    num_nodes = positions.shape[0]
+    free_indices = torch.where(roles == ROLE_FREE)[0].tolist()
+    mobile_indices = torch.where(roles == ROLE_MOBILE)[0]
+    free_count = len(free_indices)
+    reduced_dofs = 3 * free_count + 3
+
+    transform = torch.zeros(
+        (3 * num_nodes, reduced_dofs), device=positions.device, dtype=positions.dtype
     )
-    return torch.maximum(axial, DIAGONAL_CONNECTIVITY_SCALE * diagonal)
+
+    for free_slot, node_idx in enumerate(free_indices):
+        transform[3 * node_idx + 0, 3 * free_slot + 0] = 1.0
+        transform[3 * node_idx + 1, 3 * free_slot + 1] = 1.0
+        transform[3 * node_idx + 2, 3 * free_slot + 2] = 1.0
+
+    centroid = positions[mobile_indices].mean(dim=0)
+    base = 3 * free_count
+    for node_idx in mobile_indices.tolist():
+        dx = positions[node_idx, 0] - centroid[0]
+        dy = positions[node_idx, 1] - centroid[1]
+        transform[3 * node_idx + 0, base + 0] = 1.0
+        transform[3 * node_idx + 0, base + 2] = -dy
+        transform[3 * node_idx + 1, base + 1] = 1.0
+        transform[3 * node_idx + 1, base + 2] = dx
+        transform[3 * node_idx + 2, base + 2] = 1.0
+
+    return transform
 
 
-def _solid_reachability(occupancy: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
-    reach = occupancy * seeds
-    for _ in range(occupancy.shape[-2]):
-        reach = occupancy * torch.maximum(reach, _weighted_neighbor_max(reach))
-    return reach
-
-
-def _disconnect_distance_penalty(
-    top_reach: torch.Tensor, bottom_reach: torch.Tensor
+def assemble_global_stiffness(
+    positions: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig | None = None,
 ) -> torch.Tensor:
-    expanded_top = top_reach
-    expanded_bottom = bottom_reach
-    penalties: list[torch.Tensor] = []
+    config = config or FrameFEMConfig()
+    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    batch_size, num_nodes, _ = positions.shape
+    edge_i, edge_j = _cached_edge_index_pairs(num_nodes)
+    edge_i = edge_i.to(positions.device)
+    edge_j = edge_j.to(positions.device)
 
-    for _ in range(top_reach.shape[-2]):
-        overlap = (expanded_top * expanded_bottom).amax(dim=(1, 2, 3))
+    stiffness = torch.zeros(
+        (batch_size, 3 * num_nodes, 3 * num_nodes),
+        device=positions.device,
+        dtype=positions.dtype,
+    )
+
+    for batch_idx in range(batch_size):
+        for src, dst in zip(edge_i.tolist(), edge_j.tolist()):
+            activation = adjacency[batch_idx, src, dst]
+            if activation.abs().item() < 1e-8:
+                continue
+
+            delta = positions[batch_idx, dst] - positions[batch_idx, src]
+            length = torch.linalg.vector_norm(delta).clamp_min(1e-4)
+            radius = config.r_max * activation
+            area = math.pi * radius.square()
+            inertia = math.pi * radius.pow(4) / 4.0
+            local = _frame_local_stiffness(length, area, inertia, config.young_modulus)
+            transform = _frame_transform(delta, length)
+            element = transform.transpose(0, 1) @ local @ transform
+            dofs = [
+                3 * src + 0,
+                3 * src + 1,
+                3 * src + 2,
+                3 * dst + 0,
+                3 * dst + 1,
+                3 * dst + 2,
+            ]
+            stiffness[batch_idx][
+                torch.meshgrid(
+                    torch.tensor(dofs, device=positions.device),
+                    torch.tensor(dofs, device=positions.device),
+                    indexing="ij",
+                )
+            ] += element
+
+    return 0.5 * (stiffness + stiffness.transpose(1, 2))
+
+
+def _reduced_stiffness(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, num_nodes, _ = positions.shape
+    full = assemble_global_stiffness(positions, adjacency, config=config)
+    free_count = num_nodes - 4
+    reduced_size = 3 * free_count + 3
+    reduced = torch.zeros(
+        (batch_size, reduced_size, reduced_size),
+        device=positions.device,
+        dtype=positions.dtype,
+    )
+    transforms = []
+
+    for batch_idx in range(batch_size):
+        transform = _rigid_transform_for_sample(positions[batch_idx], roles[batch_idx])
+        transforms.append(transform)
+        reduced[batch_idx] = transform.transpose(0, 1) @ full[batch_idx] @ transform
+
+    return reduced, torch.stack(transforms, dim=0)
+
+
+def effective_properties(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    config = config or FrameFEMConfig()
+    reduced, _ = _reduced_stiffness(positions, roles, adjacency, config)
+    batch_size, reduced_size, _ = reduced.shape
+    eye = torch.eye(reduced_size, device=reduced.device, dtype=reduced.dtype)
+    trace = reduced.diagonal(dim1=1, dim2=2).sum(dim=1)
+    stabilized = (
+        reduced
+        + (config.stiffness_regularization * (1.0 + trace / max(reduced_size, 1)))[
+            :, None, None
+        ]
+        * eye[None, :, :]
+    )
+
+    free_count = positions.shape[1] - 4
+    mobile_base = 3 * free_count
+    load_cases = torch.zeros(
+        (3, reduced_size), device=reduced.device, dtype=reduced.dtype
+    )
+    load_cases[0, mobile_base + 0] = 1.0
+    load_cases[1, mobile_base + 1] = 1.0
+    load_cases[2, mobile_base + 2] = 1.0
+
+    displacements = []
+    for load_idx in range(3):
+        rhs = load_cases[load_idx].expand(batch_size, -1)
+        displacements.append(torch.linalg.solve(stabilized, rhs))
+    solved = torch.stack(displacements, dim=1)
+
+    compliance = torch.stack(
+        [
+            solved[:, 0, mobile_base + 0].abs().clamp_min(1e-6),
+            solved[:, 1, mobile_base + 1].abs().clamp_min(1e-6),
+            solved[:, 2, mobile_base + 2].abs().clamp_min(1e-6),
+        ],
+        dim=1,
+    )
+    raw = 1.0 / compliance
+    return raw, compliance
+
+
+def _graph_reachability(adjacency: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
+    reach = seeds
+    diagonal = torch.eye(
+        adjacency.shape[-1], device=adjacency.device, dtype=adjacency.dtype
+    )
+    adjacency = symmetrize_adjacency(adjacency) + diagonal.unsqueeze(0)
+    for _ in range(adjacency.shape[-1]):
+        propagated = torch.amax(reach.unsqueeze(1) * adjacency, dim=2)
+        reach = torch.maximum(reach, propagated)
+    return reach.clamp(0.0, 1.0)
+
+
+def connectivity_penalty(
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    diagonal_scale: float = 0.5,
+) -> torch.Tensor:
+    del diagonal_scale
+    fixed, mobile, _ = role_masks(roles)
+    fixed_seed = fixed.to(dtype=adjacency.dtype)
+    mobile_seed = mobile.to(dtype=adjacency.dtype)
+    fixed_reach = _graph_reachability(adjacency, fixed_seed)
+    mobile_reach = _graph_reachability(adjacency, mobile_seed)
+
+    expanded_fixed = fixed_reach
+    expanded_mobile = mobile_reach
+    penalties = []
+    dense = symmetrize_adjacency(adjacency) + torch.eye(
+        adjacency.shape[-1], device=adjacency.device, dtype=adjacency.dtype
+    ).unsqueeze(0)
+    for _ in range(adjacency.shape[-1]):
+        overlap = torch.amax(expanded_fixed * expanded_mobile, dim=1)
         penalties.append(1.0 - overlap)
-        expanded_top = torch.maximum(expanded_top, _weighted_neighbor_max(expanded_top))
-        expanded_bottom = torch.maximum(
-            expanded_bottom, _weighted_neighbor_max(expanded_bottom)
+        expanded_fixed = torch.maximum(
+            expanded_fixed, torch.amax(expanded_fixed.unsqueeze(1) * dense, dim=2)
         )
-
+        expanded_mobile = torch.maximum(
+            expanded_mobile, torch.amax(expanded_mobile.unsqueeze(1) * dense, dim=2)
+        )
     return torch.stack(penalties, dim=0).mean(dim=0).clamp(0.0, 1.0)
 
 
-def interface_length(occupancy: torch.Tensor) -> torch.Tensor:
-    dx = torch.abs(occupancy[:, :, :, 1:] - occupancy[:, :, :, :-1]).mean(dim=(1, 2, 3))
-    dy = torch.abs(occupancy[:, :, 1:, :] - occupancy[:, :, :-1, :]).mean(dim=(1, 2, 3))
-    return dx + dy
+def beam_material(
+    positions: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig | None = None,
+) -> torch.Tensor:
+    config = config or FrameFEMConfig()
+    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    edge_i, edge_j = _cached_edge_index_pairs(positions.shape[1])
+    edge_i = edge_i.to(positions.device)
+    edge_j = edge_j.to(positions.device)
+    edge_lengths = torch.linalg.vector_norm(
+        positions[:, edge_j] - positions[:, edge_i], dim=-1
+    ).clamp_min(1e-4)
+    edge_radius = config.r_max * adjacency[:, edge_i, edge_j]
+    area = math.pi * edge_radius.square()
+    return (edge_lengths * area).sum(dim=1)
 
 
-def topology_regularizers(occupancy: torch.Tensor) -> dict[str, torch.Tensor]:
-    occupancy_mass = occupancy.mean(dim=(1, 2, 3))
-    top = torch.zeros_like(occupancy)
-    bottom = torch.zeros_like(occupancy)
-    top[:, :, 0, :] = 1.0
-    bottom[:, :, -1, :] = 1.0
-
-    top_reach = _solid_reachability(occupancy, top)
-    bottom_reach = _solid_reachability(occupancy, bottom)
-
-    bridge_fraction = top_reach[:, :, -1, :].mean(dim=(1, 2))
-    connectivity_penalty = _disconnect_distance_penalty(top_reach, bottom_reach)
+def mechanical_terms(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig | None = None,
+) -> dict[str, torch.Tensor]:
+    config = config or FrameFEMConfig()
+    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    raw_properties, compliance = effective_properties(
+        positions, roles, adjacency, config
+    )
     return {
-        "surface": interface_length(occupancy),
-        "connectivity_penalty": connectivity_penalty,
-        "connected_mass": bridge_fraction,
-        "occupancy_mass": occupancy_mass,
+        "properties": raw_properties,
+        "compliance": compliance,
+        "connectivity_penalty": connectivity_penalty(
+            roles, adjacency, diagonal_scale=config.diagonal_connectivity_scale
+        ),
+        "material": beam_material(positions, adjacency, config),
+        "binarization": binarization_penalty(adjacency),
     }
 
 
-def _spring_matrix(dr: int, dc: int, scale: float = 1.0) -> torch.Tensor:
-    direction = torch.tensor([float(dc), float(-dr)], dtype=torch.float32)
-    length = torch.linalg.vector_norm(direction)
-    unit = direction / length
-    axial = torch.outer(unit, unit)
-    stiffness = scale / length
-    return stiffness * torch.cat(
-        [
-            torch.cat([axial, -axial], dim=1),
-            torch.cat([-axial, axial], dim=1),
-        ],
-        dim=0,
+def noisy_state(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    time: torch.Tensor,
+    sigma_x: float,
+    sigma_a: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    free_mask = (roles == ROLE_FREE).unsqueeze(-1).to(dtype=positions.dtype)
+    position_noise = torch.randn_like(positions) * (sigma_x * time[:, None, None])
+    noisy_positions = (positions + free_mask * position_noise).clamp(0.0, 1.0)
+
+    adjacency_noise = torch.randn_like(adjacency) * (sigma_a * time[:, None, None])
+    noisy_adjacency = symmetrize_adjacency(
+        (adjacency + adjacency_noise).clamp(0.0, 1.0)
     )
+    return noisy_positions, noisy_adjacency
 
 
-def _node_index(width: int, row: int, col: int) -> int:
-    return row * width + col
-
-
-@lru_cache(maxsize=16)
-def _grid_fem_data(height: int, width: int) -> GridFEMData:
-    node_count = height * width
-    dof_count = node_count * 2
-
-    edge_sources: list[int] = []
-    edge_targets: list[int] = []
-    edge_flat_indices: list[list[int]] = []
-    edge_base_values: list[list[float]] = []
-
-    for row in range(height):
-        for col in range(width):
-            source = _node_index(width, row, col)
-            for dr, dc in AXIAL_SPRING_NEIGHBORS:
-                nr = row + dr
-                nc = col + dc
-                if nr >= height or nc >= width:
-                    continue
-                target = _node_index(width, nr, nc)
-                element = _spring_matrix(dr, dc)
-                dofs = [2 * source, 2 * source + 1, 2 * target, 2 * target + 1]
-                edge_sources.append(source)
-                edge_targets.append(target)
-                edge_flat_indices.append(
-                    [a * dof_count + b for a in dofs for b in dofs]
-                )
-                edge_base_values.append(element.reshape(-1).tolist())
-
-            for dr, dc in DIAGONAL_SPRING_NEIGHBORS:
-                nr = row + dr
-                nc = col + dc
-                if nr >= height or nc < 0 or nc >= width:
-                    continue
-                target = _node_index(width, nr, nc)
-                element = _spring_matrix(dr, dc, scale=DIAGONAL_STIFFNESS_SCALE)
-                dofs = [2 * source, 2 * source + 1, 2 * target, 2 * target + 1]
-                edge_sources.append(source)
-                edge_targets.append(target)
-                edge_flat_indices.append(
-                    [a * dof_count + b for a in dofs for b in dofs]
-                )
-                edge_base_values.append(element.reshape(-1).tolist())
-
-    free_count = (height - 2) * width * 2
-    transform = torch.zeros((dof_count, free_count + 3), dtype=torch.float32)
-    free_col = 0
-    for row in range(1, height - 1):
-        for col in range(width):
-            node = _node_index(width, row, col)
-            transform[2 * node, free_col] = 1.0
-            transform[2 * node + 1, free_col + 1] = 1.0
-            free_col += 2
-
-    center_x = (width - 1) / 2.0
-    for col in range(width):
-        node = _node_index(width, 0, col)
-        transform[2 * node, free_count + 0] = 1.0
-        transform[2 * node + 1, free_count + 1] = 1.0
-        transform[2 * node + 1, free_count + 2] = float(col) - center_x
-
-    return GridFEMData(
-        edge_sources=torch.tensor(edge_sources, dtype=torch.long),
-        edge_targets=torch.tensor(edge_targets, dtype=torch.long),
-        edge_flat_indices=torch.tensor(edge_flat_indices, dtype=torch.long),
-        edge_base_values=torch.tensor(edge_base_values, dtype=torch.float32),
-        transform=transform,
-        free_count=free_count,
-    )
-
-
-def _assemble_stiffness(occupancy: torch.Tensor) -> tuple[torch.Tensor, GridFEMData]:
-    batch, _, height, width = occupancy.shape
-    data = _grid_fem_data(height, width)
-    device = occupancy.device
-    dtype = occupancy.dtype
-
-    sources = data.edge_sources.to(device)
-    targets = data.edge_targets.to(device)
-    flat_indices = data.edge_flat_indices.to(device)
-    base_values = data.edge_base_values.to(device=device, dtype=dtype)
-
-    occ_flat = occupancy.reshape(batch, -1)
-    edge_weights = occ_flat[:, sources] * occ_flat[:, targets]
-
-    dof_count = height * width * 2
-    stiffness_flat = torch.zeros(
-        (batch, dof_count * dof_count), device=device, dtype=dtype
-    )
-    contributions = (edge_weights[:, :, None] * base_values[None, :, :]).reshape(
-        batch, -1
-    )
-    stiffness_flat.scatter_add_(
-        1, flat_indices.reshape(1, -1).expand(batch, -1), contributions
-    )
-    stiffness = stiffness_flat.view(batch, dof_count, dof_count)
-    return 0.5 * (stiffness + stiffness.transpose(1, 2)), data
-
-
-def _condensed_stiffness(occupancy: torch.Tensor) -> torch.Tensor:
-    stiffness, data = _assemble_stiffness(occupancy)
-    device = occupancy.device
-    dtype = occupancy.dtype
-
-    transform = data.transform.to(device=device, dtype=dtype)
-    reduced = torch.matmul(
-        transform.transpose(0, 1).unsqueeze(0), torch.matmul(stiffness, transform)
-    )
-
-    free_count = data.free_count
-    plate = reduced[:, free_count:, free_count:]
-    if free_count == 0:
-        return plate
-
-    free = reduced[:, :free_count, :free_count]
-    coupling = reduced[:, :free_count, free_count:]
-    free_trace = free.diagonal(dim1=1, dim2=2).sum(dim=1)
-    regularizer = (1e-4 + 1e-4 * free_trace / max(free_count, 1)).to(dtype=dtype)
-    eye = torch.eye(free_count, device=device, dtype=dtype).unsqueeze(0)
-    stabilized_free = free + regularizer[:, None, None] * eye
-    solved = torch.linalg.solve(stabilized_free, coupling)
-    return plate - torch.matmul(coupling.transpose(1, 2), solved)
-
-
-def _raw_properties(occupancy: torch.Tensor) -> torch.Tensor:
-    condensed = _condensed_stiffness(occupancy)
-    batch = condensed.shape[0]
-    dtype = condensed.dtype
-    device = condensed.device
-
-    trace = condensed.diagonal(dim1=1, dim2=2).sum(dim=1)
-    regularizer = (1e-4 + 1e-4 * trace / 3.0).to(dtype=dtype)
-    eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
-    compliance = torch.linalg.inv(condensed + regularizer[:, None, None] * eye)
-    diagonal = compliance.diagonal(dim1=1, dim2=2).clamp_min(1e-6)
-    return 1.0 / diagonal.reshape(batch, 3)
-
-
-@lru_cache(maxsize=16)
-def _reference_properties(height: int, width: int) -> torch.Tensor:
-    full = torch.ones((1, 1, height, width), dtype=torch.float32)
-    return _raw_properties(full)[0].cpu().clamp_min(1e-6)
-
-
-def mechanical_terms(occupancy: torch.Tensor) -> dict[str, torch.Tensor]:
-    occupancy = occupancy.float().clamp(0.0, 1.0)
-    regularizers = topology_regularizers(occupancy)
-    raw_properties = _raw_properties(occupancy)
-    reference = _reference_properties(occupancy.shape[-2], occupancy.shape[-1]).to(
-        device=occupancy.device, dtype=occupancy.dtype
-    )
-    properties = torch.log1p(raw_properties) / torch.log1p(0.1 * reference[None, :])
-    properties = properties.clamp(0.0, 1.0)
-
-    return {
-        "properties": properties,
-        "surface": regularizers["surface"],
-        "connectivity_penalty": regularizers["connectivity_penalty"],
-        "connected_mass": regularizers["connected_mass"],
-        "occupancy_mass": regularizers["occupancy_mass"],
-    }
+def refine_connectivity(
+    adjacency: torch.Tensor, delta_scores: torch.Tensor, step_size: float
+) -> torch.Tensor:
+    logits = adjacency_logits(adjacency)
+    return logits_to_adjacency(logits + step_size * delta_scores)

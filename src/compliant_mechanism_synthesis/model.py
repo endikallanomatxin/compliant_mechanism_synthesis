@@ -3,8 +3,14 @@ from __future__ import annotations
 import math
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
+
+from compliant_mechanism_synthesis.common import (
+    NUM_ROLES,
+    logits_to_adjacency,
+    symmetrize_adjacency,
+)
 
 
 def sinusoidal_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
@@ -19,21 +25,78 @@ def sinusoidal_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
     return embedding
 
 
-class ConditionedDenoiser(nn.Module):
+class GraphAttentionBlock(nn.Module):
+    def __init__(self, d_model: int, nhead: int, conditioned: bool) -> None:
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError("d_model must be divisible by nhead")
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.conditioned = conditioned
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model),
+        )
+
+    def forward(self, hidden: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+        batch, num_nodes, _ = hidden.shape
+        normed = self.norm1(hidden)
+        q = (
+            self.q_proj(normed)
+            .view(batch, num_nodes, self.nhead, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(normed)
+            .view(batch, num_nodes, self.nhead, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(normed)
+            .view(batch, num_nodes, self.nhead, self.head_dim)
+            .transpose(1, 2)
+        )
+        logits = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+
+        if self.conditioned:
+            bias = 2.0 * adjacency[:, None, :, :] - 1.0
+            logits = logits + bias
+
+        weights = torch.softmax(logits, dim=-1)
+        if self.conditioned:
+            weights = weights * (0.25 + 0.75 * adjacency[:, None, :, :])
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        attended = torch.matmul(weights, v)
+        attended = attended.transpose(1, 2).reshape(batch, num_nodes, self.d_model)
+        hidden = hidden + self.out_proj(attended)
+        hidden = hidden + self.ff(self.norm2(hidden))
+        return hidden
+
+
+class GraphRefinementModel(nn.Module):
     def __init__(
-        self, grid_size: int, patch_size: int, d_model: int, nhead: int, num_layers: int
+        self,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        latent_dim: int,
     ) -> None:
         super().__init__()
-        if grid_size % patch_size != 0:
-            raise ValueError("grid_size must be divisible by patch_size")
-
-        self.grid_size = grid_size
-        self.patch_size = patch_size
-        self.patch_dim = patch_size * patch_size
-        self.patch_grid_size = grid_size // patch_size
-        self.num_patches = self.patch_grid_size**2
-
-        self.patch_in = nn.Linear(self.patch_dim, d_model)
+        self.position_mlp = nn.Sequential(
+            nn.Linear(2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.role_embedding = nn.Embedding(NUM_ROLES, d_model)
         self.target_mlp = nn.Sequential(
             nn.Linear(3, d_model),
             nn.GELU(),
@@ -44,51 +107,60 @@ class ConditionedDenoiser(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
-        self.row_position = nn.Parameter(
-            torch.randn(1, self.patch_grid_size, 1, d_model) * 0.02
+        self.input_norm = nn.LayerNorm(d_model)
+        self.layers = nn.ModuleList(
+            [
+                GraphAttentionBlock(d_model, nhead, conditioned=(idx % 2 == 0))
+                for idx in range(num_layers)
+            ]
         )
-        self.col_position = nn.Parameter(
-            torch.randn(1, 1, self.patch_grid_size, d_model) * 0.02
+        self.final_norm = nn.LayerNorm(d_model)
+        self.displacement_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 2),
         )
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True,
-            norm_first=False,
+        self.node_latent_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, latent_dim),
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(d_model)
-        self.patch_out = nn.Linear(d_model, self.patch_dim)
-
-    def _patchify(self, grids: torch.Tensor) -> torch.Tensor:
-        patches = F.unfold(grids, kernel_size=self.patch_size, stride=self.patch_size)
-        return patches.transpose(1, 2)
-
-    def _unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
-        folded = F.fold(
-            patches.transpose(1, 2),
-            output_size=(self.grid_size, self.grid_size),
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-        )
-        return folded
 
     def forward(
-        self, noisy_grids: torch.Tensor, targets: torch.Tensor, timesteps: torch.Tensor
-    ) -> torch.Tensor:
-        tokens = self.patch_in(self._patchify(noisy_grids))
-        position = (self.row_position + self.col_position).reshape(
-            1, self.num_patches, -1
+        self,
+        positions: torch.Tensor,
+        roles: torch.Tensor,
+        adjacency: torch.Tensor,
+        targets: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        hidden = self.position_mlp(positions) + self.role_embedding(roles)
+        hidden = self.input_norm(hidden)
+        hidden = hidden + self.target_mlp(targets)[:, None, :]
+        hidden = (
+            hidden
+            + self.time_mlp(sinusoidal_embedding(timesteps, hidden.shape[-1]))[
+                :, None, :
+            ]
         )
-        target_cond = self.target_mlp(targets)[:, None, :]
-        time_cond = self.time_mlp(sinusoidal_embedding(timesteps, tokens.shape[-1]))[
-            :, None, :
-        ]
-        hidden = tokens + position + target_cond + time_cond
-        hidden = self.encoder(hidden)
-        hidden = self.norm(hidden)
-        patches = self.patch_out(hidden)
-        return self._unpatchify(patches)
+
+        current_adjacency = symmetrize_adjacency(adjacency)
+        for layer in self.layers:
+            hidden = layer(hidden, current_adjacency)
+
+        hidden = self.final_norm(hidden)
+        displacements = self.displacement_head(hidden)
+        node_latents = self.node_latent_head(hidden)
+        scores = torch.matmul(node_latents, node_latents.transpose(1, 2)) / math.sqrt(
+            node_latents.shape[-1]
+        )
+        delta_scores = symmetrize_adjacency(scores)
+        predicted_adjacency = logits_to_adjacency(
+            torch.logit(current_adjacency.clamp(1e-4, 1 - 1e-4)) + delta_scores
+        )
+        return {
+            "displacements": displacements,
+            "node_latents": node_latents,
+            "delta_scores": delta_scores,
+            "predicted_adjacency": predicted_adjacency,
+        }
