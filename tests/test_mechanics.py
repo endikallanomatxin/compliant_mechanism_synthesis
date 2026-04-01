@@ -3,7 +3,11 @@ from __future__ import annotations
 import torch
 
 from compliant_mechanism_synthesis.common import symmetrize_adjacency
-from compliant_mechanism_synthesis.data import generate_graph_sample
+from compliant_mechanism_synthesis.data import (
+    generate_graph_sample,
+    generate_noise_sample,
+    proximity_bias_matrix,
+)
 from compliant_mechanism_synthesis.mechanics import (
     FrameFEMConfig,
     GeometryRegularizationConfig,
@@ -191,3 +195,19 @@ def test_sparsity_penalty_increases_with_more_active_edges() -> None:
     sparse_terms = mechanical_terms(positions.unsqueeze(0), roles.unsqueeze(0), sparse)
     dense_terms = mechanical_terms(positions.unsqueeze(0), roles.unsqueeze(0), dense)
     assert dense_terms["sparsity"][0] > sparse_terms["sparsity"][0]
+
+
+def test_proximity_bias_prefers_closer_pairs() -> None:
+    positions = torch.tensor(
+        [[0.10, 0.10], [0.18, 0.10], [0.75, 0.10], [0.90, 0.10]],
+        dtype=torch.float32,
+    )
+    bias = proximity_bias_matrix(positions, length_scale=0.2)
+    assert bias[0, 1] > bias[0, 2]
+    assert bias[2, 3] > bias[0, 3]
+
+
+def test_noise_connectivity_gives_each_node_a_local_allowed_edge() -> None:
+    _, _, adjacency = generate_noise_sample(10)
+    incident = adjacency.sum(dim=1)
+    assert torch.all(incident > 0.0)

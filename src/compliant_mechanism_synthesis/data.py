@@ -10,6 +10,7 @@ from compliant_mechanism_synthesis.common import (
     ROLE_FREE,
     ROLE_MOBILE,
     enforce_role_adjacency_constraints,
+    role_masks,
     symmetrize_adjacency,
 )
 
@@ -214,9 +215,122 @@ def generate_graph_sample(
     return positions, roles, adjacency
 
 
-def generate_noise_connectivity(roles: torch.Tensor) -> torch.Tensor:
+def proximity_bias_matrix(
+    positions: torch.Tensor,
+    length_scale: float | None = None,
+) -> torch.Tensor:
+    num_nodes = positions.shape[0]
+    if length_scale is None:
+        length_scale = max(0.12, 0.8 / math.sqrt(float(num_nodes)))
+    pairwise = torch.linalg.vector_norm(
+        positions[:, None, :] - positions[None, :, :],
+        dim=-1,
+    )
+    bias = torch.exp(-pairwise.square() / (length_scale**2))
+    return symmetrize_adjacency(bias)
+
+
+def _forbidden_rigid_pairs(roles: torch.Tensor) -> torch.Tensor:
+    fixed, mobile, _ = role_masks(roles)
+    return (
+        (fixed.unsqueeze(-1) & fixed.unsqueeze(-2))
+        | (mobile.unsqueeze(-1) & mobile.unsqueeze(-2))
+        | (
+            (fixed.unsqueeze(-1) & mobile.unsqueeze(-2))
+            | (mobile.unsqueeze(-1) & fixed.unsqueeze(-2))
+        )
+    )
+
+
+def local_connectivity_scaffold(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    neighbors_per_node: int = 2,
+    min_activation: float = 0.35,
+    max_activation: float = 0.60,
+) -> torch.Tensor:
+    num_nodes = positions.shape[0]
+    pairwise = torch.linalg.vector_norm(
+        positions[:, None, :] - positions[None, :, :],
+        dim=-1,
+    )
+    adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    forbidden = _forbidden_rigid_pairs(roles)
+
+    for node_idx in range(num_nodes):
+        allowed = ~forbidden[node_idx]
+        allowed[node_idx] = False
+        candidates = torch.where(allowed)[0]
+        if candidates.numel() == 0:
+            continue
+        distances = pairwise[node_idx, candidates]
+        nearest = candidates[
+            torch.argsort(distances)[: min(neighbors_per_node, candidates.numel())]
+        ]
+        for neighbor_idx in nearest.tolist():
+            activation = random.uniform(min_activation, max_activation)
+            adjacency[node_idx, neighbor_idx] = max(
+                adjacency[node_idx, neighbor_idx].item(), activation
+            )
+            adjacency[neighbor_idx, node_idx] = max(
+                adjacency[neighbor_idx, node_idx].item(), activation
+            )
+    return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)
+
+
+def spanning_tree_scaffold(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    min_activation: float = 0.60,
+    max_activation: float = 0.85,
+) -> torch.Tensor:
+    num_nodes = positions.shape[0]
+    pairwise = torch.linalg.vector_norm(
+        positions[:, None, :] - positions[None, :, :],
+        dim=-1,
+    )
+    adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    forbidden = _forbidden_rigid_pairs(roles)
+
+    connected = {0}
+    remaining = set(range(1, num_nodes))
+    while remaining:
+        best_edge: tuple[int, int] | None = None
+        best_distance = float("inf")
+        for src in connected:
+            for dst in remaining:
+                if forbidden[src, dst]:
+                    continue
+                distance = float(pairwise[src, dst].item())
+                if distance < best_distance:
+                    best_distance = distance
+                    best_edge = (src, dst)
+        if best_edge is None:
+            break
+        src, dst = best_edge
+        activation = random.uniform(min_activation, max_activation)
+        adjacency[src, dst] = activation
+        adjacency[dst, src] = activation
+        connected.add(dst)
+        remaining.remove(dst)
+    return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)
+
+
+def generate_noise_connectivity(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+) -> torch.Tensor:
     num_nodes = roles.shape[0]
-    adjacency = torch.rand((num_nodes, num_nodes), dtype=torch.float32).pow(1.5)
+    proximity = proximity_bias_matrix(positions)
+    spanning = spanning_tree_scaffold(positions, roles)
+    scaffold = local_connectivity_scaffold(positions, roles)
+    random_component = 0.25 + 0.75 * torch.rand(
+        (num_nodes, num_nodes), dtype=torch.float32
+    ).pow(1.5)
+    adjacency = torch.maximum(
+        torch.maximum(proximity * random_component, scaffold),
+        spanning,
+    )
     return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)
 
 
@@ -224,5 +338,5 @@ def generate_noise_sample(
     num_nodes: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     positions, roles = generate_points(num_nodes)
-    adjacency = generate_noise_connectivity(roles)
+    adjacency = generate_noise_connectivity(positions, roles)
     return positions, roles, adjacency
