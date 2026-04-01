@@ -57,6 +57,7 @@ class TrainConfig:
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
     sample_threshold: float = 0.5
+    device: str = "auto"
     name: str = "prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
     seed: int = 7
@@ -96,8 +97,13 @@ class ResponseStatistics:
         return unique_values_to_symmetric_matrix(sampled, size=3)
 
 
-def _device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _device(device_spec: str = "auto") -> torch.device:
+    if device_spec == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_spec)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA device requested but CUDA is not available")
+    return device
 
 
 def _seed_everything(seed: int) -> None:
@@ -381,7 +387,7 @@ def _log_canonical_evaluation(
 
 def train(config: TrainConfig) -> tuple[Path, Path]:
     _seed_everything(config.seed)
-    device = _device()
+    device = _device(config.device)
     geometry_config = _geometry_regularization_config(config)
     num_batches = max(config.dataset_size // config.batch_size, 1)
     _progress(
@@ -634,10 +640,13 @@ def sample(
     output_path: str,
     steps: int,
     sample_threshold: float,
+    device_override: str | None = None,
 ) -> dict[str, object]:
-    device = _device()
+    device = _device(device_override or "auto")
     payload = torch.load(checkpoint_path, map_location=device)
     config = TrainConfig(**payload["config"])
+    if device_override is not None:
+        config.device = device_override
     geometry_config = _geometry_regularization_config(config)
     target_normalization = payload["target_normalization"]
     _seed_everything(config.seed)
@@ -776,6 +785,7 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-every-steps", type=int, default=5)
     parser.add_argument("--canonical-eval-every-steps", type=int, default=20)
     parser.add_argument("--sample-threshold", type=float, default=0.5)
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--name", default="prototype")
     parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
     parser.add_argument("--seed", type=int, default=7)
@@ -794,6 +804,7 @@ def _sample_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--steps", type=int, default=6)
     parser.add_argument("--sample-threshold", type=float, default=0.5)
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--name", default="sample")
     parser.add_argument("--output-path", default="artifacts/sample.pt")
     return parser
@@ -815,6 +826,7 @@ def sample_main() -> None:
         output_path=args.output_path,
         steps=args.steps,
         sample_threshold=args.sample_threshold,
+        device_override=args.device,
     )
     print(f"log_dir={result['log_dir']}")
     print(f"achieved_response={_format_matrix(result['response_matrix'][0])}")
