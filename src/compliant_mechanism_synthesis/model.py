@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from compliant_mechanism_synthesis.common import (
+    distance_affinity,
+    max_length_gate,
     NUM_ROLES,
     enforce_role_adjacency_constraints,
     symmetrize_adjacency,
@@ -57,12 +59,7 @@ class GraphAttentionBlock(nn.Module):
             return None
         if self.mode == "connectivity":
             return adjacency
-        pairwise = torch.linalg.vector_norm(
-            positions[:, :, None, :] - positions[:, None, :, :],
-            dim=-1,
-        )
-        affinity = torch.exp(-pairwise.square() / (0.35**2))
-        return symmetrize_adjacency(affinity)
+        return distance_affinity(positions, length_scale=0.18)
 
     def forward(
         self,
@@ -184,8 +181,17 @@ class GraphRefinementModel(nn.Module):
             node_latents.shape[-1]
         )
         delta_scores = symmetrize_adjacency(scores)
+        update_gate = max_length_gate(
+            positions,
+            max_distance=0.10,
+            transition_width=0.05,
+        )
         predicted_adjacency = enforce_role_adjacency_constraints(
-            (current_adjacency + torch.tanh(delta_scores)).clamp(0.0, 1.0),
+            (
+                current_adjacency
+                + torch.tanh(delta_scores) * update_gate
+                - current_adjacency * (1.0 - update_gate)
+            ).clamp(0.0, 1.0),
             roles,
         )
         return {

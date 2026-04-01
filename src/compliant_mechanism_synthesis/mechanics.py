@@ -7,6 +7,8 @@ import math
 import torch
 
 from compliant_mechanism_synthesis.common import (
+    distance_affinity,
+    max_length_gate,
     ROLE_FIXED,
     ROLE_FREE,
     ROLE_MOBILE,
@@ -473,9 +475,13 @@ def mechanical_terms(
 
 def refine_connectivity(
     adjacency: torch.Tensor,
+    positions: torch.Tensor,
     roles: torch.Tensor,
     delta_scores: torch.Tensor,
     step_size: float,
 ) -> torch.Tensor:
-    updated = adjacency + step_size * torch.tanh(delta_scores)
+    gate = max_length_gate(positions, max_distance=0.10, transition_width=0.05)
+    updated = adjacency + step_size * (
+        torch.tanh(delta_scores) * gate - adjacency * (1.0 - gate)
+    )
     return enforce_role_adjacency_constraints(updated.clamp(0.0, 1.0), roles)

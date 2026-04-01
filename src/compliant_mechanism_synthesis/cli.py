@@ -32,12 +32,12 @@ from compliant_mechanism_synthesis.viz import plot_graph_design
 
 @dataclass
 class TrainConfig:
-    num_nodes: int = 16
+    num_nodes: int = 64
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 8
     latent_dim: int = 128
-    batch_size: int = 128
+    batch_size: int = 64
     train_steps: int = 2000
     learning_rate: float = 1e-4
     rollout_steps: int = 8
@@ -51,7 +51,7 @@ class TrainConfig:
     sparsity_weight: float = 0.5
     connectivity_weight: float = 0.10
     short_beam_weight: float = 0.20
-    long_beam_weight: float = 0.10
+    long_beam_weight: float = 5.0
     thin_diameter_weight: float = 0.20
     thick_diameter_weight: float = 0.10
     node_spacing_weight: float = 0.20
@@ -65,6 +65,7 @@ class TrainConfig:
     target_buffer_size: int = 4096
     target_covariance_regularization: float = 1e-3
     target_sampling_temperature: float = 1.0
+    target_stats_refresh_steps: int = 100
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
     sample_threshold: float = 0.5
@@ -125,6 +126,16 @@ class ResponseStatistics:
             self.buffer[: end - self.capacity] = features[split:]
         self.next_index = end % self.capacity
         self.count += feature_count
+
+    def clone(self) -> "ResponseStatistics":
+        return ResponseStatistics(
+            buffer=self.buffer.clone(),
+            capacity=self.capacity,
+            count=self.count,
+            next_index=self.next_index,
+            covariance_regularization=self.covariance_regularization,
+            sampling_temperature=self.sampling_temperature,
+        )
 
     def normalization(self) -> dict[str, list[float]]:
         buffer = self._current_buffer()
@@ -394,6 +405,7 @@ def rollout_refinement(
         )
         current_adjacency = refine_connectivity(
             current_adjacency,
+            current_positions,
             roles,
             outputs["delta_scores"],
             connectivity_step_size,
@@ -524,7 +536,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         geometry_config=geometry_config,
     )
     response_stats.update(bootstrap_terms["response_matrix"])
-    target_normalization = response_stats.normalization()
+    sampling_stats = response_stats.clone()
+    target_normalization = sampling_stats.normalization()
     canonical_specs = _canonical_target_specs(target_normalization, device)
     _progress(
         "train:canonical_targets "
@@ -566,8 +579,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         positions, roles, adjacency = _pure_noise_batch(
             config.batch_size, config.num_nodes, current_seed, device
         )
-        target_normalization = response_stats.normalization()
-        raw_targets = response_stats.sample_targets(config.batch_size, device)
+        raw_targets = sampling_stats.sample_targets(config.batch_size, device)
         target_features = _normalize_target_response(raw_targets, target_normalization)
         base_time = torch.rand((positions.shape[0],), device=device)
 
@@ -686,7 +698,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["boundary"] += boundary_loss.item()
 
         response_stats.update(final_terms["response_matrix"])
-        target_normalization = response_stats.normalization()
+        if step % max(config.target_stats_refresh_steps, 1) == 0:
+            sampling_stats = response_stats.clone()
+            target_normalization = sampling_stats.normalization()
+            canonical_specs = _canonical_target_specs(target_normalization, device)
 
         writer.add_scalar("train/total_loss", total.item(), global_step)
         writer.add_scalar("train/property_loss", property_loss.item(), global_step)
@@ -751,7 +766,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     payload = {
         "state_dict": model.state_dict(),
         "config": asdict(config),
-        "target_normalization": response_stats.normalization(),
+        "target_normalization": sampling_stats.normalization(),
         "response_stats_count": response_stats.count,
     }
     torch.save(payload, checkpoint_path)
@@ -1038,6 +1053,11 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--boundary-margin", type=float, default=defaults.boundary_margin
+    )
+    parser.add_argument(
+        "--target-stats-refresh-steps",
+        type=int,
+        default=defaults.target_stats_refresh_steps,
     )
     parser.add_argument("--log-every-steps", type=int, default=defaults.log_every_steps)
     parser.add_argument(

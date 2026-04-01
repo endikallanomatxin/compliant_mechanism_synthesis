@@ -15,6 +15,7 @@ from compliant_mechanism_synthesis.mechanics import (
     effective_response,
     geometric_regularization_terms,
     mechanical_terms,
+    refine_connectivity,
     threshold_connectivity,
 )
 
@@ -211,3 +212,29 @@ def test_noise_connectivity_gives_each_node_a_local_allowed_edge() -> None:
     _, _, adjacency = generate_noise_sample(10)
     incident = adjacency.sum(dim=1)
     assert torch.all(incident > 0.0)
+
+
+def test_refine_connectivity_updates_near_edges_more_than_far_edges() -> None:
+    positions = torch.tensor(
+        [[[0.10, 0.10], [0.18, 0.10], [0.85, 0.10], [0.92, 0.10]]],
+        dtype=torch.float32,
+    )
+    roles = torch.tensor([[0, 2, 2, 1]], dtype=torch.long)
+    adjacency = torch.zeros((1, 4, 4), dtype=torch.float32)
+    delta = torch.ones((1, 4, 4), dtype=torch.float32)
+    updated = refine_connectivity(adjacency, positions, roles, delta, step_size=0.1)
+    assert updated[0, 0, 1] > updated[0, 0, 2]
+
+
+def test_refine_connectivity_decays_far_active_edges() -> None:
+    positions = torch.tensor(
+        [[[0.10, 0.10], [0.18, 0.10], [0.85, 0.10], [0.92, 0.10]]],
+        dtype=torch.float32,
+    )
+    roles = torch.tensor([[0, 2, 2, 1]], dtype=torch.long)
+    adjacency = torch.zeros((1, 4, 4), dtype=torch.float32)
+    adjacency[0, 0, 2] = 0.8
+    adjacency[0, 2, 0] = 0.8
+    delta = torch.ones((1, 4, 4), dtype=torch.float32)
+    updated = refine_connectivity(adjacency, positions, roles, delta, step_size=0.1)
+    assert updated[0, 0, 2] < adjacency[0, 0, 2]

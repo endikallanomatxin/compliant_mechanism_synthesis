@@ -5,8 +5,14 @@ import torch
 from compliant_mechanism_synthesis.cli import (
     _inject_rollout_noise,
     _monotonic_improvement_loss,
+    ResponseStatistics,
 )
-from compliant_mechanism_synthesis.common import ROLE_FIXED, ROLE_FREE, ROLE_MOBILE
+from compliant_mechanism_synthesis.common import (
+    ROLE_FIXED,
+    ROLE_FREE,
+    ROLE_MOBILE,
+    symmetric_matrix_unique_values,
+)
 
 
 def test_rollout_noise_preserves_adjacency_symmetry_and_zero_diagonal() -> None:
@@ -43,3 +49,22 @@ def test_monotonic_improvement_loss_penalizes_regressions_only() -> None:
     ]
     loss = _monotonic_improvement_loss(errors)
     assert torch.isclose(loss, torch.tensor((0.0 + 0.5 + 0.0) / 3.0))
+
+
+def test_response_statistics_clone_freezes_sampling_buffer() -> None:
+    stats = ResponseStatistics.empty(
+        device=torch.device("cpu"),
+        capacity=8,
+        covariance_regularization=1e-3,
+        sampling_temperature=1.0,
+    )
+    first = torch.eye(3, dtype=torch.float32).unsqueeze(0)
+    second = (2.0 * torch.eye(3, dtype=torch.float32)).unsqueeze(0)
+    stats.update(first)
+    frozen = stats.clone()
+    stats.update(second)
+
+    assert torch.allclose(
+        frozen._current_buffer(), symmetric_matrix_unique_values(first)
+    )
+    assert not torch.allclose(stats._current_buffer(), frozen._current_buffer())

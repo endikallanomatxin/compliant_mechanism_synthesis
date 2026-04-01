@@ -59,6 +59,32 @@ def apply_free_node_update(
     return clamp_positions(updated)
 
 
+def distance_affinity(
+    positions: torch.Tensor,
+    length_scale: float = 0.18,
+) -> torch.Tensor:
+    pairwise = torch.linalg.vector_norm(
+        positions[:, :, None, :] - positions[:, None, :, :],
+        dim=-1,
+    )
+    affinity = torch.exp(-pairwise.square() / (length_scale**2))
+    return symmetrize_adjacency(affinity)
+
+
+def max_length_gate(
+    positions: torch.Tensor,
+    max_distance: float = 0.10,
+    transition_width: float = 0.05,
+) -> torch.Tensor:
+    pairwise = torch.linalg.vector_norm(
+        positions[:, :, None, :] - positions[:, None, :, :],
+        dim=-1,
+    )
+    excess = (pairwise - max_distance).clamp_min(0.0)
+    gate = torch.exp(-excess.square() / (transition_width**2))
+    return symmetrize_adjacency(gate)
+
+
 def symmetric_matrix_unique_values(matrix: torch.Tensor) -> torch.Tensor:
     n = matrix.shape[-1]
     idx = torch.triu_indices(n, n, offset=0, device=matrix.device)
