@@ -31,15 +31,14 @@ from compliant_mechanism_synthesis.viz import plot_graph_design
 
 @dataclass
 class TrainConfig:
-    num_nodes: int = 12
+    num_nodes: int = 32
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 6
     latent_dim: int = 64
-    dataset_size: int = 512
-    batch_size: int = 16
-    epochs: int = 50
-    learning_rate: float = 3e-4
+    batch_size: int = 512
+    train_steps: int = 50
+    learning_rate: float = 1e-4
     rollout_steps: int = 6
     position_step_size: float = 0.2
     connectivity_step_size: float = 1.0
@@ -50,10 +49,10 @@ class TrainConfig:
     long_beam_weight: float = 0.10
     thin_diameter_weight: float = 0.20
     thick_diameter_weight: float = 0.10
-    min_beam_length: float = 0.08
-    max_beam_length: float = 0.85
-    min_beam_diameter: float = 0.01
-    max_beam_diameter: float = 0.10
+    min_beam_length: float = 0.01
+    max_beam_length: float = 0.1
+    min_beam_diameter: float = 0.001
+    max_beam_diameter: float = 0.01
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
     sample_threshold: float = 0.5
@@ -389,9 +388,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     _seed_everything(config.seed)
     device = _device(config.device)
     geometry_config = _geometry_regularization_config(config)
-    num_batches = max(config.dataset_size // config.batch_size, 1)
+    train_steps = max(config.train_steps, 1)
     _progress(
-        f"train:start device={device} epochs={config.epochs} dataset_size={config.dataset_size} batch_size={config.batch_size} num_nodes={config.num_nodes}"
+        f"train:start device={device} train_steps={train_steps} batch_size={config.batch_size} num_nodes={config.num_nodes}"
     )
 
     response_stats = ResponseStatistics.empty(device)
@@ -426,149 +425,145 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     checkpoint_path = Path(config.checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     global_step = 0
+    running_totals = {
+        "total": 0.0,
+        "property": 0.0,
+        "material": 0.0,
+        "connectivity": 0.0,
+        "short_beam": 0.0,
+        "long_beam": 0.0,
+        "thin_diameter": 0.0,
+        "thick_diameter": 0.0,
+    }
 
-    for epoch in range(config.epochs):
-        model.train()
-        epoch_totals = {
-            "total": 0.0,
-            "property": 0.0,
-            "material": 0.0,
-            "connectivity": 0.0,
-            "short_beam": 0.0,
-            "long_beam": 0.0,
-            "thin_diameter": 0.0,
-            "thick_diameter": 0.0,
-        }
+    model.train()
+    for step in range(1, train_steps + 1):
+        current_seed = config.seed + step + 1000
+        positions, roles, adjacency = _pure_noise_batch(
+            config.batch_size, config.num_nodes, current_seed, device
+        )
+        target_normalization = response_stats.normalization()
+        raw_targets = response_stats.sample_targets(config.batch_size, device)
+        target_features = _normalize_target_response(raw_targets, target_normalization)
+        base_time = torch.rand((positions.shape[0],), device=device)
 
-        for batch_idx in range(1, num_batches + 1):
-            current_seed = config.seed + epoch * num_batches + batch_idx + 1000
-            positions, roles, adjacency = _pure_noise_batch(
-                config.batch_size, config.num_nodes, current_seed, device
-            )
-            target_normalization = response_stats.normalization()
-            raw_targets = response_stats.sample_targets(config.batch_size, device)
-            target_features = _normalize_target_response(
-                raw_targets, target_normalization
-            )
-            base_time = torch.rand((positions.shape[0],), device=device)
-
-            rollout = rollout_refinement(
-                model,
-                positions,
+        rollout = rollout_refinement(
+            model,
+            positions,
+            roles,
+            adjacency,
+            target_features,
+            steps=config.rollout_steps,
+            position_step_size=config.position_step_size,
+            connectivity_step_size=config.connectivity_step_size,
+            base_time=base_time,
+        )
+        weights = _step_weights(config.rollout_steps, device)
+        property_loss = torch.zeros((), device=device)
+        for step_idx, state in enumerate(rollout):
+            step_terms = mechanical_terms(
+                state["positions"],
                 roles,
-                adjacency,
-                target_features,
-                steps=config.rollout_steps,
-                position_step_size=config.position_step_size,
-                connectivity_step_size=config.connectivity_step_size,
-                base_time=base_time,
-            )
-            weights = _step_weights(config.rollout_steps, device)
-            property_loss = torch.zeros((), device=device)
-            for step_idx, state in enumerate(rollout):
-                step_terms = mechanical_terms(
-                    state["positions"],
-                    roles,
-                    state["adjacency"],
-                    geometry_config=geometry_config,
-                )
-                property_loss = property_loss + weights[
-                    step_idx
-                ] * _response_matrix_loss(
-                    step_terms["response_matrix"],
-                    raw_targets,
-                    target_normalization,
-                )
-
-            final_state = rollout[-1]
-            final_terms = mechanical_terms(
-                final_state["positions"],
-                roles,
-                final_state["adjacency"],
+                state["adjacency"],
                 geometry_config=geometry_config,
             )
-            material_loss = final_terms["material"].mean()
-            connectivity_loss = final_terms["connectivity_penalty"].mean()
-            short_beam_loss = final_terms["short_beam_penalty"].mean()
-            long_beam_loss = final_terms["long_beam_penalty"].mean()
-            thin_diameter_loss = final_terms["thin_diameter_penalty"].mean()
-            thick_diameter_loss = final_terms["thick_diameter_penalty"].mean()
-
-            total = (
-                config.property_weight * property_loss
-                + config.material_weight * material_loss
-                + config.connectivity_weight * connectivity_loss
-                + config.short_beam_weight * short_beam_loss
-                + config.long_beam_weight * long_beam_loss
-                + config.thin_diameter_weight * thin_diameter_loss
-                + config.thick_diameter_weight * thick_diameter_loss
+            property_loss = property_loss + weights[step_idx] * _response_matrix_loss(
+                step_terms["response_matrix"],
+                raw_targets,
+                target_normalization,
             )
 
-            optimizer.zero_grad(set_to_none=True)
-            total.backward()
-            optimizer.step()
-
-            epoch_totals["total"] += total.item()
-            epoch_totals["property"] += property_loss.item()
-            epoch_totals["material"] += material_loss.item()
-            epoch_totals["connectivity"] += connectivity_loss.item()
-            epoch_totals["short_beam"] += short_beam_loss.item()
-            epoch_totals["long_beam"] += long_beam_loss.item()
-            epoch_totals["thin_diameter"] += thin_diameter_loss.item()
-            epoch_totals["thick_diameter"] += thick_diameter_loss.item()
-
-            response_stats.update(final_terms["response_matrix"])
-            target_normalization = response_stats.normalization()
-
-            writer.add_scalar("train/total_loss", total.item(), global_step)
-            writer.add_scalar("train/property_loss", property_loss.item(), global_step)
-            writer.add_scalar("train/material_loss", material_loss.item(), global_step)
-            writer.add_scalar(
-                "train/connectivity_penalty", connectivity_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/short_beam_penalty", short_beam_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/long_beam_penalty", long_beam_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/thin_diameter_penalty", thin_diameter_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/thick_diameter_penalty", thick_diameter_loss.item(), global_step
-            )
-            global_step += 1
-
-            if config.log_every_steps > 0 and (
-                batch_idx % config.log_every_steps == 0 or batch_idx == num_batches
-            ):
-                _progress(
-                    f"train:step epoch={epoch + 1}/{config.epochs} batch={batch_idx}/{num_batches} total={total.item():.4f} prop={property_loss.item():.4f} conn={connectivity_loss.item():.4f} material={material_loss.item():.4f}"
-                )
-
-            if (
-                config.canonical_eval_every_steps > 0
-                and global_step % config.canonical_eval_every_steps == 0
-            ):
-                model.eval()
-                with torch.no_grad():
-                    _log_canonical_evaluation(
-                        writer,
-                        model,
-                        config,
-                        global_step,
-                        device,
-                        _canonical_target_specs(target_normalization, device),
-                        target_normalization,
-                    )
-                model.train()
-
-        for key, value in epoch_totals.items():
-            writer.add_scalar(f"epoch/{key}", value / num_batches, epoch)
-        _progress(
-            f"train:epoch_end epoch={epoch + 1}/{config.epochs} total={epoch_totals['total'] / num_batches:.4f} prop={epoch_totals['property'] / num_batches:.4f} material={epoch_totals['material'] / num_batches:.4f} conn={epoch_totals['connectivity'] / num_batches:.4f}"
+        final_state = rollout[-1]
+        final_terms = mechanical_terms(
+            final_state["positions"],
+            roles,
+            final_state["adjacency"],
+            geometry_config=geometry_config,
         )
+        material_loss = final_terms["material"].mean()
+        connectivity_loss = final_terms["connectivity_penalty"].mean()
+        short_beam_loss = final_terms["short_beam_penalty"].mean()
+        long_beam_loss = final_terms["long_beam_penalty"].mean()
+        thin_diameter_loss = final_terms["thin_diameter_penalty"].mean()
+        thick_diameter_loss = final_terms["thick_diameter_penalty"].mean()
+
+        total = (
+            config.property_weight * property_loss
+            + config.material_weight * material_loss
+            + config.connectivity_weight * connectivity_loss
+            + config.short_beam_weight * short_beam_loss
+            + config.long_beam_weight * long_beam_loss
+            + config.thin_diameter_weight * thin_diameter_loss
+            + config.thick_diameter_weight * thick_diameter_loss
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        total.backward()
+        optimizer.step()
+
+        running_totals["total"] += total.item()
+        running_totals["property"] += property_loss.item()
+        running_totals["material"] += material_loss.item()
+        running_totals["connectivity"] += connectivity_loss.item()
+        running_totals["short_beam"] += short_beam_loss.item()
+        running_totals["long_beam"] += long_beam_loss.item()
+        running_totals["thin_diameter"] += thin_diameter_loss.item()
+        running_totals["thick_diameter"] += thick_diameter_loss.item()
+
+        response_stats.update(final_terms["response_matrix"])
+        target_normalization = response_stats.normalization()
+
+        writer.add_scalar("train/total_loss", total.item(), global_step)
+        writer.add_scalar("train/property_loss", property_loss.item(), global_step)
+        writer.add_scalar("train/material_loss", material_loss.item(), global_step)
+        writer.add_scalar(
+            "train/connectivity_penalty", connectivity_loss.item(), global_step
+        )
+        writer.add_scalar(
+            "train/short_beam_penalty", short_beam_loss.item(), global_step
+        )
+        writer.add_scalar("train/long_beam_penalty", long_beam_loss.item(), global_step)
+        writer.add_scalar(
+            "train/thin_diameter_penalty", thin_diameter_loss.item(), global_step
+        )
+        writer.add_scalar(
+            "train/thick_diameter_penalty", thick_diameter_loss.item(), global_step
+        )
+        global_step += 1
+
+        if config.log_every_steps > 0 and (
+            step % config.log_every_steps == 0 or step == train_steps
+        ):
+            window = (
+                config.log_every_steps
+                if step % config.log_every_steps == 0
+                else step % config.log_every_steps
+            )
+            if window == 0:
+                window = config.log_every_steps
+            _progress(
+                f"train:step {step}/{train_steps} total={total.item():.4f} prop={property_loss.item():.4f} conn={connectivity_loss.item():.4f} material={material_loss.item():.4f}"
+            )
+            for key, value in running_totals.items():
+                writer.add_scalar(f"window/{key}", value / window, global_step)
+                running_totals[key] = 0.0
+
+        if (
+            config.canonical_eval_every_steps > 0
+            and global_step % config.canonical_eval_every_steps == 0
+        ):
+            model.eval()
+            with torch.no_grad():
+                _log_canonical_evaluation(
+                    writer,
+                    model,
+                    config,
+                    global_step,
+                    device,
+                    _canonical_target_specs(target_normalization, device),
+                    target_normalization,
+                )
+            model.train()
 
     payload = {
         "state_dict": model.state_dict(),
@@ -764,9 +759,8 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num-layers", type=int, default=6)
     parser.add_argument("--latent-dim", type=int, default=64)
-    parser.add_argument("--dataset-size", type=int, default=512)
+    parser.add_argument("--train-steps", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--rollout-steps", type=int, default=6)
     parser.add_argument("--position-step-size", type=float, default=0.2)

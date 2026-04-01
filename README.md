@@ -94,7 +94,9 @@ uv run cms-train --name prototype
 
 The default training configuration uses:
 
-- `num_nodes=12`
+- `num_nodes=32`
+- `batch_size=512`
+- `train_steps=50` with pure-noise states generated on demand
 - `d_model=256`
 - `num_layers=6`
 - iterative rollout refinement
