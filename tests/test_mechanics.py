@@ -50,6 +50,7 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert torch.allclose(terms["response_matrix"], response_matrix)
     assert torch.allclose(terms["stiffness_matrix"], stiffness_matrix)
     assert terms["connectivity_penalty"].shape == (1,)
+    assert terms["sparsity"].shape == (1,)
     assert terms["material"].shape == (1,)
     assert terms["short_beam_penalty"].shape == (1,)
     assert terms["long_beam_penalty"].shape == (1,)
@@ -84,6 +85,36 @@ def test_geometric_regularization_penalizes_extreme_lengths_and_diameters() -> N
     assert penalties["long_beam_penalty"][0] > 0.0
     assert penalties["thin_diameter_penalty"][0] > 0.0
     assert penalties["thick_diameter_penalty"][0] > 0.0
+
+
+def test_thin_diameter_penalty_is_zero_for_absent_or_fabricable_bars() -> None:
+    positions = torch.tensor(
+        [[[0.0, 0.0], [0.2, 0.0], [0.4, 0.0]]], dtype=torch.float32
+    )
+    roles = torch.tensor([[0, 1, 2]], dtype=torch.long)
+    config = GeometryRegularizationConfig(min_diameter=2e-4, max_diameter=2e-3)
+    frame = FrameFEMConfig(workspace_size=0.2, r_max=1e-3)
+
+    absent = geometric_regularization_terms(
+        positions,
+        roles,
+        torch.zeros((1, 3, 3), dtype=torch.float32),
+        config,
+        frame_config=frame,
+    )
+    fabricable = geometric_regularization_terms(
+        positions,
+        roles,
+        torch.tensor(
+            [[[0.0, 0.1, 0.0], [0.1, 0.0, 0.0], [0.0, 0.0, 0.0]]],
+            dtype=torch.float32,
+        ),
+        config,
+        frame_config=frame,
+    )
+
+    assert torch.isclose(absent["thin_diameter_penalty"][0], torch.tensor(0.0))
+    assert torch.isclose(fabricable["thin_diameter_penalty"][0], torch.tensor(0.0))
 
 
 def test_geometric_regularization_penalizes_node_clustering_and_boundary_crowding() -> (
@@ -125,3 +156,15 @@ def test_thresholded_connectivity_is_symmetric_and_zero_diagonal() -> None:
     assert torch.allclose(thresholded, thresholded.transpose(1, 2))
     assert torch.allclose(torch.diagonal(thresholded[0]), torch.zeros(10))
     assert torch.allclose(thresholded, symmetrize_adjacency(thresholded))
+
+
+def test_sparsity_penalty_increases_with_more_active_edges() -> None:
+    positions, roles, _ = generate_graph_sample(10)
+    sparse = torch.zeros((1, 10, 10), dtype=torch.float32)
+    sparse[:, 0, 4] = 0.2
+    sparse[:, 4, 0] = 0.2
+    dense = torch.full((1, 10, 10), 0.2, dtype=torch.float32)
+    dense = dense - torch.diag_embed(torch.diagonal(dense, dim1=1, dim2=2))
+    sparse_terms = mechanical_terms(positions.unsqueeze(0), roles.unsqueeze(0), sparse)
+    dense_terms = mechanical_terms(positions.unsqueeze(0), roles.unsqueeze(0), dense)
+    assert dense_terms["sparsity"][0] > sparse_terms["sparsity"][0]

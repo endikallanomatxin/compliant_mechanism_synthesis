@@ -14,7 +14,9 @@ A design is represented by:
 The diagonal of `A` is always zero. Beam radius is derived from `A`.
 
 The normalized design domain maps to a physical `0.2 m x 0.2 m` workspace.
-By default, beam diameters span `0.2 mm` to `2.0 mm`.
+By default, the preferred fabricable beam diameters span `0.2 mm` to `2.0 mm`,
+while the internal representation can explore somewhat thicker bars and penalize
+them back down.
 
 ## Mechanics
 
@@ -67,7 +69,7 @@ For each batch:
 - inject additional Gaussian noise into positions and connectivity at each
   rollout step during training
 - apply position updates only to free nodes
-- update connectivity through adjacency logits plus node-latent dot products
+- update connectivity directly in activation space through node-latent dot products
 - evaluate the differentiable frame FEM on intermediate and final states
 
 The loss includes:
@@ -77,6 +79,7 @@ The loss includes:
 - monotonic-improvement loss so intermediate rollout steps keep reducing the
   mechanical target error instead of regressing
 - beam material penalty
+- explicit connectivity sparsity penalty on the average continuous edge activation
 - connectivity penalty
 - soft beam-length regularization for bars that are too short or too long
 - soft diameter regularization for bars that are too thin or too thick
@@ -86,7 +89,7 @@ The loss includes:
 The default geometric regularization thresholds are expressed in physical units:
 
 - beam length between `1 mm` and `20 mm`
-- beam diameter between `0.2 mm` and `2.0 mm`
+- preferred beam diameter between `0.2 mm` and `2.0 mm`
 
 ## Synthetic Data
 

@@ -19,7 +19,7 @@ from compliant_mechanism_synthesis.common import (
 class FrameFEMConfig:
     young_modulus: float = 1.0
     workspace_size: float = 0.2
-    r_max: float = 1e-3
+    r_max: float = 1.5e-3
     stiffness_regularization: float = 1e-4
 
 
@@ -334,6 +334,14 @@ def beam_material(
     return (edge_lengths * area).sum(dim=1)
 
 
+def connectivity_sparsity(adjacency: torch.Tensor) -> torch.Tensor:
+    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    edge_i, edge_j = _cached_edge_index_pairs(adjacency.shape[1])
+    edge_i = edge_i.to(adjacency.device)
+    edge_j = edge_j.to(adjacency.device)
+    return adjacency[:, edge_i, edge_j].mean(dim=1)
+
+
 def geometric_regularization_terms(
     positions: torch.Tensor,
     roles: torch.Tensor,
@@ -361,12 +369,12 @@ def geometric_regularization_terms(
     long = (activations * (lengths - geometry_config.max_length).clamp_min(0.0)).sum(
         dim=1
     ) / normalizer
-    thin = (
-        activations * (geometry_config.min_diameter - diameters).clamp_min(0.0)
-    ).sum(dim=1) / normalizer
-    thick = (
-        activations * (diameters - geometry_config.max_diameter).clamp_min(0.0)
-    ).sum(dim=1) / normalizer
+    normalized_diameter = (diameters / geometry_config.min_diameter).clamp(0.0, 1.0)
+    thin_profile = normalized_diameter * (1.0 - normalized_diameter)
+    thin = thin_profile.sum(dim=1) / normalizer
+    thick = ((diameters - geometry_config.max_diameter).clamp_min(0.0).square()).sum(
+        dim=1
+    ) / normalizer
 
     free_mask = roles == ROLE_FREE
     free_positions = physical_positions
@@ -450,6 +458,7 @@ def mechanical_terms(
         "response_matrix": response_matrix,
         "stiffness_matrix": stiffness_matrix,
         "connectivity_penalty": connectivity_penalty(roles, adjacency),
+        "sparsity": connectivity_sparsity(adjacency),
         "material": beam_material(positions, adjacency, config),
         **geometry_terms,
     }

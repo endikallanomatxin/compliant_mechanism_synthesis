@@ -47,6 +47,7 @@ class TrainConfig:
     property_weight: float = 2.0
     monotonic_improvement_weight: float = 0.25
     material_weight: float = 1e4
+    sparsity_weight: float = 0.5
     connectivity_weight: float = 0.10
     short_beam_weight: float = 0.20
     long_beam_weight: float = 0.10
@@ -543,6 +544,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "property": 0.0,
         "monotonic": 0.0,
         "material": 0.0,
+        "sparsity": 0.0,
         "connectivity": 0.0,
         "short_beam": 0.0,
         "long_beam": 0.0,
@@ -603,6 +605,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             geometry_config=geometry_config,
         )
         material_loss = final_terms["material"].mean()
+        sparsity_loss = final_terms["sparsity"].mean()
         connectivity_loss = final_terms["connectivity_penalty"].mean()
         short_beam_loss = final_terms["short_beam_penalty"].mean()
         long_beam_loss = final_terms["long_beam_penalty"].mean()
@@ -615,6 +618,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             config.property_weight * property_loss
             + config.monotonic_improvement_weight * monotonic_loss
             + config.material_weight * material_loss
+            + config.sparsity_weight * sparsity_loss
             + config.connectivity_weight * connectivity_loss
             + config.short_beam_weight * short_beam_loss
             + config.long_beam_weight * long_beam_loss
@@ -632,6 +636,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["property"] += property_loss.item()
         running_totals["monotonic"] += monotonic_loss.item()
         running_totals["material"] += material_loss.item()
+        running_totals["sparsity"] += sparsity_loss.item()
         running_totals["connectivity"] += connectivity_loss.item()
         running_totals["short_beam"] += short_beam_loss.item()
         running_totals["long_beam"] += long_beam_loss.item()
@@ -649,6 +654,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             "train/monotonic_improvement_loss", monotonic_loss.item(), global_step
         )
         writer.add_scalar("train/material_loss", material_loss.item(), global_step)
+        writer.add_scalar("train/sparsity_loss", sparsity_loss.item(), global_step)
         writer.add_scalar(
             "train/connectivity_penalty", connectivity_loss.item(), global_step
         )
@@ -748,6 +754,7 @@ def refine_sample_state(
         loss = (
             config.property_weight * property_loss
             + config.material_weight * terms["material"].mean()
+            + config.sparsity_weight * terms["sparsity"].mean()
             + config.connectivity_weight * terms["connectivity_penalty"].mean()
             + config.short_beam_weight * terms["short_beam_penalty"].mean()
             + config.long_beam_weight * terms["long_beam_penalty"].mean()
@@ -854,6 +861,7 @@ def sample(
     _log_response_matrix(
         writer, "sample/achieved_stiffness", terms["stiffness_matrix"][0], 0
     )
+    writer.add_scalar("sample/sparsity_loss", terms["sparsity"][0].item(), 0)
     writer.add_scalar(
         "sample/short_beam_penalty", terms["short_beam_penalty"][0].item(), 0
     )
@@ -879,6 +887,7 @@ def sample(
         "thresholded_adjacency": thresholded_adjacency.cpu(),
         "response_matrix": terms["response_matrix"].cpu(),
         "stiffness_matrix": terms["stiffness_matrix"].cpu(),
+        "sparsity": terms["sparsity"].cpu(),
         "short_beam_penalty": terms["short_beam_penalty"].cpu(),
         "long_beam_penalty": terms["long_beam_penalty"].cpu(),
         "thin_diameter_penalty": terms["thin_diameter_penalty"].cpu(),
@@ -939,6 +948,9 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--material-weight", type=float, default=defaults.material_weight
+    )
+    parser.add_argument(
+        "--sparsity-weight", type=float, default=defaults.sparsity_weight
     )
     parser.add_argument(
         "--connectivity-weight", type=float, default=defaults.connectivity_weight
