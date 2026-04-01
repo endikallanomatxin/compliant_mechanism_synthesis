@@ -59,48 +59,50 @@ def _frame_local_stiffness(
     l2 = length.square()
     l3 = l2 * length
 
-    k = torch.zeros((6, 6), device=length.device, dtype=length.dtype)
-    k[0, 0] = ea_over_l
-    k[0, 3] = -ea_over_l
-    k[3, 0] = -ea_over_l
-    k[3, 3] = ea_over_l
+    k = torch.zeros(length.shape + (6, 6), device=length.device, dtype=length.dtype)
+    k[..., 0, 0] = ea_over_l
+    k[..., 0, 3] = -ea_over_l
+    k[..., 3, 0] = -ea_over_l
+    k[..., 3, 3] = ea_over_l
 
-    k[1, 1] = 12.0 * ei / l3
-    k[1, 2] = 6.0 * ei / l2
-    k[1, 4] = -12.0 * ei / l3
-    k[1, 5] = 6.0 * ei / l2
+    k[..., 1, 1] = 12.0 * ei / l3
+    k[..., 1, 2] = 6.0 * ei / l2
+    k[..., 1, 4] = -12.0 * ei / l3
+    k[..., 1, 5] = 6.0 * ei / l2
 
-    k[2, 1] = 6.0 * ei / l2
-    k[2, 2] = 4.0 * ei / length
-    k[2, 4] = -6.0 * ei / l2
-    k[2, 5] = 2.0 * ei / length
+    k[..., 2, 1] = 6.0 * ei / l2
+    k[..., 2, 2] = 4.0 * ei / length
+    k[..., 2, 4] = -6.0 * ei / l2
+    k[..., 2, 5] = 2.0 * ei / length
 
-    k[4, 1] = -12.0 * ei / l3
-    k[4, 2] = -6.0 * ei / l2
-    k[4, 4] = 12.0 * ei / l3
-    k[4, 5] = -6.0 * ei / l2
+    k[..., 4, 1] = -12.0 * ei / l3
+    k[..., 4, 2] = -6.0 * ei / l2
+    k[..., 4, 4] = 12.0 * ei / l3
+    k[..., 4, 5] = -6.0 * ei / l2
 
-    k[5, 1] = 6.0 * ei / l2
-    k[5, 2] = 2.0 * ei / length
-    k[5, 4] = -6.0 * ei / l2
-    k[5, 5] = 4.0 * ei / length
+    k[..., 5, 1] = 6.0 * ei / l2
+    k[..., 5, 2] = 2.0 * ei / length
+    k[..., 5, 4] = -6.0 * ei / l2
+    k[..., 5, 5] = 4.0 * ei / length
     return k
 
 
 def _frame_transform(delta: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
-    c = delta[0] / length
-    s = delta[1] / length
-    transform = torch.zeros((6, 6), device=delta.device, dtype=delta.dtype)
-    transform[0, 0] = c
-    transform[0, 1] = s
-    transform[1, 0] = -s
-    transform[1, 1] = c
-    transform[2, 2] = 1.0
-    transform[3, 3] = c
-    transform[3, 4] = s
-    transform[4, 3] = -s
-    transform[4, 4] = c
-    transform[5, 5] = 1.0
+    c = delta[..., 0] / length
+    s = delta[..., 1] / length
+    transform = torch.zeros(
+        delta.shape[:-1] + (6, 6), device=delta.device, dtype=delta.dtype
+    )
+    transform[..., 0, 0] = c
+    transform[..., 0, 1] = s
+    transform[..., 1, 0] = -s
+    transform[..., 1, 1] = c
+    transform[..., 2, 2] = 1.0
+    transform[..., 3, 3] = c
+    transform[..., 3, 4] = s
+    transform[..., 4, 3] = -s
+    transform[..., 4, 4] = c
+    transform[..., 5, 5] = 1.0
     return transform
 
 
@@ -154,35 +156,39 @@ def assemble_global_stiffness(
         dtype=positions.dtype,
     )
 
-    for batch_idx in range(batch_size):
-        for src, dst in zip(edge_i.tolist(), edge_j.tolist()):
-            activation = adjacency[batch_idx, src, dst]
-            if activation.abs().item() < 1e-8:
-                continue
+    activations = adjacency[:, edge_i, edge_j]
+    delta = positions[:, edge_j] - positions[:, edge_i]
+    length = torch.linalg.vector_norm(delta, dim=-1).clamp_min(1e-4)
+    radius = config.r_max * activations
+    area = math.pi * radius.square()
+    inertia = math.pi * radius.pow(4) / 4.0
+    local = _frame_local_stiffness(length, area, inertia, config.young_modulus)
+    transform = _frame_transform(delta, length)
+    element = transform.transpose(-1, -2) @ local @ transform
 
-            delta = positions[batch_idx, dst] - positions[batch_idx, src]
-            length = torch.linalg.vector_norm(delta).clamp_min(1e-4)
-            radius = config.r_max * activation
-            area = math.pi * radius.square()
-            inertia = math.pi * radius.pow(4) / 4.0
-            local = _frame_local_stiffness(length, area, inertia, config.young_modulus)
-            transform = _frame_transform(delta, length)
-            element = transform.transpose(0, 1) @ local @ transform
-            dofs = [
-                3 * src + 0,
-                3 * src + 1,
-                3 * src + 2,
-                3 * dst + 0,
-                3 * dst + 1,
-                3 * dst + 2,
-            ]
-            stiffness[batch_idx][
-                torch.meshgrid(
-                    torch.tensor(dofs, device=positions.device),
-                    torch.tensor(dofs, device=positions.device),
-                    indexing="ij",
-                )
-            ] += element
+    dofs = torch.stack(
+        [
+            3 * edge_i + 0,
+            3 * edge_i + 1,
+            3 * edge_i + 2,
+            3 * edge_j + 0,
+            3 * edge_j + 1,
+            3 * edge_j + 2,
+        ],
+        dim=1,
+    )
+    batch_index = torch.arange(batch_size, device=positions.device).view(-1, 1, 1, 1)
+    row_index = dofs.view(1, -1, 6, 1)
+    col_index = dofs.view(1, -1, 1, 6)
+    stiffness.index_put_(
+        (
+            batch_index.expand(-1, dofs.shape[0], 6, 6).reshape(-1),
+            row_index.expand(batch_size, -1, 6, 6).reshape(-1),
+            col_index.expand(batch_size, -1, 6, 6).reshape(-1),
+        ),
+        element.reshape(-1),
+        accumulate=True,
+    )
 
     return 0.5 * (stiffness + stiffness.transpose(1, 2))
 
