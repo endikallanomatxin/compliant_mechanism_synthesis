@@ -24,10 +24,10 @@ from compliant_mechanism_synthesis.model import ConditionedDenoiser
 @dataclass
 class TrainConfig:
     grid_size: int = 24
-    patch_size: int = 4
-    d_model: int = 128
+    patch_size: int = 2
+    d_model: int = 256
     nhead: int = 4
-    num_layers: int = 4
+    num_layers: int = 6
     dataset_size: int = 512
     batch_size: int = 16
     epochs: int = 50
@@ -881,9 +881,9 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--grid-size", type=int, default=24)
     parser.add_argument("--patch-size", type=int, default=4)
-    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument("--num-layers", type=int, default=6)
     parser.add_argument("--dataset-size", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=50)

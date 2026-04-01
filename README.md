@@ -37,6 +37,10 @@ This repository now includes a first runnable prototype built around the same
 core idea, using a single differentiable spring-network FEM evaluator in
 PyTorch instead of the earlier heuristic mechanics surrogate.
 
+The default transformer is still lightweight, but larger than the initial
+prototype (`d_model=256`, `num_layers=6`) so it has more capacity to represent
+non-trivial geometry families.
+
 What the prototype does:
 
 - Generates connected binary 2D designs on a larger square grid.
