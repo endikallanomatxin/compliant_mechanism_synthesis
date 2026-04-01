@@ -25,6 +25,14 @@ class FrameFEMConfig:
     stiffness_regularization: float = 1e-4
 
 
+@dataclass(frozen=True)
+class GeometryRegularizationConfig:
+    min_length: float = 0.08
+    max_length: float = 0.85
+    min_diameter: float = 0.01
+    max_diameter: float = 0.10
+
+
 def threshold_connectivity(
     adjacency: torch.Tensor, threshold: float = 0.5
 ) -> torch.Tensor:
@@ -322,23 +330,81 @@ def beam_material(
     return (edge_lengths * area).sum(dim=1)
 
 
+def geometric_regularization_terms(
+    positions: torch.Tensor,
+    adjacency: torch.Tensor,
+    geometry_config: GeometryRegularizationConfig,
+    frame_config: FrameFEMConfig | None = None,
+) -> dict[str, torch.Tensor]:
+    frame_config = frame_config or FrameFEMConfig()
+    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    edge_i, edge_j = _cached_edge_index_pairs(positions.shape[1])
+    edge_i = edge_i.to(positions.device)
+    edge_j = edge_j.to(positions.device)
+
+    activations = adjacency[:, edge_i, edge_j]
+    lengths = torch.linalg.vector_norm(
+        positions[:, edge_j] - positions[:, edge_i], dim=-1
+    ).clamp_min(1e-4)
+    diameters = 2.0 * frame_config.r_max * activations
+    normalizer = activations.sum(dim=1).clamp_min(1e-6)
+
+    short = (activations * (geometry_config.min_length - lengths).clamp_min(0.0)).sum(
+        dim=1
+    ) / normalizer
+    long = (activations * (lengths - geometry_config.max_length).clamp_min(0.0)).sum(
+        dim=1
+    ) / normalizer
+    thin = (
+        activations * (geometry_config.min_diameter - diameters).clamp_min(0.0)
+    ).sum(dim=1) / normalizer
+    thick = (
+        activations * (diameters - geometry_config.max_diameter).clamp_min(0.0)
+    ).sum(dim=1) / normalizer
+    return {
+        "short_beam_penalty": short,
+        "long_beam_penalty": long,
+        "thin_diameter_penalty": thin,
+        "thick_diameter_penalty": thick,
+    }
+
+
 def mechanical_terms(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
     config: FrameFEMConfig | None = None,
+    geometry_config: GeometryRegularizationConfig | None = None,
 ) -> dict[str, torch.Tensor]:
     config = config or FrameFEMConfig()
     adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
     response_matrix, stiffness_matrix = effective_response(
         positions, roles, adjacency, config
     )
+    if geometry_config is None:
+        zeros = torch.zeros(
+            adjacency.shape[0], device=adjacency.device, dtype=adjacency.dtype
+        )
+        geometry_terms = {
+            "short_beam_penalty": zeros,
+            "long_beam_penalty": zeros,
+            "thin_diameter_penalty": zeros,
+            "thick_diameter_penalty": zeros,
+        }
+    else:
+        geometry_terms = geometric_regularization_terms(
+            positions,
+            adjacency,
+            geometry_config,
+            frame_config=config,
+        )
     return {
         "response_matrix": response_matrix,
         "stiffness_matrix": stiffness_matrix,
         "connectivity_penalty": connectivity_penalty(roles, adjacency),
         "material": beam_material(positions, adjacency, config),
         "binarization": binarization_penalty(adjacency),
+        **geometry_terms,
     }
 
 

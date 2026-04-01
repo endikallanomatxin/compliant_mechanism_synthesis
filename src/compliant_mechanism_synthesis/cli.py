@@ -21,6 +21,7 @@ from compliant_mechanism_synthesis.common import (
 )
 from compliant_mechanism_synthesis.data import generate_dataset, generate_graph_sample
 from compliant_mechanism_synthesis.mechanics import (
+    GeometryRegularizationConfig,
     binarization_penalty,
     mechanical_terms,
     noisy_state,
@@ -52,6 +53,14 @@ class TrainConfig:
     material_weight: float = 0.02
     binarization_weight: float = 0.05
     connectivity_weight: float = 0.10
+    short_beam_weight: float = 0.20
+    long_beam_weight: float = 0.10
+    thin_diameter_weight: float = 0.20
+    thick_diameter_weight: float = 0.10
+    min_beam_length: float = 0.08
+    max_beam_length: float = 0.85
+    min_beam_diameter: float = 0.01
+    max_beam_diameter: float = 0.10
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
     sample_threshold: float = 0.5
@@ -173,6 +182,17 @@ def _normalize_target_response(
     std = raw_targets.new_tensor(normalization["std"])
     normalized = (flattened - mean) / std
     return normalized.reshape(-1, 3, 3)
+
+
+def _geometry_regularization_config(
+    config: TrainConfig,
+) -> GeometryRegularizationConfig:
+    return GeometryRegularizationConfig(
+        min_length=config.min_beam_length,
+        max_length=config.max_beam_length,
+        min_diameter=config.min_beam_diameter,
+        max_diameter=config.max_beam_diameter,
+    )
 
 
 def _log_response_matrix(
@@ -329,6 +349,7 @@ def _log_canonical_evaluation(
 def train(config: TrainConfig) -> tuple[Path, Path]:
     _seed_everything(config.seed)
     device = _device()
+    geometry_config = _geometry_regularization_config(config)
     _progress(
         f"train:start device={device} epochs={config.epochs} dataset_size={config.dataset_size} batch_size={config.batch_size} num_nodes={config.num_nodes}"
     )
@@ -378,6 +399,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             "material": 0.0,
             "connectivity": 0.0,
             "binarization": 0.0,
+            "short_beam": 0.0,
+            "long_beam": 0.0,
+            "thin_diameter": 0.0,
+            "thick_diameter": 0.0,
         }
 
         for batch_idx, (
@@ -417,7 +442,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             adjacency_loss = torch.zeros((), device=device)
             for step_idx, state in enumerate(rollout):
                 step_terms = mechanical_terms(
-                    state["positions"], roles, state["adjacency"]
+                    state["positions"],
+                    roles,
+                    state["adjacency"],
+                    geometry_config=geometry_config,
                 )
                 property_loss = property_loss + weights[step_idx] * F.mse_loss(
                     _normalize_target_response(
@@ -434,11 +462,18 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
             final_state = rollout[-1]
             final_terms = mechanical_terms(
-                final_state["positions"], roles, final_state["adjacency"]
+                final_state["positions"],
+                roles,
+                final_state["adjacency"],
+                geometry_config=geometry_config,
             )
             material_loss = final_terms["material"].mean()
             connectivity_loss = final_terms["connectivity_penalty"].mean()
             bin_loss = final_terms["binarization"].mean()
+            short_beam_loss = final_terms["short_beam_penalty"].mean()
+            long_beam_loss = final_terms["long_beam_penalty"].mean()
+            thin_diameter_loss = final_terms["thin_diameter_penalty"].mean()
+            thick_diameter_loss = final_terms["thick_diameter_penalty"].mean()
 
             total = (
                 config.property_weight * property_loss
@@ -447,6 +482,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 + config.material_weight * material_loss
                 + config.connectivity_weight * connectivity_loss
                 + config.binarization_weight * bin_loss
+                + config.short_beam_weight * short_beam_loss
+                + config.long_beam_weight * long_beam_loss
+                + config.thin_diameter_weight * thin_diameter_loss
+                + config.thick_diameter_weight * thick_diameter_loss
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -460,6 +499,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             epoch_totals["material"] += material_loss.item()
             epoch_totals["connectivity"] += connectivity_loss.item()
             epoch_totals["binarization"] += bin_loss.item()
+            epoch_totals["short_beam"] += short_beam_loss.item()
+            epoch_totals["long_beam"] += long_beam_loss.item()
+            epoch_totals["thin_diameter"] += thin_diameter_loss.item()
+            epoch_totals["thick_diameter"] += thick_diameter_loss.item()
 
             writer.add_scalar("train/total_loss", total.item(), global_step)
             writer.add_scalar("train/property_loss", property_loss.item(), global_step)
@@ -473,6 +516,18 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             writer.add_scalar(
                 "train/binarization_penalty", bin_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/short_beam_penalty", short_beam_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/long_beam_penalty", long_beam_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/thin_diameter_penalty", thin_diameter_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/thick_diameter_penalty", thick_diameter_loss.item(), global_step
             )
             global_step += 1
 
@@ -528,6 +583,7 @@ def refine_sample_state(
     steps: int = 12,
     lr: float = 0.15,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    geometry_config = _geometry_regularization_config(config)
     free_mask = (roles == ROLE_FREE).unsqueeze(-1).to(dtype=positions.dtype)
     position_param = torch.nn.Parameter(positions.clone())
     adjacency_param = torch.nn.Parameter(adjacency_logits(adjacency))
@@ -537,7 +593,12 @@ def refine_sample_state(
         current_positions = positions + free_mask * (position_param - positions)
         current_positions = current_positions.clamp(0.0, 1.0)
         current_adjacency = logits_to_adjacency(adjacency_param)
-        terms = mechanical_terms(current_positions, roles, current_adjacency)
+        terms = mechanical_terms(
+            current_positions,
+            roles,
+            current_adjacency,
+            geometry_config=geometry_config,
+        )
         property_loss = F.mse_loss(
             _normalize_target_response(terms["response_matrix"], target_normalization),
             target_features,
@@ -547,6 +608,10 @@ def refine_sample_state(
             + config.material_weight * terms["material"].mean()
             + config.connectivity_weight * terms["connectivity_penalty"].mean()
             + config.binarization_weight * terms["binarization"].mean()
+            + config.short_beam_weight * terms["short_beam_penalty"].mean()
+            + config.long_beam_weight * terms["long_beam_penalty"].mean()
+            + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
+            + config.thick_diameter_weight * terms["thick_diameter_penalty"].mean()
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -570,6 +635,7 @@ def sample(
     device = _device()
     payload = torch.load(checkpoint_path, map_location=device)
     config = TrainConfig(**payload["config"])
+    geometry_config = _geometry_regularization_config(config)
     target_normalization = payload["target_normalization"]
     _seed_everything(config.seed)
 
@@ -615,7 +681,12 @@ def sample(
     thresholded_adjacency = threshold_connectivity(
         refined_adjacency, threshold=sample_threshold
     )
-    terms = mechanical_terms(refined_positions, roles, thresholded_adjacency)
+    terms = mechanical_terms(
+        refined_positions,
+        roles,
+        thresholded_adjacency,
+        geometry_config=geometry_config,
+    )
 
     log_dir = _timestamped_run_dir(name)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -635,6 +706,18 @@ def sample(
     _log_response_matrix(
         writer, "sample/achieved_stiffness", terms["stiffness_matrix"][0], 0
     )
+    writer.add_scalar(
+        "sample/short_beam_penalty", terms["short_beam_penalty"][0].item(), 0
+    )
+    writer.add_scalar(
+        "sample/long_beam_penalty", terms["long_beam_penalty"][0].item(), 0
+    )
+    writer.add_scalar(
+        "sample/thin_diameter_penalty", terms["thin_diameter_penalty"][0].item(), 0
+    )
+    writer.add_scalar(
+        "sample/thick_diameter_penalty", terms["thick_diameter_penalty"][0].item(), 0
+    )
     writer.close()
 
     result = {
@@ -644,6 +727,10 @@ def sample(
         "thresholded_adjacency": thresholded_adjacency.cpu(),
         "response_matrix": terms["response_matrix"].cpu(),
         "stiffness_matrix": terms["stiffness_matrix"].cpu(),
+        "short_beam_penalty": terms["short_beam_penalty"].cpu(),
+        "long_beam_penalty": terms["long_beam_penalty"].cpu(),
+        "thin_diameter_penalty": terms["thin_diameter_penalty"].cpu(),
+        "thick_diameter_penalty": terms["thick_diameter_penalty"].cpu(),
         "log_dir": str(log_dir),
     }
     output = Path(output_path)
@@ -680,6 +767,14 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--material-weight", type=float, default=0.02)
     parser.add_argument("--binarization-weight", type=float, default=0.05)
     parser.add_argument("--connectivity-weight", type=float, default=0.10)
+    parser.add_argument("--short-beam-weight", type=float, default=0.20)
+    parser.add_argument("--long-beam-weight", type=float, default=0.10)
+    parser.add_argument("--thin-diameter-weight", type=float, default=0.20)
+    parser.add_argument("--thick-diameter-weight", type=float, default=0.10)
+    parser.add_argument("--min-beam-length", type=float, default=0.08)
+    parser.add_argument("--max-beam-length", type=float, default=0.85)
+    parser.add_argument("--min-beam-diameter", type=float, default=0.01)
+    parser.add_argument("--max-beam-diameter", type=float, default=0.10)
     parser.add_argument("--log-every-steps", type=int, default=5)
     parser.add_argument("--canonical-eval-every-steps", type=int, default=20)
     parser.add_argument("--sample-threshold", type=float, default=0.5)

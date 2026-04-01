@@ -75,6 +75,8 @@ The loss includes:
 - beam material penalty
 - connectivity penalty
 - binarization encouragement for `A`
+- soft beam-length regularization for bars that are too short or too long
+- soft diameter regularization for bars that are too thin or too thick
 
 ## Synthetic Data
 
@@ -101,6 +103,8 @@ The default training configuration uses:
 - `num_layers=6`
 - iterative rollout refinement
 - canonical TensorBoard evaluations during training
+- configurable geometric regularization thresholds and weights for beam length
+  and diameter
 
 ## Sample
 

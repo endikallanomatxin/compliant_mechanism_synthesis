@@ -5,8 +5,10 @@ import torch
 from compliant_mechanism_synthesis.common import symmetrize_adjacency
 from compliant_mechanism_synthesis.data import generate_graph_sample
 from compliant_mechanism_synthesis.mechanics import (
+    GeometryRegularizationConfig,
     assemble_global_stiffness,
     effective_response,
+    geometric_regularization_terms,
     mechanical_terms,
     threshold_connectivity,
 )
@@ -49,6 +51,34 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["connectivity_penalty"].shape == (1,)
     assert terms["material"].shape == (1,)
     assert terms["binarization"].shape == (1,)
+    assert terms["short_beam_penalty"].shape == (1,)
+    assert terms["long_beam_penalty"].shape == (1,)
+    assert terms["thin_diameter_penalty"].shape == (1,)
+    assert terms["thick_diameter_penalty"].shape == (1,)
+
+
+def test_geometric_regularization_penalizes_extreme_lengths_and_diameters() -> None:
+    positions = torch.tensor(
+        [[[0.0, 0.0], [0.05, 0.0], [1.0, 0.0]]], dtype=torch.float32
+    )
+    adjacency = torch.tensor(
+        [[[0.0, 0.1, 0.95], [0.1, 0.0, 0.0], [0.95, 0.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    penalties = geometric_regularization_terms(
+        positions,
+        adjacency,
+        GeometryRegularizationConfig(
+            min_length=0.10,
+            max_length=0.80,
+            min_diameter=0.02,
+            max_diameter=0.08,
+        ),
+    )
+    assert penalties["short_beam_penalty"][0] > 0.0
+    assert penalties["long_beam_penalty"][0] > 0.0
+    assert penalties["thin_diameter_penalty"][0] > 0.0
+    assert penalties["thick_diameter_penalty"][0] > 0.0
 
 
 def test_thresholded_connectivity_is_symmetric_and_zero_diagonal() -> None:
