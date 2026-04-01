@@ -26,14 +26,16 @@ def sinusoidal_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class GraphAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, nhead: int, conditioned: bool) -> None:
+    def __init__(self, d_model: int, nhead: int, mode: str) -> None:
         super().__init__()
         if d_model % nhead != 0:
             raise ValueError("d_model must be divisible by nhead")
+        if mode not in {"distance", "connectivity", "free"}:
+            raise ValueError("mode must be one of: distance, connectivity, free")
         self.d_model = d_model
         self.nhead = nhead
         self.head_dim = d_model // nhead
-        self.conditioned = conditioned
+        self.mode = mode
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -46,7 +48,28 @@ class GraphAttentionBlock(nn.Module):
             nn.Linear(d_model * 4, d_model),
         )
 
-    def forward(self, hidden: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+    def _conditioning_matrix(
+        self,
+        adjacency: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.mode == "free":
+            return None
+        if self.mode == "connectivity":
+            return adjacency
+        pairwise = torch.linalg.vector_norm(
+            positions[:, :, None, :] - positions[:, None, :, :],
+            dim=-1,
+        )
+        affinity = torch.exp(-pairwise.square() / (0.35**2))
+        return symmetrize_adjacency(affinity)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        adjacency: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
         batch, num_nodes, _ = hidden.shape
         normed = self.norm1(hidden)
         q = (
@@ -66,13 +89,14 @@ class GraphAttentionBlock(nn.Module):
         )
         logits = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
 
-        if self.conditioned:
-            bias = 2.0 * adjacency[:, None, :, :] - 1.0
+        conditioning = self._conditioning_matrix(adjacency, positions)
+        if conditioning is not None:
+            bias = 2.0 * conditioning[:, None, :, :] - 1.0
             logits = logits + bias
 
         weights = torch.softmax(logits, dim=-1)
-        if self.conditioned:
-            weights = weights * (0.25 + 0.75 * adjacency[:, None, :, :])
+        if conditioning is not None:
+            weights = weights * (0.25 + 0.75 * conditioning[:, None, :, :])
             weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
         attended = torch.matmul(weights, v)
@@ -108,9 +132,10 @@ class GraphRefinementModel(nn.Module):
             nn.Linear(d_model, d_model),
         )
         self.input_norm = nn.LayerNorm(d_model)
+        layer_modes = ["distance", "connectivity", "free"]
         self.layers = nn.ModuleList(
             [
-                GraphAttentionBlock(d_model, nhead, conditioned=(idx % 2 == 0))
+                GraphAttentionBlock(d_model, nhead, mode=layer_modes[idx % 3])
                 for idx in range(num_layers)
             ]
         )
@@ -150,7 +175,7 @@ class GraphRefinementModel(nn.Module):
 
         current_adjacency = enforce_role_adjacency_constraints(adjacency, roles)
         for layer in self.layers:
-            hidden = layer(hidden, current_adjacency)
+            hidden = layer(hidden, current_adjacency, positions)
 
         hidden = self.final_norm(hidden)
         displacements = self.displacement_head(hidden)

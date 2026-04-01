@@ -65,7 +65,14 @@ def test_connectivity_delta_comes_from_node_latent_dot_products() -> None:
     assert torch.allclose(outputs["delta_scores"], expected, atol=1e-6)
 
 
-def test_attention_layers_alternate_conditioning() -> None:
+def test_attention_layers_cycle_distance_connectivity_free() -> None:
     model = GraphRefinementModel(d_model=128, nhead=4, num_layers=6, latent_dim=32)
-    flags = [layer.conditioned for layer in model.layers]
-    assert flags == [True, False, True, False, True, False]
+    modes = [layer.mode for layer in model.layers]
+    assert modes == [
+        "distance",
+        "connectivity",
+        "free",
+        "distance",
+        "connectivity",
+        "free",
+    ]
