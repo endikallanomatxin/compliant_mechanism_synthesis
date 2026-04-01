@@ -50,7 +50,6 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert torch.allclose(terms["stiffness_matrix"], stiffness_matrix)
     assert terms["connectivity_penalty"].shape == (1,)
     assert terms["material"].shape == (1,)
-    assert terms["binarization"].shape == (1,)
     assert terms["short_beam_penalty"].shape == (1,)
     assert terms["long_beam_penalty"].shape == (1,)
     assert terms["thin_diameter_penalty"].shape == (1,)

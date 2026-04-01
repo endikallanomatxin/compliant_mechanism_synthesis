@@ -44,7 +44,19 @@ def apply_free_node_update(
     return clamp_positions(updated)
 
 
-def upper_triangle_values(matrix: torch.Tensor) -> torch.Tensor:
+def symmetric_matrix_unique_values(matrix: torch.Tensor) -> torch.Tensor:
     n = matrix.shape[-1]
-    idx = torch.triu_indices(n, n, offset=1, device=matrix.device)
+    idx = torch.triu_indices(n, n, offset=0, device=matrix.device)
     return matrix[..., idx[0], idx[1]]
+
+
+def unique_values_to_symmetric_matrix(values: torch.Tensor, size: int) -> torch.Tensor:
+    idx = torch.triu_indices(size, size, offset=0, device=values.device)
+    matrix = torch.zeros(
+        values.shape[:-1] + (size, size),
+        device=values.device,
+        dtype=values.dtype,
+    )
+    matrix[..., idx[0], idx[1]] = values
+    matrix[..., idx[1], idx[0]] = values
+    return matrix

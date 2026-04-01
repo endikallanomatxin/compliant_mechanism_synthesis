@@ -22,5 +22,5 @@
 - Each refinement step predicts free-node displacement deltas and connectivity updates.
 - Connectivity updates must come only from dot products between per-node latent vectors.
 - Attention layers alternate between connectivity-conditioned and unconditioned self-attention.
-- Training uses noisy positions and noisy connectivity, plus property, reconstruction, material, binarization, and connectivity losses.
+- Training starts from pure-noise graph states and optimizes objective, material, connectivity, and geometric regularization losses directly through the differentiable simulator.
 - Training logs and sample figures are written to TensorBoard.

@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.common import (
@@ -17,14 +16,13 @@ from compliant_mechanism_synthesis.common import (
     adjacency_logits,
     apply_free_node_update,
     logits_to_adjacency,
-    upper_triangle_values,
+    symmetric_matrix_unique_values,
+    unique_values_to_symmetric_matrix,
 )
-from compliant_mechanism_synthesis.data import generate_dataset, generate_graph_sample
+from compliant_mechanism_synthesis.data import generate_noise_sample
 from compliant_mechanism_synthesis.mechanics import (
     GeometryRegularizationConfig,
-    binarization_penalty,
     mechanical_terms,
-    noisy_state,
     threshold_connectivity,
 )
 from compliant_mechanism_synthesis.model import GraphRefinementModel
@@ -45,13 +43,8 @@ class TrainConfig:
     rollout_steps: int = 6
     position_step_size: float = 0.2
     connectivity_step_size: float = 1.0
-    sigma_x_max: float = 0.08
-    sigma_a_max: float = 0.60
     property_weight: float = 2.0
-    position_weight: float = 1.0
-    adjacency_weight: float = 1.0
     material_weight: float = 0.02
-    binarization_weight: float = 0.05
     connectivity_weight: float = 0.10
     short_beam_weight: float = 0.20
     long_beam_weight: float = 0.10
@@ -67,6 +60,40 @@ class TrainConfig:
     name: str = "prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
     seed: int = 7
+
+
+@dataclass
+class ResponseStatistics:
+    count: int
+    sum: torch.Tensor
+    sumsq: torch.Tensor
+
+    @classmethod
+    def empty(cls, device: torch.device) -> "ResponseStatistics":
+        zeros = torch.zeros(6, device=device, dtype=torch.float32)
+        return cls(count=0, sum=zeros.clone(), sumsq=zeros.clone())
+
+    def update(self, response_matrix: torch.Tensor) -> None:
+        features = symmetric_matrix_unique_values(response_matrix.detach())
+        self.count += int(features.shape[0])
+        self.sum = self.sum + features.sum(dim=0)
+        self.sumsq = self.sumsq + features.square().sum(dim=0)
+
+    def normalization(self) -> dict[str, list[float]]:
+        count = max(self.count, 1)
+        mean = self.sum / count
+        variance = (self.sumsq / count) - mean.square()
+        std = variance.clamp_min(1e-6).sqrt()
+        return {"mean": mean.tolist(), "std": std.tolist()}
+
+    def sample_targets(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        normalization = self.normalization()
+        mean = torch.tensor(normalization["mean"], device=device, dtype=torch.float32)
+        std = torch.tensor(normalization["std"], device=device, dtype=torch.float32)
+        sampled = mean.unsqueeze(0) + torch.randn(
+            (batch_size, mean.shape[0]), device=device, dtype=torch.float32
+        ) * std.unsqueeze(0)
+        return unique_values_to_symmetric_matrix(sampled, size=3)
 
 
 def _device() -> torch.device:
@@ -90,7 +117,7 @@ def _timestamped_run_dir(name: str) -> Path:
     return Path("runs") / f"{timestamp}-{name}"
 
 
-def _fixed_noise(
+def _pure_noise_batch(
     batch_size: int, num_nodes: int, seed: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     positions = []
@@ -101,7 +128,7 @@ def _fixed_noise(
     random.seed(seed)
     torch.manual_seed(seed)
     for _ in range(batch_size):
-        x, r, a = generate_graph_sample(num_nodes)
+        x, r, a = generate_noise_sample(num_nodes)
         positions.append(x)
         roles.append(r)
         adjacency.append(a)
@@ -115,32 +142,46 @@ def _fixed_noise(
 
 
 def _canonical_target_specs(
-    target_pool: torch.Tensor,
+    normalization: dict[str, list[float]],
+    device: torch.device,
 ) -> list[tuple[str, torch.Tensor]]:
-    mean = target_pool.mean(dim=0)
-    std = target_pool.std(dim=0, unbiased=False)
+    mean = torch.tensor(normalization["mean"], device=device, dtype=torch.float32)
+    std = torch.tensor(normalization["std"], device=device, dtype=torch.float32)
     low = mean - std
     high = mean + std
     specs = []
     first = mean.clone()
-    first[0, 0] = low[0, 0]
-    first[1, 1] = high[1, 1]
-    first[2, 2] = high[2, 2]
-    specs.append(("low-cxx_high-cyy-ctheta", 0.5 * (first + first.transpose(0, 1))))
+    first[0] = low[0]
+    first[3] = high[3]
+    first[5] = high[5]
+    specs.append(
+        (
+            "low-cxx_high-cyy-ctheta",
+            unique_values_to_symmetric_matrix(first.unsqueeze(0), size=3)[0],
+        )
+    )
 
     second = mean.clone()
-    second[0, 0] = high[0, 0]
-    second[1, 1] = low[1, 1]
-    second[2, 2] = high[2, 2]
+    second[0] = high[0]
+    second[3] = low[3]
+    second[5] = high[5]
     specs.append(
-        ("high-cxx_low-cyy-high-ctheta", 0.5 * (second + second.transpose(0, 1)))
+        (
+            "high-cxx_low-cyy-high-ctheta",
+            unique_values_to_symmetric_matrix(second.unsqueeze(0), size=3)[0],
+        )
     )
 
     third = mean.clone()
-    third[0, 0] = high[0, 0]
-    third[1, 1] = high[1, 1]
-    third[2, 2] = low[2, 2]
-    specs.append(("high-cxx-cyy_low-ctheta", 0.5 * (third + third.transpose(0, 1))))
+    third[0] = high[0]
+    third[3] = high[3]
+    third[5] = low[5]
+    specs.append(
+        (
+            "high-cxx-cyy_low-ctheta",
+            unique_values_to_symmetric_matrix(third.unsqueeze(0), size=3)[0],
+        )
+    )
     return specs
 
 
@@ -165,23 +206,27 @@ def _parse_target_response(raw: str) -> list[float]:
     return values
 
 
-def _target_normalization(raw_targets: torch.Tensor) -> dict[str, list[float]]:
-    flattened = raw_targets.reshape(raw_targets.shape[0], -1)
-    return {
-        "mean": flattened.mean(dim=0).tolist(),
-        "std": flattened.std(dim=0, unbiased=False).clamp_min(1e-6).tolist(),
-    }
-
-
 def _normalize_target_response(
     raw_targets: torch.Tensor,
     normalization: dict[str, list[float]],
 ) -> torch.Tensor:
-    flattened = raw_targets.reshape(raw_targets.shape[0], -1)
+    flattened = symmetric_matrix_unique_values(raw_targets)
     mean = raw_targets.new_tensor(normalization["mean"])
     std = raw_targets.new_tensor(normalization["std"])
     normalized = (flattened - mean) / std
-    return normalized.reshape(-1, 3, 3)
+    return unique_values_to_symmetric_matrix(normalized, size=3)
+
+
+def _response_matrix_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    normalization: dict[str, list[float]],
+) -> torch.Tensor:
+    pred_unique = symmetric_matrix_unique_values(predicted)
+    target_unique = symmetric_matrix_unique_values(target)
+    mean = predicted.new_tensor(normalization["mean"])
+    std = predicted.new_tensor(normalization["std"])
+    return F.mse_loss((pred_unique - mean) / std, (target_unique - mean) / std)
 
 
 def _geometry_regularization_config(
@@ -213,22 +258,6 @@ def _log_response_matrix(
                 matrix[row_idx, col_idx].item(),
                 step,
             )
-
-
-def _free_position_loss(
-    predicted: torch.Tensor, target: torch.Tensor, roles: torch.Tensor
-) -> torch.Tensor:
-    free_mask = (roles == ROLE_FREE).unsqueeze(-1)
-    if not free_mask.any():
-        return torch.zeros((), device=predicted.device)
-    difference = (predicted - target).square() * free_mask.to(dtype=predicted.dtype)
-    return difference.sum() / free_mask.sum().clamp_min(1)
-
-
-def _adjacency_loss(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    pred_upper = upper_triangle_values(predicted)
-    target_upper = upper_triangle_values(target)
-    return F.mse_loss(pred_upper, target_upper)
 
 
 def rollout_refinement(
@@ -282,7 +311,8 @@ def _log_canonical_evaluation(
     canonical_specs: list[tuple[str, torch.Tensor]],
     target_normalization: dict[str, list[float]],
 ) -> None:
-    positions, roles, adjacency = _fixed_noise(
+    geometry_config = _geometry_regularization_config(config)
+    positions, roles, adjacency = _pure_noise_batch(
         len(canonical_specs), config.num_nodes, config.seed + 101, device
     )
     raw_targets = torch.stack([values for _, values in canonical_specs], dim=0).to(
@@ -303,7 +333,10 @@ def _log_canonical_evaluation(
     )
     final_state = rollout[-1]
     final_terms = mechanical_terms(
-        final_state["positions"], roles, final_state["adjacency"]
+        final_state["positions"],
+        roles,
+        final_state["adjacency"],
+        geometry_config=geometry_config,
     )
 
     for idx, (name, target_values) in enumerate(canonical_specs):
@@ -330,12 +363,12 @@ def _log_canonical_evaluation(
                 state["positions"][idx : idx + 1],
                 roles[idx : idx + 1],
                 state["adjacency"][idx : idx + 1],
+                geometry_config=geometry_config,
             )
-            step_error = F.mse_loss(
-                _normalize_target_response(
-                    step_terms["response_matrix"], target_normalization
-                ),
-                targets[idx : idx + 1],
+            step_error = _response_matrix_loss(
+                step_terms["response_matrix"],
+                raw_targets[idx : idx + 1],
+                target_normalization,
             )
             writer.add_scalar(
                 f"canonical/{name}/property_error_step_{rollout_idx}",
@@ -350,31 +383,30 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     _seed_everything(config.seed)
     device = _device()
     geometry_config = _geometry_regularization_config(config)
+    num_batches = max(config.dataset_size // config.batch_size, 1)
     _progress(
         f"train:start device={device} epochs={config.epochs} dataset_size={config.dataset_size} batch_size={config.batch_size} num_nodes={config.num_nodes}"
     )
 
-    dataset = generate_dataset(config.dataset_size, config.num_nodes, config.seed)
-    raw_targets = mechanical_terms(dataset.positions, dataset.roles, dataset.adjacency)[
-        "response_matrix"
-    ]
-    target_normalization = _target_normalization(raw_targets)
-    normalized_targets = _normalize_target_response(raw_targets, target_normalization)
-    canonical_specs = _canonical_target_specs(raw_targets)
+    response_stats = ResponseStatistics.empty(device)
+    bootstrap_positions, bootstrap_roles, bootstrap_adjacency = _pure_noise_batch(
+        max(config.batch_size * 4, 64), config.num_nodes, config.seed + 17, device
+    )
+    bootstrap_terms = mechanical_terms(
+        bootstrap_positions,
+        bootstrap_roles,
+        bootstrap_adjacency,
+        geometry_config=geometry_config,
+    )
+    response_stats.update(bootstrap_terms["response_matrix"])
+    target_normalization = response_stats.normalization()
+    canonical_specs = _canonical_target_specs(target_normalization, device)
     _progress(
         "train:canonical_targets "
         + " ".join(
             f"{name}={_format_matrix(values)}" for name, values in canonical_specs
         )
     )
-
-    tensor_dataset = TensorDataset(
-        dataset.positions,
-        dataset.roles,
-        dataset.adjacency,
-        normalized_targets,
-    )
-    loader = DataLoader(tensor_dataset, batch_size=config.batch_size, shuffle=True)
 
     model = GraphRefinementModel(
         d_model=config.d_model,
@@ -394,42 +426,31 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         epoch_totals = {
             "total": 0.0,
             "property": 0.0,
-            "position": 0.0,
-            "adjacency": 0.0,
             "material": 0.0,
             "connectivity": 0.0,
-            "binarization": 0.0,
             "short_beam": 0.0,
             "long_beam": 0.0,
             "thin_diameter": 0.0,
             "thick_diameter": 0.0,
         }
 
-        for batch_idx, (
-            clean_positions,
-            roles,
-            clean_adjacency,
-            target_features,
-        ) in enumerate(loader, start=1):
-            clean_positions = clean_positions.to(device)
-            roles = roles.to(device)
-            clean_adjacency = clean_adjacency.to(device)
-            target_features = target_features.to(device)
-            base_time = torch.rand((clean_positions.shape[0],), device=device)
-            noisy_positions, noisy_adjacency = noisy_state(
-                clean_positions,
-                roles,
-                clean_adjacency,
-                base_time,
-                sigma_x=config.sigma_x_max,
-                sigma_a=config.sigma_a_max,
+        for batch_idx in range(1, num_batches + 1):
+            current_seed = config.seed + epoch * num_batches + batch_idx + 1000
+            positions, roles, adjacency = _pure_noise_batch(
+                config.batch_size, config.num_nodes, current_seed, device
             )
+            target_normalization = response_stats.normalization()
+            raw_targets = response_stats.sample_targets(config.batch_size, device)
+            target_features = _normalize_target_response(
+                raw_targets, target_normalization
+            )
+            base_time = torch.rand((positions.shape[0],), device=device)
 
             rollout = rollout_refinement(
                 model,
-                noisy_positions,
+                positions,
                 roles,
-                noisy_adjacency,
+                adjacency,
                 target_features,
                 steps=config.rollout_steps,
                 position_step_size=config.position_step_size,
@@ -438,8 +459,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             weights = _step_weights(config.rollout_steps, device)
             property_loss = torch.zeros((), device=device)
-            position_loss = torch.zeros((), device=device)
-            adjacency_loss = torch.zeros((), device=device)
             for step_idx, state in enumerate(rollout):
                 step_terms = mechanical_terms(
                     state["positions"],
@@ -447,17 +466,12 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     state["adjacency"],
                     geometry_config=geometry_config,
                 )
-                property_loss = property_loss + weights[step_idx] * F.mse_loss(
-                    _normalize_target_response(
-                        step_terms["response_matrix"], target_normalization
-                    ),
-                    target_features,
-                )
-                position_loss = position_loss + weights[step_idx] * _free_position_loss(
-                    state["positions"], clean_positions, roles
-                )
-                adjacency_loss = adjacency_loss + weights[step_idx] * _adjacency_loss(
-                    state["adjacency"], clean_adjacency
+                property_loss = property_loss + weights[
+                    step_idx
+                ] * _response_matrix_loss(
+                    step_terms["response_matrix"],
+                    raw_targets,
+                    target_normalization,
                 )
 
             final_state = rollout[-1]
@@ -469,7 +483,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             material_loss = final_terms["material"].mean()
             connectivity_loss = final_terms["connectivity_penalty"].mean()
-            bin_loss = final_terms["binarization"].mean()
             short_beam_loss = final_terms["short_beam_penalty"].mean()
             long_beam_loss = final_terms["long_beam_penalty"].mean()
             thin_diameter_loss = final_terms["thin_diameter_penalty"].mean()
@@ -477,11 +490,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
             total = (
                 config.property_weight * property_loss
-                + config.position_weight * position_loss
-                + config.adjacency_weight * adjacency_loss
                 + config.material_weight * material_loss
                 + config.connectivity_weight * connectivity_loss
-                + config.binarization_weight * bin_loss
                 + config.short_beam_weight * short_beam_loss
                 + config.long_beam_weight * long_beam_loss
                 + config.thin_diameter_weight * thin_diameter_loss
@@ -494,28 +504,21 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
             epoch_totals["total"] += total.item()
             epoch_totals["property"] += property_loss.item()
-            epoch_totals["position"] += position_loss.item()
-            epoch_totals["adjacency"] += adjacency_loss.item()
             epoch_totals["material"] += material_loss.item()
             epoch_totals["connectivity"] += connectivity_loss.item()
-            epoch_totals["binarization"] += bin_loss.item()
             epoch_totals["short_beam"] += short_beam_loss.item()
             epoch_totals["long_beam"] += long_beam_loss.item()
             epoch_totals["thin_diameter"] += thin_diameter_loss.item()
             epoch_totals["thick_diameter"] += thick_diameter_loss.item()
 
+            response_stats.update(final_terms["response_matrix"])
+            target_normalization = response_stats.normalization()
+
             writer.add_scalar("train/total_loss", total.item(), global_step)
             writer.add_scalar("train/property_loss", property_loss.item(), global_step)
-            writer.add_scalar("train/position_loss", position_loss.item(), global_step)
-            writer.add_scalar(
-                "train/adjacency_loss", adjacency_loss.item(), global_step
-            )
             writer.add_scalar("train/material_loss", material_loss.item(), global_step)
             writer.add_scalar(
                 "train/connectivity_penalty", connectivity_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/binarization_penalty", bin_loss.item(), global_step
             )
             writer.add_scalar(
                 "train/short_beam_penalty", short_beam_loss.item(), global_step
@@ -532,10 +535,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             global_step += 1
 
             if config.log_every_steps > 0 and (
-                batch_idx % config.log_every_steps == 0 or batch_idx == len(loader)
+                batch_idx % config.log_every_steps == 0 or batch_idx == num_batches
             ):
                 _progress(
-                    f"train:step epoch={epoch + 1}/{config.epochs} batch={batch_idx}/{len(loader)} total={total.item():.4f} prop={property_loss.item():.4f} pos={position_loss.item():.4f} adj={adjacency_loss.item():.4f} conn={connectivity_loss.item():.4f}"
+                    f"train:step epoch={epoch + 1}/{config.epochs} batch={batch_idx}/{num_batches} total={total.item():.4f} prop={property_loss.item():.4f} conn={connectivity_loss.item():.4f} material={material_loss.item():.4f}"
                 )
 
             if (
@@ -550,22 +553,22 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                         config,
                         global_step,
                         device,
-                        canonical_specs,
+                        _canonical_target_specs(target_normalization, device),
                         target_normalization,
                     )
                 model.train()
 
-        num_batches = max(len(loader), 1)
         for key, value in epoch_totals.items():
             writer.add_scalar(f"epoch/{key}", value / num_batches, epoch)
         _progress(
-            f"train:epoch_end epoch={epoch + 1}/{config.epochs} total={epoch_totals['total'] / num_batches:.4f} prop={epoch_totals['property'] / num_batches:.4f} pos={epoch_totals['position'] / num_batches:.4f} adj={epoch_totals['adjacency'] / num_batches:.4f}"
+            f"train:epoch_end epoch={epoch + 1}/{config.epochs} total={epoch_totals['total'] / num_batches:.4f} prop={epoch_totals['property'] / num_batches:.4f} material={epoch_totals['material'] / num_batches:.4f} conn={epoch_totals['connectivity'] / num_batches:.4f}"
         )
 
     payload = {
         "state_dict": model.state_dict(),
         "config": asdict(config),
-        "target_normalization": target_normalization,
+        "target_normalization": response_stats.normalization(),
+        "response_stats_count": response_stats.count,
     }
     torch.save(payload, checkpoint_path)
     writer.close()
@@ -577,7 +580,7 @@ def refine_sample_state(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
-    target_features: torch.Tensor,
+    raw_target_response: torch.Tensor,
     target_normalization: dict[str, list[float]],
     config: TrainConfig,
     steps: int = 12,
@@ -599,15 +602,15 @@ def refine_sample_state(
             current_adjacency,
             geometry_config=geometry_config,
         )
-        property_loss = F.mse_loss(
-            _normalize_target_response(terms["response_matrix"], target_normalization),
-            target_features,
+        property_loss = _response_matrix_loss(
+            terms["response_matrix"],
+            raw_target_response,
+            target_normalization,
         )
         loss = (
             config.property_weight * property_loss
             + config.material_weight * terms["material"].mean()
             + config.connectivity_weight * terms["connectivity_penalty"].mean()
-            + config.binarization_weight * terms["binarization"].mean()
             + config.short_beam_weight * terms["short_beam_penalty"].mean()
             + config.long_beam_weight * terms["long_beam_penalty"].mean()
             + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
@@ -648,7 +651,7 @@ def sample(
     model.load_state_dict(payload["state_dict"])
     model.eval()
 
-    positions, roles, adjacency = _fixed_noise(
+    positions, roles, adjacency = _pure_noise_batch(
         1, config.num_nodes, config.seed + 500, device
     )
     raw_targets = torch.tensor(
@@ -674,7 +677,7 @@ def sample(
         final_state["positions"],
         roles,
         final_state["adjacency"],
-        targets,
+        raw_targets,
         target_normalization,
         config,
     )
@@ -759,13 +762,8 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-steps", type=int, default=6)
     parser.add_argument("--position-step-size", type=float, default=0.2)
     parser.add_argument("--connectivity-step-size", type=float, default=1.0)
-    parser.add_argument("--sigma-x-max", type=float, default=0.08)
-    parser.add_argument("--sigma-a-max", type=float, default=0.60)
     parser.add_argument("--property-weight", type=float, default=2.0)
-    parser.add_argument("--position-weight", type=float, default=1.0)
-    parser.add_argument("--adjacency-weight", type=float, default=1.0)
     parser.add_argument("--material-weight", type=float, default=0.02)
-    parser.add_argument("--binarization-weight", type=float, default=0.05)
     parser.add_argument("--connectivity-weight", type=float, default=0.10)
     parser.add_argument("--short-beam-weight", type=float, default=0.20)
     parser.add_argument("--long-beam-weight", type=float, default=0.10)

@@ -152,6 +152,19 @@ def generate_graph_sample(
     return positions, roles, adjacency
 
 
+def generate_noise_connectivity(num_nodes: int) -> torch.Tensor:
+    adjacency = torch.rand((num_nodes, num_nodes), dtype=torch.float32).pow(1.5)
+    return symmetrize_adjacency(adjacency)
+
+
+def generate_noise_sample(
+    num_nodes: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    positions, roles = generate_points(num_nodes)
+    adjacency = generate_noise_connectivity(num_nodes)
+    return positions, roles, adjacency
+
+
 def generate_dataset(num_samples: int, num_nodes: int, seed: int) -> GraphDataset:
     random.seed(seed)
     torch.manual_seed(seed)

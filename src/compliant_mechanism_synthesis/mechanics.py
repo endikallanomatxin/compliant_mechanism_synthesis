@@ -14,7 +14,6 @@ from compliant_mechanism_synthesis.common import (
     logits_to_adjacency,
     role_masks,
     symmetrize_adjacency,
-    upper_triangle_values,
 )
 
 
@@ -37,12 +36,6 @@ def threshold_connectivity(
     adjacency: torch.Tensor, threshold: float = 0.5
 ) -> torch.Tensor:
     return symmetrize_adjacency((adjacency >= threshold).to(dtype=adjacency.dtype))
-
-
-def binarization_penalty(adjacency: torch.Tensor) -> torch.Tensor:
-    return (
-        upper_triangle_values(adjacency) * (1.0 - upper_triangle_values(adjacency))
-    ).mean(dim=1)
 
 
 def _edge_index_pairs(num_nodes: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -403,7 +396,6 @@ def mechanical_terms(
         "stiffness_matrix": stiffness_matrix,
         "connectivity_penalty": connectivity_penalty(roles, adjacency),
         "material": beam_material(positions, adjacency, config),
-        "binarization": binarization_penalty(adjacency),
         **geometry_terms,
     }
 

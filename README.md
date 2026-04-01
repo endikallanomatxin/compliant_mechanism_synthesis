@@ -55,13 +55,11 @@ matrix internally only for model conditioning and loss scaling.
 
 ## Training Loop
 
-Training starts from a clean synthetic graph sample `(X_0, A_0)` and creates a
-noisy state `(X_t, A_t)`.
-
 For each batch:
 
-- add Gaussian noise to free-node positions
-- add Gaussian noise to the connectivity matrix
+- sample an initial graph state from pure noise
+- sample a target response matrix from the empirical distribution of previously
+  simulated responses
 - refine the noisy graph over several learned rollout steps
 - apply position updates only to free nodes
 - update connectivity through adjacency logits plus node-latent dot products
@@ -69,12 +67,10 @@ For each batch:
 
 The loss includes:
 
-- target response-matrix loss on all `3x3` terms, including couplings
-- reconstruction loss on free-node positions
-- reconstruction loss on connectivity
+- target response-matrix loss on the unique symmetric terms of the `3x3` matrix,
+  including couplings without double-counting mirrored entries
 - beam material penalty
 - connectivity penalty
-- binarization encouragement for `A`
 - soft beam-length regularization for bars that are too short or too long
 - soft diameter regularization for bars that are too thin or too thick
 
@@ -102,6 +98,7 @@ The default training configuration uses:
 - `d_model=256`
 - `num_layers=6`
 - iterative rollout refinement
+- pure-noise initial states with no reference-design reconstruction loss
 - canonical TensorBoard evaluations during training
 - configurable geometric regularization thresholds and weights for beam length
   and diameter
