@@ -31,15 +31,15 @@ from compliant_mechanism_synthesis.viz import plot_graph_design
 
 @dataclass
 class TrainConfig:
-    num_nodes: int = 32
-    d_model: int = 256
+    num_nodes: int = 64
+    d_model: int = 512
     nhead: int = 8
     num_layers: int = 6
-    latent_dim: int = 64
-    batch_size: int = 512
-    train_steps: int = 50
-    learning_rate: float = 1e-4
-    rollout_steps: int = 6
+    latent_dim: int = 256
+    batch_size: int = 2048
+    train_steps: int = 20000
+    learning_rate: float = 1e-5
+    rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 1.0
     property_weight: float = 2.0
@@ -751,54 +751,92 @@ def sample(
 
 
 def _train_parser() -> argparse.ArgumentParser:
+    defaults = TrainConfig()
     parser = argparse.ArgumentParser(
         description="Train the point-and-beam compliant mechanism prototype"
     )
-    parser.add_argument("--num-nodes", type=int, default=12)
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--num-layers", type=int, default=6)
-    parser.add_argument("--latent-dim", type=int, default=64)
-    parser.add_argument("--train-steps", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--rollout-steps", type=int, default=6)
-    parser.add_argument("--position-step-size", type=float, default=0.2)
-    parser.add_argument("--connectivity-step-size", type=float, default=1.0)
-    parser.add_argument("--property-weight", type=float, default=2.0)
-    parser.add_argument("--material-weight", type=float, default=0.02)
-    parser.add_argument("--connectivity-weight", type=float, default=0.10)
-    parser.add_argument("--short-beam-weight", type=float, default=0.20)
-    parser.add_argument("--long-beam-weight", type=float, default=0.10)
-    parser.add_argument("--thin-diameter-weight", type=float, default=0.20)
-    parser.add_argument("--thick-diameter-weight", type=float, default=0.10)
-    parser.add_argument("--min-beam-length", type=float, default=0.08)
-    parser.add_argument("--max-beam-length", type=float, default=0.85)
-    parser.add_argument("--min-beam-diameter", type=float, default=0.01)
-    parser.add_argument("--max-beam-diameter", type=float, default=0.10)
-    parser.add_argument("--log-every-steps", type=int, default=5)
-    parser.add_argument("--canonical-eval-every-steps", type=int, default=20)
-    parser.add_argument("--sample-threshold", type=float, default=0.5)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--name", default="prototype")
-    parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--num-nodes", type=int, default=defaults.num_nodes)
+    parser.add_argument("--d-model", type=int, default=defaults.d_model)
+    parser.add_argument("--nhead", type=int, default=defaults.nhead)
+    parser.add_argument("--num-layers", type=int, default=defaults.num_layers)
+    parser.add_argument("--latent-dim", type=int, default=defaults.latent_dim)
+    parser.add_argument("--train-steps", type=int, default=defaults.train_steps)
+    parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
+    parser.add_argument("--rollout-steps", type=int, default=defaults.rollout_steps)
+    parser.add_argument(
+        "--position-step-size", type=float, default=defaults.position_step_size
+    )
+    parser.add_argument(
+        "--connectivity-step-size",
+        type=float,
+        default=defaults.connectivity_step_size,
+    )
+    parser.add_argument(
+        "--property-weight", type=float, default=defaults.property_weight
+    )
+    parser.add_argument(
+        "--material-weight", type=float, default=defaults.material_weight
+    )
+    parser.add_argument(
+        "--connectivity-weight", type=float, default=defaults.connectivity_weight
+    )
+    parser.add_argument(
+        "--short-beam-weight", type=float, default=defaults.short_beam_weight
+    )
+    parser.add_argument(
+        "--long-beam-weight", type=float, default=defaults.long_beam_weight
+    )
+    parser.add_argument(
+        "--thin-diameter-weight", type=float, default=defaults.thin_diameter_weight
+    )
+    parser.add_argument(
+        "--thick-diameter-weight", type=float, default=defaults.thick_diameter_weight
+    )
+    parser.add_argument(
+        "--min-beam-length", type=float, default=defaults.min_beam_length
+    )
+    parser.add_argument(
+        "--max-beam-length", type=float, default=defaults.max_beam_length
+    )
+    parser.add_argument(
+        "--min-beam-diameter", type=float, default=defaults.min_beam_diameter
+    )
+    parser.add_argument(
+        "--max-beam-diameter", type=float, default=defaults.max_beam_diameter
+    )
+    parser.add_argument("--log-every-steps", type=int, default=defaults.log_every_steps)
+    parser.add_argument(
+        "--canonical-eval-every-steps",
+        type=int,
+        default=defaults.canonical_eval_every_steps,
+    )
+    parser.add_argument(
+        "--sample-threshold", type=float, default=defaults.sample_threshold
+    )
+    parser.add_argument("--device", default=defaults.device)
+    parser.add_argument("--name", default=defaults.name)
+    parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
+    parser.add_argument("--seed", type=int, default=defaults.seed)
     return parser
 
 
 def _sample_parser() -> argparse.ArgumentParser:
+    defaults = TrainConfig()
     parser = argparse.ArgumentParser(
         description="Sample a point-and-beam design from a trained prototype"
     )
-    parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
+    parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
     parser.add_argument(
         "--target-response",
         required=True,
         help="Nine comma-separated row-major values for the 3x3 target response matrix",
     )
     parser.add_argument("--steps", type=int, default=6)
-    parser.add_argument("--sample-threshold", type=float, default=0.5)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--sample-threshold", type=float, default=defaults.sample_threshold
+    )
+    parser.add_argument("--device", default=defaults.device)
     parser.add_argument("--name", default="sample")
     parser.add_argument("--output-path", default="artifacts/sample.pt")
     return parser
