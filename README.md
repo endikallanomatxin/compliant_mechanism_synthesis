@@ -13,6 +13,9 @@ A design is represented by:
 
 The diagonal of `A` is always zero. Beam radius is derived from `A`.
 
+The normalized design domain maps to a physical `0.2 m x 0.2 m` workspace.
+By default, beam diameters span `0.2 mm` to `2.0 mm`.
+
 ## Mechanics
 
 The mechanics module uses a differentiable 2D Euler-Bernoulli frame FEM in
@@ -73,6 +76,13 @@ The loss includes:
 - connectivity penalty
 - soft beam-length regularization for bars that are too short or too long
 - soft diameter regularization for bars that are too thin or too thick
+- soft free-node spacing regularization to avoid node collapse
+- soft boundary-margin regularization to avoid crowding against workspace edges
+
+The default geometric regularization thresholds are expressed in physical units:
+
+- beam length between `1 mm` and `20 mm`
+- beam diameter between `0.2 mm` and `2.0 mm`
 
 ## Synthetic Data
 

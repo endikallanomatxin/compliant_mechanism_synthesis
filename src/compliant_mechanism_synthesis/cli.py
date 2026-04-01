@@ -31,7 +31,7 @@ from compliant_mechanism_synthesis.viz import plot_graph_design
 
 @dataclass
 class TrainConfig:
-    num_nodes: int = 32
+    num_nodes: int = 16
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 6
@@ -43,16 +43,20 @@ class TrainConfig:
     position_step_size: float = 0.2
     connectivity_step_size: float = 1.0
     property_weight: float = 2.0
-    material_weight: float = 0.02
+    material_weight: float = 1e4
     connectivity_weight: float = 0.10
     short_beam_weight: float = 0.20
     long_beam_weight: float = 0.10
     thin_diameter_weight: float = 0.20
     thick_diameter_weight: float = 0.10
-    min_beam_length: float = 0.02
-    max_beam_length: float = 0.35
-    min_beam_diameter: float = 0.004
-    max_beam_diameter: float = 0.10
+    node_spacing_weight: float = 0.20
+    boundary_weight: float = 0.10
+    min_beam_length: float = 1e-3
+    max_beam_length: float = 2e-2
+    min_beam_diameter: float = 2e-4
+    max_beam_diameter: float = 2e-3
+    min_free_node_spacing: float = 5e-3
+    boundary_margin: float = 5e-3
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
     sample_threshold: float = 0.5
@@ -242,6 +246,8 @@ def _geometry_regularization_config(
         max_length=config.max_beam_length,
         min_diameter=config.min_beam_diameter,
         max_diameter=config.max_beam_diameter,
+        min_free_node_spacing=config.min_free_node_spacing,
+        boundary_margin=config.boundary_margin,
     )
 
 
@@ -434,6 +440,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "long_beam": 0.0,
         "thin_diameter": 0.0,
         "thick_diameter": 0.0,
+        "node_spacing": 0.0,
+        "boundary": 0.0,
     }
 
     model.train()
@@ -486,6 +494,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         long_beam_loss = final_terms["long_beam_penalty"].mean()
         thin_diameter_loss = final_terms["thin_diameter_penalty"].mean()
         thick_diameter_loss = final_terms["thick_diameter_penalty"].mean()
+        node_spacing_loss = final_terms["node_spacing_penalty"].mean()
+        boundary_loss = final_terms["boundary_penalty"].mean()
 
         total = (
             config.property_weight * property_loss
@@ -495,6 +505,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             + config.long_beam_weight * long_beam_loss
             + config.thin_diameter_weight * thin_diameter_loss
             + config.thick_diameter_weight * thick_diameter_loss
+            + config.node_spacing_weight * node_spacing_loss
+            + config.boundary_weight * boundary_loss
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -509,6 +521,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["long_beam"] += long_beam_loss.item()
         running_totals["thin_diameter"] += thin_diameter_loss.item()
         running_totals["thick_diameter"] += thick_diameter_loss.item()
+        running_totals["node_spacing"] += node_spacing_loss.item()
+        running_totals["boundary"] += boundary_loss.item()
 
         response_stats.update(final_terms["response_matrix"])
         target_normalization = response_stats.normalization()
@@ -529,6 +543,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         writer.add_scalar(
             "train/thick_diameter_penalty", thick_diameter_loss.item(), global_step
         )
+        writer.add_scalar(
+            "train/node_spacing_penalty", node_spacing_loss.item(), global_step
+        )
+        writer.add_scalar("train/boundary_penalty", boundary_loss.item(), global_step)
         global_step += 1
 
         if config.log_every_steps > 0 and (
@@ -616,6 +634,8 @@ def refine_sample_state(
             + config.long_beam_weight * terms["long_beam_penalty"].mean()
             + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
             + config.thick_diameter_weight * terms["thick_diameter_penalty"].mean()
+            + config.node_spacing_weight * terms["node_spacing_penalty"].mean()
+            + config.boundary_weight * terms["boundary_penalty"].mean()
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -725,6 +745,10 @@ def sample(
     writer.add_scalar(
         "sample/thick_diameter_penalty", terms["thick_diameter_penalty"][0].item(), 0
     )
+    writer.add_scalar(
+        "sample/node_spacing_penalty", terms["node_spacing_penalty"][0].item(), 0
+    )
+    writer.add_scalar("sample/boundary_penalty", terms["boundary_penalty"][0].item(), 0)
     writer.close()
 
     result = {
@@ -738,6 +762,8 @@ def sample(
         "long_beam_penalty": terms["long_beam_penalty"].cpu(),
         "thin_diameter_penalty": terms["thin_diameter_penalty"].cpu(),
         "thick_diameter_penalty": terms["thick_diameter_penalty"].cpu(),
+        "node_spacing_penalty": terms["node_spacing_penalty"].cpu(),
+        "boundary_penalty": terms["boundary_penalty"].cpu(),
         "log_dir": str(log_dir),
     }
     output = Path(output_path)
@@ -794,6 +820,12 @@ def _train_parser() -> argparse.ArgumentParser:
         "--thick-diameter-weight", type=float, default=defaults.thick_diameter_weight
     )
     parser.add_argument(
+        "--node-spacing-weight", type=float, default=defaults.node_spacing_weight
+    )
+    parser.add_argument(
+        "--boundary-weight", type=float, default=defaults.boundary_weight
+    )
+    parser.add_argument(
         "--min-beam-length", type=float, default=defaults.min_beam_length
     )
     parser.add_argument(
@@ -804,6 +836,14 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-beam-diameter", type=float, default=defaults.max_beam_diameter
+    )
+    parser.add_argument(
+        "--min-free-node-spacing",
+        type=float,
+        default=defaults.min_free_node_spacing,
+    )
+    parser.add_argument(
+        "--boundary-margin", type=float, default=defaults.boundary_margin
     )
     parser.add_argument("--log-every-steps", type=int, default=defaults.log_every_steps)
     parser.add_argument(

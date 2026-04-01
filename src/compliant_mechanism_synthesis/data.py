@@ -27,6 +27,22 @@ def _sample_point(
     raise RuntimeError("failed to sample point with requested spacing")
 
 
+def _sample_point_with_relaxed_spacing(
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    existing: list[tuple[float, float]],
+    initial_spacing: float,
+    minimum_spacing: float,
+) -> tuple[float, float]:
+    spacing = initial_spacing
+    while spacing >= minimum_spacing:
+        try:
+            return _sample_point(x_range, y_range, existing, spacing)
+        except RuntimeError:
+            spacing *= 0.9
+    return _sample_point(x_range, y_range, existing, minimum_spacing)
+
+
 def _adaptive_interior_spacing(
     num_nodes: int,
     requested_spacing: float,
@@ -46,18 +62,59 @@ def generate_points(
     coords: list[tuple[float, float]] = []
     roles = torch.full((num_nodes,), ROLE_FREE, dtype=torch.long)
     effective_spacing = _adaptive_interior_spacing(num_nodes, min_spacing)
+    minimum_spacing = max(0.25 * effective_spacing, 0.01)
 
-    coords.append(_sample_point((0.0, 0.2), (0.0, 0.1), coords, effective_spacing))
+    coords.append(
+        _sample_point_with_relaxed_spacing(
+            (0.0, 0.2),
+            (0.0, 0.1),
+            coords,
+            effective_spacing,
+            minimum_spacing,
+        )
+    )
     roles[0] = ROLE_FIXED
-    coords.append(_sample_point((0.8, 1.0), (0.0, 0.1), coords, effective_spacing))
+    coords.append(
+        _sample_point_with_relaxed_spacing(
+            (0.8, 1.0),
+            (0.0, 0.1),
+            coords,
+            effective_spacing,
+            minimum_spacing,
+        )
+    )
     roles[1] = ROLE_FIXED
-    coords.append(_sample_point((0.0, 0.2), (0.9, 1.0), coords, effective_spacing))
+    coords.append(
+        _sample_point_with_relaxed_spacing(
+            (0.0, 0.2),
+            (0.9, 1.0),
+            coords,
+            effective_spacing,
+            minimum_spacing,
+        )
+    )
     roles[2] = ROLE_MOBILE
-    coords.append(_sample_point((0.8, 1.0), (0.9, 1.0), coords, effective_spacing))
+    coords.append(
+        _sample_point_with_relaxed_spacing(
+            (0.8, 1.0),
+            (0.9, 1.0),
+            coords,
+            effective_spacing,
+            minimum_spacing,
+        )
+    )
     roles[3] = ROLE_MOBILE
 
     while len(coords) < num_nodes:
-        coords.append(_sample_point((0.1, 0.9), (0.1, 0.9), coords, effective_spacing))
+        coords.append(
+            _sample_point_with_relaxed_spacing(
+                (0.1, 0.9),
+                (0.1, 0.9),
+                coords,
+                effective_spacing,
+                minimum_spacing,
+            )
+        )
 
     return torch.tensor(coords, dtype=torch.float32), roles
 

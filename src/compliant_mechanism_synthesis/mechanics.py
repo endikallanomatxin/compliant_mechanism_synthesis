@@ -20,16 +20,19 @@ from compliant_mechanism_synthesis.common import (
 @dataclass(frozen=True)
 class FrameFEMConfig:
     young_modulus: float = 1.0
-    r_max: float = 0.06
+    workspace_size: float = 0.2
+    r_max: float = 1e-3
     stiffness_regularization: float = 1e-4
 
 
 @dataclass(frozen=True)
 class GeometryRegularizationConfig:
-    min_length: float = 0.08
-    max_length: float = 0.85
-    min_diameter: float = 0.01
-    max_diameter: float = 0.10
+    min_length: float = 1e-3
+    max_length: float = 2e-2
+    min_diameter: float = 2e-4
+    max_diameter: float = 2e-3
+    min_free_node_spacing: float = 5e-3
+    boundary_margin: float = 5e-3
 
 
 def threshold_connectivity(
@@ -106,6 +109,13 @@ def _frame_transform(delta: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
     return transform
 
 
+def _physical_positions(
+    positions: torch.Tensor,
+    config: FrameFEMConfig,
+) -> torch.Tensor:
+    return positions * config.workspace_size
+
+
 def _rigid_transforms(positions: torch.Tensor, roles: torch.Tensor) -> torch.Tensor:
     batch_size, num_nodes, _ = positions.shape
     free_mask = roles == ROLE_FREE
@@ -154,6 +164,7 @@ def assemble_global_stiffness(
 ) -> torch.Tensor:
     config = config or FrameFEMConfig()
     adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    physical_positions = _physical_positions(positions, config)
     batch_size, num_nodes, _ = positions.shape
     edge_i, edge_j = _cached_edge_index_pairs(num_nodes)
     edge_i = edge_i.to(positions.device)
@@ -166,7 +177,7 @@ def assemble_global_stiffness(
     )
 
     activations = adjacency[:, edge_i, edge_j]
-    delta = positions[:, edge_j] - positions[:, edge_i]
+    delta = physical_positions[:, edge_j] - physical_positions[:, edge_i]
     length = torch.linalg.vector_norm(delta, dim=-1).clamp_min(1e-4)
     radius = config.r_max * activations
     area = math.pi * radius.square()
@@ -211,7 +222,7 @@ def _reduced_stiffness(
     _, num_nodes, _ = positions.shape
     full = assemble_global_stiffness(positions, adjacency, config=config)
     free_count = num_nodes - 4
-    transforms = _rigid_transforms(positions, roles)
+    transforms = _rigid_transforms(_physical_positions(positions, config), roles)
     reduced = transforms.transpose(1, 2) @ full @ transforms
     return reduced, transforms
 
@@ -313,11 +324,12 @@ def beam_material(
 ) -> torch.Tensor:
     config = config or FrameFEMConfig()
     adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    physical_positions = _physical_positions(positions, config)
     edge_i, edge_j = _cached_edge_index_pairs(positions.shape[1])
     edge_i = edge_i.to(positions.device)
     edge_j = edge_j.to(positions.device)
     edge_lengths = torch.linalg.vector_norm(
-        positions[:, edge_j] - positions[:, edge_i], dim=-1
+        physical_positions[:, edge_j] - physical_positions[:, edge_i], dim=-1
     ).clamp_min(1e-4)
     edge_radius = config.r_max * adjacency[:, edge_i, edge_j]
     area = math.pi * edge_radius.square()
@@ -326,19 +338,21 @@ def beam_material(
 
 def geometric_regularization_terms(
     positions: torch.Tensor,
+    roles: torch.Tensor,
     adjacency: torch.Tensor,
     geometry_config: GeometryRegularizationConfig,
     frame_config: FrameFEMConfig | None = None,
 ) -> dict[str, torch.Tensor]:
     frame_config = frame_config or FrameFEMConfig()
     adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    physical_positions = _physical_positions(positions, frame_config)
     edge_i, edge_j = _cached_edge_index_pairs(positions.shape[1])
     edge_i = edge_i.to(positions.device)
     edge_j = edge_j.to(positions.device)
 
     activations = adjacency[:, edge_i, edge_j]
     lengths = torch.linalg.vector_norm(
-        positions[:, edge_j] - positions[:, edge_i], dim=-1
+        physical_positions[:, edge_j] - physical_positions[:, edge_i], dim=-1
     ).clamp_min(1e-4)
     diameters = 2.0 * frame_config.r_max * activations
     normalizer = activations.sum(dim=1).clamp_min(1e-6)
@@ -355,11 +369,50 @@ def geometric_regularization_terms(
     thick = (
         activations * (diameters - geometry_config.max_diameter).clamp_min(0.0)
     ).sum(dim=1) / normalizer
+
+    free_mask = roles == ROLE_FREE
+    free_positions = physical_positions
+    pairwise = torch.linalg.vector_norm(
+        free_positions[:, :, None, :] - free_positions[:, None, :, :], dim=-1
+    )
+    pair_mask = free_mask[:, :, None] & free_mask[:, None, :]
+    upper_mask = torch.triu(
+        torch.ones(pairwise.shape[-2:], device=pairwise.device, dtype=torch.bool),
+        diagonal=1,
+    ).unsqueeze(0)
+    active_pairs = pair_mask & upper_mask
+    spacing_violation = (geometry_config.min_free_node_spacing - pairwise).clamp_min(
+        0.0
+    )
+    spacing_penalty = (spacing_violation * active_pairs.to(dtype=pairwise.dtype)).sum(
+        dim=(1, 2)
+    ) / active_pairs.to(dtype=pairwise.dtype).sum(dim=(1, 2)).clamp_min(1.0)
+
+    boundary_violation = torch.stack(
+        [
+            (geometry_config.boundary_margin - free_positions[..., 0]).clamp_min(0.0),
+            (
+                free_positions[..., 0]
+                - (frame_config.workspace_size - geometry_config.boundary_margin)
+            ).clamp_min(0.0),
+            (geometry_config.boundary_margin - free_positions[..., 1]).clamp_min(0.0),
+            (
+                free_positions[..., 1]
+                - (frame_config.workspace_size - geometry_config.boundary_margin)
+            ).clamp_min(0.0),
+        ],
+        dim=-1,
+    )
+    boundary_penalty = (
+        boundary_violation.sum(dim=-1) * free_mask.to(dtype=positions.dtype)
+    ).sum(dim=1) / free_mask.to(dtype=positions.dtype).sum(dim=1).clamp_min(1.0)
     return {
         "short_beam_penalty": short,
         "long_beam_penalty": long,
         "thin_diameter_penalty": thin,
         "thick_diameter_penalty": thick,
+        "node_spacing_penalty": spacing_penalty,
+        "boundary_penalty": boundary_penalty,
     }
 
 
@@ -384,10 +437,13 @@ def mechanical_terms(
             "long_beam_penalty": zeros,
             "thin_diameter_penalty": zeros,
             "thick_diameter_penalty": zeros,
+            "node_spacing_penalty": zeros,
+            "boundary_penalty": zeros,
         }
     else:
         geometry_terms = geometric_regularization_terms(
             positions,
+            roles,
             adjacency,
             geometry_config,
             frame_config=config,

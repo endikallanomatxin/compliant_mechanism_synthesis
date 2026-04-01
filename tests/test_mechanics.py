@@ -5,6 +5,7 @@ import torch
 from compliant_mechanism_synthesis.common import symmetrize_adjacency
 from compliant_mechanism_synthesis.data import generate_graph_sample
 from compliant_mechanism_synthesis.mechanics import (
+    FrameFEMConfig,
     GeometryRegularizationConfig,
     assemble_global_stiffness,
     effective_response,
@@ -54,30 +55,67 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["long_beam_penalty"].shape == (1,)
     assert terms["thin_diameter_penalty"].shape == (1,)
     assert terms["thick_diameter_penalty"].shape == (1,)
+    assert terms["node_spacing_penalty"].shape == (1,)
+    assert terms["boundary_penalty"].shape == (1,)
 
 
 def test_geometric_regularization_penalizes_extreme_lengths_and_diameters() -> None:
     positions = torch.tensor(
-        [[[0.0, 0.0], [0.05, 0.0], [1.0, 0.0]]], dtype=torch.float32
+        [[[0.0, 0.0], [0.0025, 0.0], [0.15, 0.0]]], dtype=torch.float32
     )
+    roles = torch.tensor([[0, 1, 2]], dtype=torch.long)
     adjacency = torch.tensor(
         [[[0.0, 0.1, 0.95], [0.1, 0.0, 0.0], [0.95, 0.0, 0.0]]],
         dtype=torch.float32,
     )
     penalties = geometric_regularization_terms(
         positions,
+        roles,
         adjacency,
         GeometryRegularizationConfig(
-            min_length=0.10,
-            max_length=0.80,
-            min_diameter=0.02,
-            max_diameter=0.08,
+            min_length=1e-3,
+            max_length=2e-2,
+            min_diameter=2.5e-4,
+            max_diameter=1.5e-3,
         ),
+        frame_config=FrameFEMConfig(workspace_size=0.2, r_max=1e-3),
     )
     assert penalties["short_beam_penalty"][0] > 0.0
     assert penalties["long_beam_penalty"][0] > 0.0
     assert penalties["thin_diameter_penalty"][0] > 0.0
     assert penalties["thick_diameter_penalty"][0] > 0.0
+
+
+def test_geometric_regularization_penalizes_node_clustering_and_boundary_crowding() -> (
+    None
+):
+    positions = torch.tensor(
+        [
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [0.01, 0.02],
+                [0.015, 0.021],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    roles = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.long)
+    adjacency = torch.zeros((1, 6, 6), dtype=torch.float32)
+    penalties = geometric_regularization_terms(
+        positions,
+        roles,
+        adjacency,
+        GeometryRegularizationConfig(
+            min_free_node_spacing=5e-3,
+            boundary_margin=5e-3,
+        ),
+        frame_config=FrameFEMConfig(workspace_size=0.2, r_max=1e-3),
+    )
+    assert penalties["node_spacing_penalty"][0] > 0.0
+    assert penalties["boundary_penalty"][0] > 0.0
 
 
 def test_thresholded_connectivity_is_symmetric_and_zero_diagonal() -> None:
