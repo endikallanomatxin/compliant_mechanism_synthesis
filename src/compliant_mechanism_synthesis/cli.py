@@ -57,6 +57,9 @@ class TrainConfig:
     max_beam_diameter: float = 2e-3
     min_free_node_spacing: float = 5e-3
     boundary_margin: float = 5e-3
+    target_buffer_size: int = 4096
+    target_covariance_regularization: float = 1e-3
+    target_sampling_temperature: float = 1.0
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
     sample_threshold: float = 0.5
@@ -68,35 +71,82 @@ class TrainConfig:
 
 @dataclass
 class ResponseStatistics:
+    buffer: torch.Tensor
+    capacity: int
     count: int
-    sum: torch.Tensor
-    sumsq: torch.Tensor
+    next_index: int
+    covariance_regularization: float
+    sampling_temperature: float
 
     @classmethod
-    def empty(cls, device: torch.device) -> "ResponseStatistics":
-        zeros = torch.zeros(6, device=device, dtype=torch.float32)
-        return cls(count=0, sum=zeros.clone(), sumsq=zeros.clone())
+    def empty(
+        cls,
+        device: torch.device,
+        capacity: int,
+        covariance_regularization: float,
+        sampling_temperature: float,
+    ) -> "ResponseStatistics":
+        buffer = torch.zeros((capacity, 6), device=device, dtype=torch.float32)
+        return cls(
+            buffer=buffer,
+            capacity=capacity,
+            count=0,
+            next_index=0,
+            covariance_regularization=covariance_regularization,
+            sampling_temperature=sampling_temperature,
+        )
+
+    def _current_buffer(self) -> torch.Tensor:
+        if self.count == 0:
+            raise RuntimeError("response statistics buffer is empty")
+        valid = min(self.count, self.capacity)
+        return self.buffer[:valid]
 
     def update(self, response_matrix: torch.Tensor) -> None:
         features = symmetric_matrix_unique_values(response_matrix.detach())
-        self.count += int(features.shape[0])
-        self.sum = self.sum + features.sum(dim=0)
-        self.sumsq = self.sumsq + features.square().sum(dim=0)
+        feature_count = features.shape[0]
+        if feature_count >= self.capacity:
+            self.buffer.copy_(features[-self.capacity :])
+            self.count += feature_count
+            self.next_index = 0
+            return
+
+        end = self.next_index + feature_count
+        if end <= self.capacity:
+            self.buffer[self.next_index : end] = features
+        else:
+            split = self.capacity - self.next_index
+            self.buffer[self.next_index :] = features[:split]
+            self.buffer[: end - self.capacity] = features[split:]
+        self.next_index = end % self.capacity
+        self.count += feature_count
 
     def normalization(self) -> dict[str, list[float]]:
-        count = max(self.count, 1)
-        mean = self.sum / count
-        variance = (self.sumsq / count) - mean.square()
+        buffer = self._current_buffer()
+        mean = buffer.mean(dim=0)
+        variance = buffer.var(dim=0, unbiased=False)
         std = variance.clamp_min(1e-6).sqrt()
         return {"mean": mean.tolist(), "std": std.tolist()}
 
+    def covariance(self) -> torch.Tensor:
+        buffer = self._current_buffer()
+        centered = buffer - buffer.mean(dim=0, keepdim=True)
+        covariance = centered.transpose(0, 1) @ centered / max(buffer.shape[0], 1)
+        scale = covariance.diagonal().mean().clamp_min(1e-6)
+        covariance = covariance + (self.covariance_regularization * scale) * torch.eye(
+            covariance.shape[0], device=covariance.device, dtype=covariance.dtype
+        )
+        return covariance
+
     def sample_targets(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        normalization = self.normalization()
-        mean = torch.tensor(normalization["mean"], device=device, dtype=torch.float32)
-        std = torch.tensor(normalization["std"], device=device, dtype=torch.float32)
-        sampled = mean.unsqueeze(0) + torch.randn(
-            (batch_size, mean.shape[0]), device=device, dtype=torch.float32
-        ) * std.unsqueeze(0)
+        buffer = self._current_buffer()
+        mean = buffer.mean(dim=0)
+        covariance = self.covariance()
+        cholesky = torch.linalg.cholesky(covariance)
+        sampled = mean.unsqueeze(0) + self.sampling_temperature * (
+            torch.randn((batch_size, mean.shape[0]), device=device, dtype=torch.float32)
+            @ cholesky.transpose(0, 1)
+        )
         return unique_values_to_symmetric_matrix(sampled, size=3)
 
 
@@ -399,7 +449,12 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         f"train:start device={device} train_steps={train_steps} batch_size={config.batch_size} num_nodes={config.num_nodes}"
     )
 
-    response_stats = ResponseStatistics.empty(device)
+    response_stats = ResponseStatistics.empty(
+        device=device,
+        capacity=config.target_buffer_size,
+        covariance_regularization=config.target_covariance_regularization,
+        sampling_temperature=config.target_sampling_temperature,
+    )
     bootstrap_positions, bootstrap_roles, bootstrap_adjacency = _pure_noise_batch(
         max(config.batch_size * 4, 64), config.num_nodes, config.seed + 17, device
     )
