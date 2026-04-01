@@ -23,7 +23,6 @@ class FrameFEMConfig:
     young_modulus: float = 1.0
     r_max: float = 0.06
     stiffness_regularization: float = 1e-4
-    diagonal_connectivity_scale: float = 0.5
 
 
 def threshold_connectivity(
@@ -273,9 +272,7 @@ def _graph_reachability(adjacency: torch.Tensor, seeds: torch.Tensor) -> torch.T
 def connectivity_penalty(
     roles: torch.Tensor,
     adjacency: torch.Tensor,
-    diagonal_scale: float = 0.5,
 ) -> torch.Tensor:
-    del diagonal_scale
     fixed, mobile, _ = role_masks(roles)
     fixed_seed = fixed.to(dtype=adjacency.dtype)
     mobile_seed = mobile.to(dtype=adjacency.dtype)
@@ -332,9 +329,7 @@ def mechanical_terms(
     return {
         "properties": raw_properties,
         "compliance": compliance,
-        "connectivity_penalty": connectivity_penalty(
-            roles, adjacency, diagonal_scale=config.diagonal_connectivity_scale
-        ),
+        "connectivity_penalty": connectivity_penalty(roles, adjacency),
         "material": beam_material(positions, adjacency, config),
         "binarization": binarization_penalty(adjacency),
     }

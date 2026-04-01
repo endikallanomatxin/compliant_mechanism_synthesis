@@ -21,7 +21,6 @@ from compliant_mechanism_synthesis.common import (
 )
 from compliant_mechanism_synthesis.data import generate_dataset, generate_graph_sample
 from compliant_mechanism_synthesis.mechanics import (
-    FrameFEMConfig,
     binarization_penalty,
     mechanical_terms,
     noisy_state,
@@ -85,8 +84,6 @@ def _timestamped_run_dir(name: str) -> Path:
 def _fixed_noise(
     batch_size: int, num_nodes: int, seed: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
     positions = []
     roles = []
     adjacency = []
@@ -319,7 +316,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         dataset.positions,
         dataset.roles,
         dataset.adjacency,
-        raw_targets,
         normalized_targets,
     )
     loader = DataLoader(tensor_dataset, batch_size=config.batch_size, shuffle=True)
@@ -353,13 +349,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             clean_positions,
             roles,
             clean_adjacency,
-            raw_target_props,
             target_features,
         ) in enumerate(loader, start=1):
             clean_positions = clean_positions.to(device)
             roles = roles.to(device)
             clean_adjacency = clean_adjacency.to(device)
-            raw_target_props = raw_target_props.to(device)
             target_features = target_features.to(device)
             base_time = torch.rand((clean_positions.shape[0],), device=device)
             noisy_positions, noisy_adjacency = noisy_state(
