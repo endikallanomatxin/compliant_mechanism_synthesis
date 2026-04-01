@@ -49,7 +49,8 @@ class TrainConfig:
     monotonic_improvement_weight: float = 0.25
     material_weight: float = 1e4
     sparsity_weight: float = 0.5
-    connectivity_weight: float = 0.10
+    connectivity_weight: float = 0.25
+    fixed_mobile_connectivity_weight: float = 2.0
     short_beam_weight: float = 0.20
     long_beam_weight: float = 5.0
     thin_diameter_weight: float = 0.20
@@ -187,28 +188,39 @@ def _progress(message: str) -> None:
     print(message, flush=True)
 
 
+def _resolve_sample_seed(seed_override: int | None) -> int:
+    if seed_override is not None:
+        return seed_override
+    return random.SystemRandom().randrange(0, 2**31)
+
+
 def _timestamped_run_dir(name: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Path("runs") / f"{timestamp}-{name}"
 
 
 def _pure_noise_batch(
-    batch_size: int, num_nodes: int, seed: int, device: torch.device
+    batch_size: int,
+    num_nodes: int,
+    device: torch.device,
+    seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     positions = []
     roles = []
     adjacency = []
-    state = random.getstate()
-    torch_state = torch.random.get_rng_state()
-    random.seed(seed)
-    torch.manual_seed(seed)
+    if seed is not None:
+        state = random.getstate()
+        torch_state = torch.random.get_rng_state()
+        random.seed(seed)
+        torch.manual_seed(seed)
     for _ in range(batch_size):
         x, r, a = generate_noise_sample(num_nodes)
         positions.append(x)
         roles.append(r)
         adjacency.append(a)
-    random.setstate(state)
-    torch.random.set_rng_state(torch_state)
+    if seed is not None:
+        random.setstate(state)
+        torch.random.set_rng_state(torch_state)
     return (
         torch.stack(positions, dim=0).to(device),
         torch.stack(roles, dim=0).to(device),
@@ -442,7 +454,10 @@ def _log_canonical_evaluation(
 ) -> None:
     geometry_config = _geometry_regularization_config(config)
     positions, roles, adjacency = _pure_noise_batch(
-        len(canonical_specs), config.num_nodes, config.seed + 101, device
+        len(canonical_specs),
+        config.num_nodes,
+        device,
+        seed=config.seed + 101,
     )
     raw_targets = torch.stack([values for _, values in canonical_specs], dim=0).to(
         device
@@ -482,11 +497,16 @@ def _log_canonical_evaluation(
             threshold=0.05,
             title=name,
         )
-        writer.add_figure(f"canonical/{name}/design", figure, global_step=step)
-        _log_response_matrix(writer, f"canonical/{name}/target", target_values, step)
+        writer.add_figure(f"canonical/00_designs/{name}", figure, global_step=step)
         _log_response_matrix(
             writer,
-            f"canonical/{name}/achieved",
+            f"canonical/10_target_response/{name}",
+            target_values,
+            step,
+        )
+        _log_response_matrix(
+            writer,
+            f"canonical/20_achieved_response/{name}",
             final_terms["response_matrix"][idx],
             step,
         )
@@ -503,7 +523,7 @@ def _log_canonical_evaluation(
                 target_normalization,
             )
             writer.add_scalar(
-                f"canonical/{name}/property_error_step_{rollout_idx}",
+                f"canonical/30_property_error/{name}/step_{rollout_idx}",
                 step_error.item(),
                 step,
             )
@@ -527,7 +547,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         sampling_temperature=config.target_sampling_temperature,
     )
     bootstrap_positions, bootstrap_roles, bootstrap_adjacency = _pure_noise_batch(
-        max(config.batch_size * 4, 64), config.num_nodes, config.seed + 17, device
+        max(config.batch_size * 4, 64),
+        config.num_nodes,
+        device,
+        seed=config.seed + 17,
     )
     bootstrap_terms = mechanical_terms(
         bootstrap_positions,
@@ -578,7 +601,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     for step in range(1, train_steps + 1):
         current_seed = config.seed + step + 1000
         positions, roles, adjacency = _pure_noise_batch(
-            config.batch_size, config.num_nodes, current_seed, device
+            config.batch_size,
+            config.num_nodes,
+            device,
+            seed=current_seed,
         )
         raw_targets = sampling_stats.sample_targets(config.batch_size, device)
         target_features = _normalize_target_response(raw_targets, target_normalization)
@@ -678,9 +704,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             + config.monotonic_improvement_weight * monotonic_loss
             + config.material_weight * material_loss
             + config.sparsity_weight * sparsity_loss
-            + config.connectivity_weight
-            * 0.5
-            * (connectivity_loss + fixed_mobile_connectivity_loss)
+            + config.connectivity_weight * connectivity_loss
+            + config.fixed_mobile_connectivity_weight * fixed_mobile_connectivity_loss
             + config.short_beam_weight * short_beam_loss
             + config.long_beam_weight * long_beam_loss
             + config.thin_diameter_weight * thin_diameter_loss
@@ -830,12 +855,9 @@ def refine_sample_state(
             config.property_weight * property_loss
             + config.material_weight * terms["material"].mean()
             + config.sparsity_weight * terms["sparsity"].mean()
-            + config.connectivity_weight
-            * 0.5
-            * (
-                terms["connectivity_penalty"].mean()
-                + terms["fixed_mobile_connectivity_penalty"].mean()
-            )
+            + config.connectivity_weight * terms["connectivity_penalty"].mean()
+            + config.fixed_mobile_connectivity_weight
+            * terms["fixed_mobile_connectivity_penalty"].mean()
             + config.short_beam_weight * terms["short_beam_penalty"].mean()
             + config.long_beam_weight * terms["long_beam_penalty"].mean()
             + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
@@ -865,6 +887,7 @@ def sample(
     steps: int,
     sample_threshold: float,
     device_override: str | None = None,
+    seed_override: int | None = None,
 ) -> dict[str, object]:
     device = _device(device_override or "auto")
     payload = torch.load(checkpoint_path, map_location=device)
@@ -873,7 +896,8 @@ def sample(
         config.device = device_override
     geometry_config = _geometry_regularization_config(config)
     target_normalization = payload["target_normalization"]
-    _seed_everything(config.seed)
+    sample_seed = _resolve_sample_seed(seed_override)
+    _seed_everything(sample_seed)
 
     model = GraphRefinementModel(
         d_model=config.d_model,
@@ -885,7 +909,10 @@ def sample(
     model.eval()
 
     positions, roles, adjacency = _pure_noise_batch(
-        1, config.num_nodes, config.seed + 500, device
+        1,
+        config.num_nodes,
+        device,
+        seed=sample_seed + 500,
     )
     raw_targets = torch.tensor(
         target_response, dtype=torch.float32, device=device
@@ -936,34 +963,37 @@ def sample(
         threshold=sample_threshold,
         title=name,
     )
-    writer.add_figure("sample/final_graph", figure, global_step=0)
-    _log_response_matrix(writer, "sample/target_response", raw_targets[0], 0)
+    writer.add_figure("sample/00_design/final_graph", figure, global_step=0)
+    _log_response_matrix(writer, "sample/10_target_response", raw_targets[0], 0)
     _log_response_matrix(
-        writer, "sample/achieved_response", terms["response_matrix"][0], 0
+        writer, "sample/20_achieved_response", terms["response_matrix"][0], 0
     )
     _log_response_matrix(
-        writer, "sample/achieved_stiffness", terms["stiffness_matrix"][0], 0
+        writer, "sample/30_achieved_stiffness", terms["stiffness_matrix"][0], 0
     )
-    writer.add_scalar("sample/sparsity_loss", terms["sparsity"][0].item(), 0)
+    writer.add_scalar("sample/40_sparsity_loss", terms["sparsity"][0].item(), 0)
     writer.add_scalar(
-        "sample/short_beam_penalty", terms["short_beam_penalty"][0].item(), 0
-    )
-    writer.add_scalar(
-        "sample/long_beam_penalty", terms["long_beam_penalty"][0].item(), 0
+        "sample/40_short_beam_penalty", terms["short_beam_penalty"][0].item(), 0
     )
     writer.add_scalar(
-        "sample/thin_diameter_penalty", terms["thin_diameter_penalty"][0].item(), 0
+        "sample/40_long_beam_penalty", terms["long_beam_penalty"][0].item(), 0
     )
     writer.add_scalar(
-        "sample/thick_diameter_penalty", terms["thick_diameter_penalty"][0].item(), 0
+        "sample/40_thin_diameter_penalty", terms["thin_diameter_penalty"][0].item(), 0
     )
     writer.add_scalar(
-        "sample/node_spacing_penalty", terms["node_spacing_penalty"][0].item(), 0
+        "sample/40_thick_diameter_penalty", terms["thick_diameter_penalty"][0].item(), 0
     )
-    writer.add_scalar("sample/boundary_penalty", terms["boundary_penalty"][0].item(), 0)
+    writer.add_scalar(
+        "sample/40_node_spacing_penalty", terms["node_spacing_penalty"][0].item(), 0
+    )
+    writer.add_scalar(
+        "sample/40_boundary_penalty", terms["boundary_penalty"][0].item(), 0
+    )
     writer.close()
 
     result = {
+        "seed": sample_seed,
         "positions": refined_positions.cpu(),
         "roles": roles.cpu(),
         "adjacency": refined_adjacency.cpu(),
@@ -987,7 +1017,7 @@ def sample(
     torch.save(result, output)
     _progress(
         "sample:done "
-        f"response={_format_matrix(terms['response_matrix'][0])} log_dir={log_dir}"
+        f"seed={sample_seed} response={_format_matrix(terms['response_matrix'][0])} log_dir={log_dir}"
     )
     return result
 
@@ -1040,6 +1070,11 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--connectivity-weight", type=float, default=defaults.connectivity_weight
+    )
+    parser.add_argument(
+        "--fixed-mobile-connectivity-weight",
+        type=float,
+        default=defaults.fixed_mobile_connectivity_weight,
     )
     parser.add_argument(
         "--short-beam-weight", type=float, default=defaults.short_beam_weight
@@ -1116,6 +1151,7 @@ def _sample_parser() -> argparse.ArgumentParser:
         "--sample-threshold", type=float, default=defaults.sample_threshold
     )
     parser.add_argument("--device", default=defaults.device)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--name", default="sample")
     parser.add_argument("--output-path", default="artifacts/sample.pt")
     return parser
@@ -1138,7 +1174,9 @@ def sample_main() -> None:
         steps=args.steps,
         sample_threshold=args.sample_threshold,
         device_override=args.device,
+        seed_override=args.seed,
     )
+    print(f"seed={result['seed']}")
     print(f"log_dir={result['log_dir']}")
     print(f"achieved_response={_format_matrix(result['response_matrix'][0])}")
     print(f"achieved_stiffness={_format_matrix(result['stiffness_matrix'][0])}")

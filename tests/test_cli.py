@@ -5,6 +5,8 @@ import torch
 from compliant_mechanism_synthesis.cli import (
     _inject_rollout_noise,
     _monotonic_improvement_loss,
+    _pure_noise_batch,
+    _resolve_sample_seed,
     ResponseStatistics,
 )
 from compliant_mechanism_synthesis.common import (
@@ -68,3 +70,16 @@ def test_response_statistics_clone_freezes_sampling_buffer() -> None:
         frozen._current_buffer(), symmetric_matrix_unique_values(first)
     )
     assert not torch.allclose(stats._current_buffer(), frozen._current_buffer())
+
+
+def test_pure_noise_batch_is_reproducible_with_explicit_seed() -> None:
+    batch_a = _pure_noise_batch(2, 8, torch.device("cpu"), seed=123)
+    batch_b = _pure_noise_batch(2, 8, torch.device("cpu"), seed=123)
+
+    for a, b in zip(batch_a, batch_b):
+        assert torch.allclose(a, b)
+
+
+def test_resolve_sample_seed_uses_override_when_provided() -> None:
+    assert _resolve_sample_seed(17) == 17
+    assert isinstance(_resolve_sample_seed(None), int)
