@@ -31,7 +31,7 @@ from compliant_mechanism_synthesis.viz import plot_graph_design
 
 @dataclass
 class TrainConfig:
-    num_nodes: int = 16
+    num_nodes: int = 32
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 6
@@ -42,7 +42,10 @@ class TrainConfig:
     rollout_steps: int = 6
     position_step_size: float = 0.2
     connectivity_step_size: float = 1.0
+    rollout_position_noise: float = 0.01
+    rollout_connectivity_noise: float = 0.05
     property_weight: float = 2.0
+    monotonic_improvement_weight: float = 0.25
     material_weight: float = 1e4
     connectivity_weight: float = 0.10
     short_beam_weight: float = 0.20
@@ -288,6 +291,42 @@ def _response_matrix_loss(
     return F.mse_loss((pred_unique - mean) / std, (target_unique - mean) / std)
 
 
+def _inject_rollout_noise(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    time_fraction: torch.Tensor,
+    position_noise_scale: float,
+    connectivity_noise_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if position_noise_scale <= 0.0 and connectivity_noise_scale <= 0.0:
+        return positions, adjacency
+
+    free_mask = (roles == ROLE_FREE).unsqueeze(-1).to(dtype=positions.dtype)
+    if position_noise_scale > 0.0:
+        position_noise = torch.randn_like(positions) * (
+            position_noise_scale * time_fraction[:, None, None]
+        )
+        positions = (positions + free_mask * position_noise).clamp(0.0, 1.0)
+
+    if connectivity_noise_scale > 0.0:
+        adjacency_noise = torch.randn_like(adjacency) * (
+            connectivity_noise_scale * time_fraction[:, None, None]
+        )
+        adjacency = logits_to_adjacency(adjacency_logits(adjacency) + adjacency_noise)
+    return positions, adjacency
+
+
+def _monotonic_improvement_loss(step_errors: list[torch.Tensor]) -> torch.Tensor:
+    if len(step_errors) < 2:
+        return torch.zeros((), device=step_errors[0].device)
+    penalties = [
+        (current - previous).clamp_min(0.0)
+        for previous, current in zip(step_errors[:-1], step_errors[1:])
+    ]
+    return torch.stack(penalties, dim=0).mean()
+
+
 def _geometry_regularization_config(
     config: TrainConfig,
 ) -> GeometryRegularizationConfig:
@@ -331,6 +370,8 @@ def rollout_refinement(
     position_step_size: float,
     connectivity_step_size: float,
     base_time: torch.Tensor,
+    position_noise_scale: float = 0.0,
+    connectivity_noise_scale: float = 0.0,
 ) -> list[dict[str, torch.Tensor]]:
     current_positions = positions
     current_adjacency = adjacency
@@ -349,6 +390,14 @@ def rollout_refinement(
         current_adjacency = logits_to_adjacency(
             adjacency_logits(current_adjacency)
             + connectivity_step_size * outputs["delta_scores"]
+        )
+        current_positions, current_adjacency = _inject_rollout_noise(
+            current_positions,
+            roles,
+            current_adjacency,
+            base_time * time_fraction,
+            position_noise_scale,
+            connectivity_noise_scale,
         )
         states.append(
             {
@@ -391,6 +440,8 @@ def _log_canonical_evaluation(
         position_step_size=config.position_step_size,
         connectivity_step_size=config.connectivity_step_size,
         base_time=base_time,
+        position_noise_scale=0.0,
+        connectivity_noise_scale=0.0,
     )
     final_state = rollout[-1]
     final_terms = mechanical_terms(
@@ -489,6 +540,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     running_totals = {
         "total": 0.0,
         "property": 0.0,
+        "monotonic": 0.0,
         "material": 0.0,
         "connectivity": 0.0,
         "short_beam": 0.0,
@@ -520,9 +572,12 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             position_step_size=config.position_step_size,
             connectivity_step_size=config.connectivity_step_size,
             base_time=base_time,
+            position_noise_scale=config.rollout_position_noise,
+            connectivity_noise_scale=config.rollout_connectivity_noise,
         )
         weights = _step_weights(config.rollout_steps, device)
         property_loss = torch.zeros((), device=device)
+        step_errors: list[torch.Tensor] = []
         for step_idx, state in enumerate(rollout):
             step_terms = mechanical_terms(
                 state["positions"],
@@ -530,11 +585,14 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 state["adjacency"],
                 geometry_config=geometry_config,
             )
-            property_loss = property_loss + weights[step_idx] * _response_matrix_loss(
+            step_error = _response_matrix_loss(
                 step_terms["response_matrix"],
                 raw_targets,
                 target_normalization,
             )
+            step_errors.append(step_error)
+            property_loss = property_loss + weights[step_idx] * step_error
+        monotonic_loss = _monotonic_improvement_loss(step_errors)
 
         final_state = rollout[-1]
         final_terms = mechanical_terms(
@@ -554,6 +612,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
         total = (
             config.property_weight * property_loss
+            + config.monotonic_improvement_weight * monotonic_loss
             + config.material_weight * material_loss
             + config.connectivity_weight * connectivity_loss
             + config.short_beam_weight * short_beam_loss
@@ -570,6 +629,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
         running_totals["total"] += total.item()
         running_totals["property"] += property_loss.item()
+        running_totals["monotonic"] += monotonic_loss.item()
         running_totals["material"] += material_loss.item()
         running_totals["connectivity"] += connectivity_loss.item()
         running_totals["short_beam"] += short_beam_loss.item()
@@ -584,6 +644,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
         writer.add_scalar("train/total_loss", total.item(), global_step)
         writer.add_scalar("train/property_loss", property_loss.item(), global_step)
+        writer.add_scalar(
+            "train/monotonic_improvement_loss", monotonic_loss.item(), global_step
+        )
         writer.add_scalar("train/material_loss", material_loss.item(), global_step)
         writer.add_scalar(
             "train/connectivity_penalty", connectivity_loss.item(), global_step
@@ -750,6 +813,8 @@ def sample(
             position_step_size=config.position_step_size,
             connectivity_step_size=config.connectivity_step_size,
             base_time=base_time,
+            position_noise_scale=0.0,
+            connectivity_noise_scale=0.0,
         )
     final_state = rollout[-1]
     refined_positions, refined_adjacency = refine_sample_state(
@@ -854,7 +919,22 @@ def _train_parser() -> argparse.ArgumentParser:
         default=defaults.connectivity_step_size,
     )
     parser.add_argument(
+        "--rollout-position-noise",
+        type=float,
+        default=defaults.rollout_position_noise,
+    )
+    parser.add_argument(
+        "--rollout-connectivity-noise",
+        type=float,
+        default=defaults.rollout_connectivity_noise,
+    )
+    parser.add_argument(
         "--property-weight", type=float, default=defaults.property_weight
+    )
+    parser.add_argument(
+        "--monotonic-improvement-weight",
+        type=float,
+        default=defaults.monotonic_improvement_weight,
     )
     parser.add_argument(
         "--material-weight", type=float, default=defaults.material_weight

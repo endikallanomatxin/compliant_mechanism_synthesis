@@ -64,6 +64,8 @@ For each batch:
 - sample a target response matrix from the empirical distribution of previously
   simulated responses
 - refine the noisy graph over several learned rollout steps
+- inject additional Gaussian noise into positions and connectivity at each
+  rollout step during training
 - apply position updates only to free nodes
 - update connectivity through adjacency logits plus node-latent dot products
 - evaluate the differentiable frame FEM on intermediate and final states
@@ -72,6 +74,8 @@ The loss includes:
 
 - target response-matrix loss on the unique symmetric terms of the `3x3` matrix,
   including couplings without double-counting mirrored entries
+- monotonic-improvement loss so intermediate rollout steps keep reducing the
+  mechanical target error instead of regressing
 - beam material penalty
 - connectivity penalty
 - soft beam-length regularization for bars that are too short or too long
