@@ -161,9 +161,9 @@ Canonical evaluations are controlled with:
 --canonical-eval-every-steps 20
 ```
 
-The current code computes a single `low=q20` and a single `high=q80` over the
-positive property values in the reference pool, then evaluates these three
-canonical patterns:
+The current code computes a mean `mu` and standard deviation `sigma` for each of
+`k_x`, `k_y`, and `k_theta` over the reference pool, then evaluates these three
+canonical patterns using `mu-sigma` and `mu+sigma` on the relevant axis:
 
 - low `k_x`, higher `k_y` and `k_theta`
 - higher `k_x`, low `k_y`, higher `k_theta`

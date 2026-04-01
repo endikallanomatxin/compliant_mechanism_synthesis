@@ -98,18 +98,24 @@ def _progress(message: str) -> None:
 def _canonical_target_specs(
     target_pool: torch.Tensor,
 ) -> list[tuple[str, tuple[float, float, float]]]:
-    positive = target_pool[target_pool > 1e-6]
-    if len(positive) == 0:
-        low = 0.05
-        high = 0.20
-    else:
-        low = float(torch.quantile(positive, 0.20).item())
-        high = float(torch.quantile(positive, 0.80).item())
+    mean = target_pool.mean(dim=0)
+    std = target_pool.std(dim=0, unbiased=False)
+    low = (mean - std).clamp(0.0, 1.0)
+    high = (mean + std).clamp(0.0, 1.0)
 
     return [
-        ("low-kx_high-ky-ktheta", (low, high, high)),
-        ("high-kx_low-ky-high-ktheta", (high, low, high)),
-        ("high-kx-ky_low-ktheta", (high, high, low)),
+        (
+            "low-kx_high-ky-ktheta",
+            (float(low[0]), float(high[1]), float(high[2])),
+        ),
+        (
+            "high-kx_low-ky-high-ktheta",
+            (float(high[0]), float(low[1]), float(high[2])),
+        ),
+        (
+            "high-kx-ky_low-ktheta",
+            (float(high[0]), float(high[1]), float(low[2])),
+        ),
     ]
 
 
@@ -271,6 +277,15 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         replacement=True,
     )
     loader = DataLoader(dataset, batch_size=config.batch_size, sampler=sampler)
+    _progress(
+        "train:canonical_stats "
+        f"mu=({canonical_reference_targets[:, 0].mean().item():.3f},"
+        f"{canonical_reference_targets[:, 1].mean().item():.3f},"
+        f"{canonical_reference_targets[:, 2].mean().item():.3f}) "
+        f"sigma=({canonical_reference_targets[:, 0].std(unbiased=False).item():.3f},"
+        f"{canonical_reference_targets[:, 1].std(unbiased=False).item():.3f},"
+        f"{canonical_reference_targets[:, 2].std(unbiased=False).item():.3f})"
+    )
     _progress(
         "train:canonical_targets "
         + " ".join(
