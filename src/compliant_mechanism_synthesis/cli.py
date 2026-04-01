@@ -31,15 +31,15 @@ from compliant_mechanism_synthesis.viz import plot_graph_design
 
 @dataclass
 class TrainConfig:
-    num_nodes: int = 64
-    d_model: int = 512
+    num_nodes: int = 32
+    d_model: int = 256
     nhead: int = 8
     num_layers: int = 6
-    latent_dim: int = 256
-    batch_size: int = 2048
-    train_steps: int = 20000
-    learning_rate: float = 1e-5
-    rollout_steps: int = 8
+    latent_dim: int = 128
+    batch_size: int = 256
+    train_steps: int = 2000
+    learning_rate: float = 1e-4
+    rollout_steps: int = 6
     position_step_size: float = 0.2
     connectivity_step_size: float = 1.0
     property_weight: float = 2.0
@@ -49,10 +49,10 @@ class TrainConfig:
     long_beam_weight: float = 0.10
     thin_diameter_weight: float = 0.20
     thick_diameter_weight: float = 0.10
-    min_beam_length: float = 0.01
-    max_beam_length: float = 0.1
-    min_beam_diameter: float = 0.001
-    max_beam_diameter: float = 0.01
+    min_beam_length: float = 0.02
+    max_beam_length: float = 0.35
+    min_beam_diameter: float = 0.004
+    max_beam_diameter: float = 0.10
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
     sample_threshold: float = 0.5

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 
 import torch
@@ -26,6 +27,16 @@ def _sample_point(
     raise RuntimeError("failed to sample point with requested spacing")
 
 
+def _adaptive_interior_spacing(
+    num_nodes: int,
+    requested_spacing: float,
+) -> float:
+    free_nodes = max(num_nodes - 4, 1)
+    interior_area = 0.8 * 0.8
+    spacing_from_area = 0.75 * math.sqrt(interior_area / free_nodes)
+    return min(requested_spacing, spacing_from_area)
+
+
 def generate_points(
     num_nodes: int, min_spacing: float = 0.12
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -34,18 +45,19 @@ def generate_points(
 
     coords: list[tuple[float, float]] = []
     roles = torch.full((num_nodes,), ROLE_FREE, dtype=torch.long)
+    effective_spacing = _adaptive_interior_spacing(num_nodes, min_spacing)
 
-    coords.append(_sample_point((0.0, 0.2), (0.0, 0.1), coords, min_spacing))
+    coords.append(_sample_point((0.0, 0.2), (0.0, 0.1), coords, effective_spacing))
     roles[0] = ROLE_FIXED
-    coords.append(_sample_point((0.8, 1.0), (0.0, 0.1), coords, min_spacing))
+    coords.append(_sample_point((0.8, 1.0), (0.0, 0.1), coords, effective_spacing))
     roles[1] = ROLE_FIXED
-    coords.append(_sample_point((0.0, 0.2), (0.9, 1.0), coords, min_spacing))
+    coords.append(_sample_point((0.0, 0.2), (0.9, 1.0), coords, effective_spacing))
     roles[2] = ROLE_MOBILE
-    coords.append(_sample_point((0.8, 1.0), (0.9, 1.0), coords, min_spacing))
+    coords.append(_sample_point((0.8, 1.0), (0.9, 1.0), coords, effective_spacing))
     roles[3] = ROLE_MOBILE
 
     while len(coords) < num_nodes:
-        coords.append(_sample_point((0.1, 0.9), (0.1, 0.9), coords, min_spacing))
+        coords.append(_sample_point((0.1, 0.9), (0.1, 0.9), coords, effective_spacing))
 
     return torch.tensor(coords, dtype=torch.float32), roles
 
