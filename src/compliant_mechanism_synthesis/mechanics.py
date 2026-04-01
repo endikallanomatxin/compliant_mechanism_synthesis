@@ -106,35 +106,44 @@ def _frame_transform(delta: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
     return transform
 
 
-def _rigid_transform_for_sample(
-    positions: torch.Tensor, roles: torch.Tensor
-) -> torch.Tensor:
-    num_nodes = positions.shape[0]
-    free_indices = torch.where(roles == ROLE_FREE)[0].tolist()
-    mobile_indices = torch.where(roles == ROLE_MOBILE)[0]
-    free_count = len(free_indices)
+def _rigid_transforms(positions: torch.Tensor, roles: torch.Tensor) -> torch.Tensor:
+    batch_size, num_nodes, _ = positions.shape
+    free_mask = roles == ROLE_FREE
+    mobile_mask = roles == ROLE_MOBILE
+    free_count = int(free_mask[0].sum().item())
+    mobile_count = int(mobile_mask[0].sum().item())
     reduced_dofs = 3 * free_count + 3
 
+    node_ids = torch.arange(num_nodes, device=positions.device).expand(batch_size, -1)
+    free_indices = node_ids.masked_select(free_mask).view(batch_size, free_count)
+    mobile_indices = node_ids.masked_select(mobile_mask).view(batch_size, mobile_count)
+
     transform = torch.zeros(
-        (3 * num_nodes, reduced_dofs), device=positions.device, dtype=positions.dtype
+        (batch_size, 3 * num_nodes, reduced_dofs),
+        device=positions.device,
+        dtype=positions.dtype,
     )
+    batch_ids = torch.arange(batch_size, device=positions.device)[:, None]
+    free_slots = torch.arange(free_count, device=positions.device)[None, :]
 
-    for free_slot, node_idx in enumerate(free_indices):
-        transform[3 * node_idx + 0, 3 * free_slot + 0] = 1.0
-        transform[3 * node_idx + 1, 3 * free_slot + 1] = 1.0
-        transform[3 * node_idx + 2, 3 * free_slot + 2] = 1.0
+    for dof in range(3):
+        transform[
+            batch_ids,
+            3 * free_indices + dof,
+            3 * free_slots + dof,
+        ] = 1.0
 
-    centroid = positions[mobile_indices].mean(dim=0)
+    mobile_positions = positions[batch_ids, mobile_indices]
+    centroid = mobile_positions.mean(dim=1, keepdim=True)
+    dx = mobile_positions[..., 0] - centroid[..., 0]
+    dy = mobile_positions[..., 1] - centroid[..., 1]
     base = 3 * free_count
-    for node_idx in mobile_indices.tolist():
-        dx = positions[node_idx, 0] - centroid[0]
-        dy = positions[node_idx, 1] - centroid[1]
-        transform[3 * node_idx + 0, base + 0] = 1.0
-        transform[3 * node_idx + 0, base + 2] = -dy
-        transform[3 * node_idx + 1, base + 1] = 1.0
-        transform[3 * node_idx + 1, base + 2] = dx
-        transform[3 * node_idx + 2, base + 2] = 1.0
 
+    transform[batch_ids, 3 * mobile_indices + 0, base + 0] = 1.0
+    transform[batch_ids, 3 * mobile_indices + 0, base + 2] = -dy
+    transform[batch_ids, 3 * mobile_indices + 1, base + 1] = 1.0
+    transform[batch_ids, 3 * mobile_indices + 1, base + 2] = dx
+    transform[batch_ids, 3 * mobile_indices + 2, base + 2] = 1.0
     return transform
 
 
@@ -199,23 +208,12 @@ def _reduced_stiffness(
     adjacency: torch.Tensor,
     config: FrameFEMConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size, num_nodes, _ = positions.shape
+    _, num_nodes, _ = positions.shape
     full = assemble_global_stiffness(positions, adjacency, config=config)
     free_count = num_nodes - 4
-    reduced_size = 3 * free_count + 3
-    reduced = torch.zeros(
-        (batch_size, reduced_size, reduced_size),
-        device=positions.device,
-        dtype=positions.dtype,
-    )
-    transforms = []
-
-    for batch_idx in range(batch_size):
-        transform = _rigid_transform_for_sample(positions[batch_idx], roles[batch_idx])
-        transforms.append(transform)
-        reduced[batch_idx] = transform.transpose(0, 1) @ full[batch_idx] @ transform
-
-    return reduced, torch.stack(transforms, dim=0)
+    transforms = _rigid_transforms(positions, roles)
+    reduced = transforms.transpose(1, 2) @ full @ transforms
+    return reduced, transforms
 
 
 def effective_response(
