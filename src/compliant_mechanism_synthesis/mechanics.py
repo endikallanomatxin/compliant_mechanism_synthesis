@@ -10,8 +10,6 @@ from compliant_mechanism_synthesis.common import (
     ROLE_FIXED,
     ROLE_FREE,
     ROLE_MOBILE,
-    adjacency_logits,
-    logits_to_adjacency,
     role_masks,
     symmetrize_adjacency,
 )
@@ -460,5 +458,5 @@ def mechanical_terms(
 def refine_connectivity(
     adjacency: torch.Tensor, delta_scores: torch.Tensor, step_size: float
 ) -> torch.Tensor:
-    logits = adjacency_logits(adjacency)
-    return logits_to_adjacency(logits + step_size * delta_scores)
+    updated = adjacency + step_size * delta_scores
+    return symmetrize_adjacency(updated.clamp(0.0, 1.0))

@@ -13,16 +13,16 @@ from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.common import (
     ROLE_FREE,
-    adjacency_logits,
     apply_free_node_update,
-    logits_to_adjacency,
     symmetric_matrix_unique_values,
+    symmetrize_adjacency,
     unique_values_to_symmetric_matrix,
 )
 from compliant_mechanism_synthesis.data import generate_noise_sample
 from compliant_mechanism_synthesis.mechanics import (
     GeometryRegularizationConfig,
     mechanical_terms,
+    refine_connectivity,
     threshold_connectivity,
 )
 from compliant_mechanism_synthesis.model import GraphRefinementModel
@@ -31,15 +31,15 @@ from compliant_mechanism_synthesis.viz import plot_graph_design
 
 @dataclass
 class TrainConfig:
-    num_nodes: int = 32
+    num_nodes: int = 16
     d_model: int = 256
     nhead: int = 8
-    num_layers: int = 6
+    num_layers: int = 8
     latent_dim: int = 128
-    batch_size: int = 256
+    batch_size: int = 128
     train_steps: int = 2000
-    learning_rate: float = 1e-4
-    rollout_steps: int = 6
+    learning_rate: float = 1e-5
+    rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 1.0
     rollout_position_noise: float = 0.01
@@ -313,7 +313,7 @@ def _inject_rollout_noise(
         adjacency_noise = torch.randn_like(adjacency) * (
             connectivity_noise_scale * time_fraction[:, None, None]
         )
-        adjacency = logits_to_adjacency(adjacency_logits(adjacency) + adjacency_noise)
+        adjacency = symmetrize_adjacency((adjacency + adjacency_noise).clamp(0.0, 1.0))
     return positions, adjacency
 
 
@@ -387,9 +387,10 @@ def rollout_refinement(
             roles,
             position_step_size,
         )
-        current_adjacency = logits_to_adjacency(
-            adjacency_logits(current_adjacency)
-            + connectivity_step_size * outputs["delta_scores"]
+        current_adjacency = refine_connectivity(
+            current_adjacency,
+            outputs["delta_scores"],
+            connectivity_step_size,
         )
         current_positions, current_adjacency = _inject_rollout_noise(
             current_positions,
@@ -726,13 +727,13 @@ def refine_sample_state(
     geometry_config = _geometry_regularization_config(config)
     free_mask = (roles == ROLE_FREE).unsqueeze(-1).to(dtype=positions.dtype)
     position_param = torch.nn.Parameter(positions.clone())
-    adjacency_param = torch.nn.Parameter(adjacency_logits(adjacency))
+    adjacency_param = torch.nn.Parameter(adjacency.clone())
     optimizer = torch.optim.Adam([position_param, adjacency_param], lr=lr)
 
     for _ in range(steps):
         current_positions = positions + free_mask * (position_param - positions)
         current_positions = current_positions.clamp(0.0, 1.0)
-        current_adjacency = logits_to_adjacency(adjacency_param)
+        current_adjacency = symmetrize_adjacency(adjacency_param.clamp(0.0, 1.0))
         terms = mechanical_terms(
             current_positions,
             roles,
@@ -762,7 +763,7 @@ def refine_sample_state(
     refined_positions = (
         (positions + free_mask * (position_param - positions)).detach().clamp(0.0, 1.0)
     )
-    refined_adjacency = logits_to_adjacency(adjacency_param.detach())
+    refined_adjacency = symmetrize_adjacency(adjacency_param.detach().clamp(0.0, 1.0))
     return refined_positions, refined_adjacency
 
 

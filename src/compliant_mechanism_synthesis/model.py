@@ -8,7 +8,6 @@ from torch import nn
 
 from compliant_mechanism_synthesis.common import (
     NUM_ROLES,
-    logits_to_adjacency,
     symmetrize_adjacency,
 )
 
@@ -159,8 +158,8 @@ class GraphRefinementModel(nn.Module):
             node_latents.shape[-1]
         )
         delta_scores = symmetrize_adjacency(scores)
-        predicted_adjacency = logits_to_adjacency(
-            torch.logit(current_adjacency.clamp(1e-4, 1 - 1e-4)) + delta_scores
+        predicted_adjacency = symmetrize_adjacency(
+            (current_adjacency + delta_scores).clamp(0.0, 1.0)
         )
         return {
             "displacements": displacements,
