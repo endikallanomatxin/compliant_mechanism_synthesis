@@ -107,16 +107,32 @@ def _fixed_noise(
 
 def _canonical_target_specs(
     target_pool: torch.Tensor,
-) -> list[tuple[str, tuple[float, float, float]]]:
+) -> list[tuple[str, torch.Tensor]]:
     mean = target_pool.mean(dim=0)
     std = target_pool.std(dim=0, unbiased=False)
-    low = (mean - std).clamp_min(0.0)
+    low = mean - std
     high = mean + std
-    return [
-        ("low-kx_high-ky-ktheta", (float(low[0]), float(high[1]), float(high[2]))),
-        ("high-kx_low-ky-high-ktheta", (float(high[0]), float(low[1]), float(high[2]))),
-        ("high-kx-ky_low-ktheta", (float(high[0]), float(high[1]), float(low[2]))),
-    ]
+    specs = []
+    first = mean.clone()
+    first[0, 0] = low[0, 0]
+    first[1, 1] = high[1, 1]
+    first[2, 2] = high[2, 2]
+    specs.append(("low-cxx_high-cyy-ctheta", 0.5 * (first + first.transpose(0, 1))))
+
+    second = mean.clone()
+    second[0, 0] = high[0, 0]
+    second[1, 1] = low[1, 1]
+    second[2, 2] = high[2, 2]
+    specs.append(
+        ("high-cxx_low-cyy-high-ctheta", 0.5 * (second + second.transpose(0, 1)))
+    )
+
+    third = mean.clone()
+    third[0, 0] = high[0, 0]
+    third[1, 1] = high[1, 1]
+    third[2, 2] = low[2, 2]
+    specs.append(("high-cxx-cyy_low-ctheta", 0.5 * (third + third.transpose(0, 1))))
+    return specs
 
 
 def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
@@ -124,29 +140,59 @@ def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
     return weights / weights.sum()
 
 
-def _format_triplet(
-    values: torch.Tensor | tuple[float, float, float] | list[float],
-) -> str:
-    if isinstance(values, torch.Tensor):
-        values = values.detach().cpu().tolist()
-    return f"({values[0]:.4e},{values[1]:.4e},{values[2]:.4e})"
+def _format_matrix(matrix: torch.Tensor | list[list[float]]) -> str:
+    if isinstance(matrix, torch.Tensor):
+        matrix = matrix.detach().cpu().tolist()
+    rows = ["[" + ",".join(f"{value:.4e}" for value in row) + "]" for row in matrix]
+    return "[" + ";".join(rows) + "]"
+
+
+def _parse_target_response(raw: str) -> list[float]:
+    values = [float(value.strip()) for value in raw.split(",") if value.strip()]
+    if len(values) != 9:
+        raise ValueError(
+            "target response must contain exactly 9 comma-separated values"
+        )
+    return values
 
 
 def _target_normalization(raw_targets: torch.Tensor) -> dict[str, list[float]]:
-    log_targets = torch.log1p(raw_targets.clamp_min(0.0))
+    flattened = raw_targets.reshape(raw_targets.shape[0], -1)
     return {
-        "log_mean": log_targets.mean(dim=0).tolist(),
-        "log_std": log_targets.std(dim=0, unbiased=False).clamp_min(1e-4).tolist(),
+        "mean": flattened.mean(dim=0).tolist(),
+        "std": flattened.std(dim=0, unbiased=False).clamp_min(1e-6).tolist(),
     }
 
 
-def _normalize_target_properties(
+def _normalize_target_response(
     raw_targets: torch.Tensor,
     normalization: dict[str, list[float]],
 ) -> torch.Tensor:
-    mean = raw_targets.new_tensor(normalization["log_mean"])
-    std = raw_targets.new_tensor(normalization["log_std"])
-    return (torch.log1p(raw_targets.clamp_min(0.0)) - mean) / std
+    flattened = raw_targets.reshape(raw_targets.shape[0], -1)
+    mean = raw_targets.new_tensor(normalization["mean"])
+    std = raw_targets.new_tensor(normalization["std"])
+    normalized = (flattened - mean) / std
+    return normalized.reshape(-1, 3, 3)
+
+
+def _log_response_matrix(
+    writer: SummaryWriter,
+    prefix: str,
+    matrix: torch.Tensor,
+    step: int,
+) -> None:
+    names = [
+        ["ux_fx", "ux_fy", "ux_m"],
+        ["uy_fx", "uy_fy", "uy_m"],
+        ["theta_fx", "theta_fy", "theta_m"],
+    ]
+    for row_idx in range(3):
+        for col_idx in range(3):
+            writer.add_scalar(
+                f"{prefix}/{names[row_idx][col_idx]}",
+                matrix[row_idx, col_idx].item(),
+                step,
+            )
 
 
 def _free_position_loss(
@@ -213,16 +259,16 @@ def _log_canonical_evaluation(
     config: TrainConfig,
     step: int,
     device: torch.device,
-    canonical_specs: list[tuple[str, tuple[float, float, float]]],
+    canonical_specs: list[tuple[str, torch.Tensor]],
     target_normalization: dict[str, list[float]],
 ) -> None:
     positions, roles, adjacency = _fixed_noise(
         len(canonical_specs), config.num_nodes, config.seed + 101, device
     )
-    raw_targets = torch.tensor(
-        [values for _, values in canonical_specs], dtype=torch.float32, device=device
+    raw_targets = torch.stack([values for _, values in canonical_specs], dim=0).to(
+        device
     )
-    targets = _normalize_target_properties(raw_targets, target_normalization)
+    targets = _normalize_target_response(raw_targets, target_normalization)
     base_time = torch.ones((len(canonical_specs),), device=device)
     rollout = rollout_refinement(
         model,
@@ -252,22 +298,11 @@ def _log_canonical_evaluation(
             title=name,
         )
         writer.add_figure(f"canonical/{name}/design", figure, global_step=step)
-        writer.add_scalar(f"canonical/{name}/target_kx", target_values[0], step)
-        writer.add_scalar(f"canonical/{name}/target_ky", target_values[1], step)
-        writer.add_scalar(f"canonical/{name}/target_ktheta", target_values[2], step)
-        writer.add_scalar(
-            f"canonical/{name}/achieved_kx",
-            final_terms["properties"][idx, 0].item(),
-            step,
-        )
-        writer.add_scalar(
-            f"canonical/{name}/achieved_ky",
-            final_terms["properties"][idx, 1].item(),
-            step,
-        )
-        writer.add_scalar(
-            f"canonical/{name}/achieved_ktheta",
-            final_terms["properties"][idx, 2].item(),
+        _log_response_matrix(writer, f"canonical/{name}/target", target_values, step)
+        _log_response_matrix(
+            writer,
+            f"canonical/{name}/achieved",
+            final_terms["response_matrix"][idx],
             step,
         )
         for rollout_idx, state in enumerate(rollout, start=1):
@@ -277,8 +312,8 @@ def _log_canonical_evaluation(
                 state["adjacency"][idx : idx + 1],
             )
             step_error = F.mse_loss(
-                _normalize_target_properties(
-                    step_terms["properties"], target_normalization
+                _normalize_target_response(
+                    step_terms["response_matrix"], target_normalization
                 ),
                 targets[idx : idx + 1],
             )
@@ -300,15 +335,15 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
     dataset = generate_dataset(config.dataset_size, config.num_nodes, config.seed)
     raw_targets = mechanical_terms(dataset.positions, dataset.roles, dataset.adjacency)[
-        "properties"
+        "response_matrix"
     ]
     target_normalization = _target_normalization(raw_targets)
-    normalized_targets = _normalize_target_properties(raw_targets, target_normalization)
+    normalized_targets = _normalize_target_response(raw_targets, target_normalization)
     canonical_specs = _canonical_target_specs(raw_targets)
     _progress(
         "train:canonical_targets "
         + " ".join(
-            f"{name}={_format_triplet(values)}" for name, values in canonical_specs
+            f"{name}={_format_matrix(values)}" for name, values in canonical_specs
         )
     )
 
@@ -385,8 +420,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     state["positions"], roles, state["adjacency"]
                 )
                 property_loss = property_loss + weights[step_idx] * F.mse_loss(
-                    _normalize_target_properties(
-                        step_terms["properties"], target_normalization
+                    _normalize_target_response(
+                        step_terms["response_matrix"], target_normalization
                     ),
                     target_features,
                 )
@@ -504,7 +539,7 @@ def refine_sample_state(
         current_adjacency = logits_to_adjacency(adjacency_param)
         terms = mechanical_terms(current_positions, roles, current_adjacency)
         property_loss = F.mse_loss(
-            _normalize_target_properties(terms["properties"], target_normalization),
+            _normalize_target_response(terms["response_matrix"], target_normalization),
             target_features,
         )
         loss = (
@@ -526,7 +561,7 @@ def refine_sample_state(
 
 def sample(
     checkpoint_path: str,
-    target_props: list[float],
+    target_response: list[float],
     name: str,
     output_path: str,
     steps: int,
@@ -550,8 +585,11 @@ def sample(
     positions, roles, adjacency = _fixed_noise(
         1, config.num_nodes, config.seed + 500, device
     )
-    raw_targets = torch.tensor([target_props], dtype=torch.float32, device=device)
-    targets = _normalize_target_properties(raw_targets, target_normalization)
+    raw_targets = torch.tensor(
+        target_response, dtype=torch.float32, device=device
+    ).reshape(1, 3, 3)
+    raw_targets = 0.5 * (raw_targets + raw_targets.transpose(1, 2))
+    targets = _normalize_target_response(raw_targets, target_normalization)
     base_time = torch.ones((1,), device=device)
     with torch.no_grad():
         rollout = rollout_refinement(
@@ -590,12 +628,13 @@ def sample(
         title=name,
     )
     writer.add_figure("sample/final_graph", figure, global_step=0)
-    writer.add_scalar("sample/target_kx", raw_targets[0, 0].item(), 0)
-    writer.add_scalar("sample/target_ky", raw_targets[0, 1].item(), 0)
-    writer.add_scalar("sample/target_ktheta", raw_targets[0, 2].item(), 0)
-    writer.add_scalar("sample/achieved_kx", terms["properties"][0, 0].item(), 0)
-    writer.add_scalar("sample/achieved_ky", terms["properties"][0, 1].item(), 0)
-    writer.add_scalar("sample/achieved_ktheta", terms["properties"][0, 2].item(), 0)
+    _log_response_matrix(writer, "sample/target_response", raw_targets[0], 0)
+    _log_response_matrix(
+        writer, "sample/achieved_response", terms["response_matrix"][0], 0
+    )
+    _log_response_matrix(
+        writer, "sample/achieved_stiffness", terms["stiffness_matrix"][0], 0
+    )
     writer.close()
 
     result = {
@@ -603,7 +642,8 @@ def sample(
         "roles": roles.cpu(),
         "adjacency": refined_adjacency.cpu(),
         "thresholded_adjacency": thresholded_adjacency.cpu(),
-        "properties": terms["properties"].cpu(),
+        "response_matrix": terms["response_matrix"].cpu(),
+        "stiffness_matrix": terms["stiffness_matrix"].cpu(),
         "log_dir": str(log_dir),
     }
     output = Path(output_path)
@@ -611,7 +651,7 @@ def sample(
     torch.save(result, output)
     _progress(
         "sample:done "
-        f"properties={_format_triplet(terms['properties'][0])} log_dir={log_dir}"
+        f"response={_format_matrix(terms['response_matrix'][0])} log_dir={log_dir}"
     )
     return result
 
@@ -654,9 +694,11 @@ def _sample_parser() -> argparse.ArgumentParser:
         description="Sample a point-and-beam design from a trained prototype"
     )
     parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
-    parser.add_argument("--target-kx", type=float, required=True)
-    parser.add_argument("--target-ky", type=float, required=True)
-    parser.add_argument("--target-ktheta", type=float, required=True)
+    parser.add_argument(
+        "--target-response",
+        required=True,
+        help="Nine comma-separated row-major values for the 3x3 target response matrix",
+    )
     parser.add_argument("--steps", type=int, default=6)
     parser.add_argument("--sample-threshold", type=float, default=0.5)
     parser.add_argument("--name", default="sample")
@@ -675,12 +717,12 @@ def sample_main() -> None:
     args = _sample_parser().parse_args()
     result = sample(
         checkpoint_path=args.checkpoint_path,
-        target_props=[args.target_kx, args.target_ky, args.target_ktheta],
+        target_response=_parse_target_response(args.target_response),
         name=args.name,
         output_path=args.output_path,
         steps=args.steps,
         sample_threshold=args.sample_threshold,
     )
     print(f"log_dir={result['log_dir']}")
-    properties = result["properties"][0].tolist()
-    print(f"achieved_properties={_format_triplet(properties)}")
+    print(f"achieved_response={_format_matrix(result['response_matrix'][0])}")
+    print(f"achieved_stiffness={_format_matrix(result['stiffness_matrix'][0])}")

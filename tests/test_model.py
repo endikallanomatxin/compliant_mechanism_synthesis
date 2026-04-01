@@ -26,7 +26,8 @@ def _dummy_inputs(batch_size: int = 2, num_nodes: int = 8) -> tuple[torch.Tensor
     adjacency = torch.rand(batch_size, num_nodes, num_nodes)
     adjacency = 0.5 * (adjacency + adjacency.transpose(1, 2))
     adjacency = adjacency - torch.diag_embed(torch.diagonal(adjacency, dim1=1, dim2=2))
-    targets = torch.rand(batch_size, 3)
+    targets = torch.rand(batch_size, 3, 3)
+    targets = 0.5 * (targets + targets.transpose(1, 2))
     timesteps = torch.rand(batch_size)
     return positions, roles, adjacency, targets, timesteps
 

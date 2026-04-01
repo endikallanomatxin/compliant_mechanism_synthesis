@@ -22,16 +22,13 @@ PyTorch.
 - each edge is a beam element with axial and bending stiffness
 - the 2 fixed nodes are rigidly clamped
 - the 2 mobile nodes are tied to a rigid body with `(Ux, Uy, Theta)`
-- effective properties are computed from three unit load cases:
+- effective response is computed from three unit load cases:
   - horizontal force
   - vertical force
   - moment
 
-The reported target properties are:
-
-- `k_x`
-- `k_y`
-- `k_theta`
+The target mechanical objective is the full `3x3` generalized response matrix of
+the mobile rigid body, including coupling terms between force and moment.
 
 ## Learning Model
 
@@ -39,7 +36,7 @@ The model is a graph-based iterative refinement network.
 
 - each node is a token
 - node tokens use position features and learned role embeddings
-- target properties and timestep are injected globally
+- target response matrix and timestep are injected globally
 - attention layers alternate between:
   - connectivity-conditioned self-attention
   - unconditioned self-attention
@@ -52,9 +49,9 @@ The model predicts:
 Connectivity updates are produced only from dot products between these latent
 vectors.
 
-The reported mechanical properties remain the raw effective stiffness values
-`k_x`, `k_y`, and `k_theta`. The training loop normalizes them internally only
-for model conditioning and loss scaling.
+The mechanics module reports both the raw mobile-body response matrix and the
+derived effective stiffness matrix. The training loop normalizes the response
+matrix internally only for model conditioning and loss scaling.
 
 ## Training Loop
 
@@ -72,7 +69,7 @@ For each batch:
 
 The loss includes:
 
-- target property loss on `k_x`, `k_y`, `k_theta`
+- target response-matrix loss on all `3x3` terms, including couplings
 - reconstruction loss on free-node positions
 - reconstruction loss on connectivity
 - beam material penalty
@@ -110,7 +107,7 @@ The default training configuration uses:
 ```bash
 uv run cms-sample \
   --checkpoint-path artifacts/prototype.pt \
-  --target-kx 2.0e-3 --target-ky 4.0e-3 --target-ktheta 5.0e-4 \
+  --target-response "2.0e-3,1.0e-4,0.0,1.0e-4,4.0e-3,2.0e-4,0.0,2.0e-4,5.0e-4" \
   --name sample
 ```
 
@@ -120,7 +117,7 @@ Sampling outputs:
 - node roles
 - final continuous connectivity matrix
 - thresholded sparse graph for visualization
-- evaluated properties
+- evaluated response and stiffness matrices
 
 ## TensorBoard
 

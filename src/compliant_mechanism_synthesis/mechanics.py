@@ -211,7 +211,7 @@ def _reduced_stiffness(
     return reduced, torch.stack(transforms, dim=0)
 
 
-def effective_properties(
+def effective_response(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
@@ -245,16 +245,23 @@ def effective_properties(
         displacements.append(torch.linalg.solve(stabilized, rhs))
     solved = torch.stack(displacements, dim=1)
 
-    compliance = torch.stack(
-        [
-            solved[:, 0, mobile_base + 0].abs().clamp_min(1e-6),
-            solved[:, 1, mobile_base + 1].abs().clamp_min(1e-6),
-            solved[:, 2, mobile_base + 2].abs().clamp_min(1e-6),
-        ],
-        dim=1,
+    response_matrix = solved[:, :, mobile_base : mobile_base + 3].transpose(1, 2)
+    response_matrix = 0.5 * (response_matrix + response_matrix.transpose(1, 2))
+    response_eye = torch.eye(3, device=reduced.device, dtype=reduced.dtype)
+    response_trace = response_matrix.diagonal(dim1=1, dim2=2).sum(dim=1)
+    stabilized_response = (
+        response_matrix
+        + (config.stiffness_regularization * (1.0 + response_trace / 3.0))[
+            :, None, None
+        ]
+        * response_eye[None, :, :]
     )
-    raw = 1.0 / compliance
-    return raw, compliance
+    stiffness_matrix = torch.linalg.solve(
+        stabilized_response,
+        response_eye[None, :, :].expand(batch_size, -1, -1),
+    )
+    stiffness_matrix = 0.5 * (stiffness_matrix + stiffness_matrix.transpose(1, 2))
+    return response_matrix, stiffness_matrix
 
 
 def _graph_reachability(adjacency: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
@@ -323,12 +330,12 @@ def mechanical_terms(
 ) -> dict[str, torch.Tensor]:
     config = config or FrameFEMConfig()
     adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
-    raw_properties, compliance = effective_properties(
+    response_matrix, stiffness_matrix = effective_response(
         positions, roles, adjacency, config
     )
     return {
-        "properties": raw_properties,
-        "compliance": compliance,
+        "response_matrix": response_matrix,
+        "stiffness_matrix": stiffness_matrix,
         "connectivity_penalty": connectivity_penalty(roles, adjacency),
         "material": beam_material(positions, adjacency, config),
         "binarization": binarization_penalty(adjacency),

@@ -98,7 +98,7 @@ class GraphRefinementModel(nn.Module):
         )
         self.role_embedding = nn.Embedding(NUM_ROLES, d_model)
         self.target_mlp = nn.Sequential(
-            nn.Linear(3, d_model),
+            nn.Linear(9, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
@@ -136,7 +136,9 @@ class GraphRefinementModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         hidden = self.position_mlp(positions) + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
-        hidden = hidden + self.target_mlp(targets)[:, None, :]
+        hidden = (
+            hidden + self.target_mlp(targets.reshape(targets.shape[0], -1))[:, None, :]
+        )
         hidden = (
             hidden
             + self.time_mlp(sinusoidal_embedding(timesteps, hidden.shape[-1]))[
