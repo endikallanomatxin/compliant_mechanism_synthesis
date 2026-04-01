@@ -3,17 +3,20 @@ from __future__ import annotations
 import torch
 
 from compliant_mechanism_synthesis.cli import (
+    _fixed_stiffness_target_specs,
     _inject_rollout_noise,
+    _matrix_loss,
     _monotonic_improvement_loss,
     _pure_noise_batch,
     _resolve_sample_seed,
-    ResponseStatistics,
+    _sample_stiffness_targets,
+    _stiffness_to_response,
+    _target_normalization,
 )
 from compliant_mechanism_synthesis.common import (
     ROLE_FIXED,
     ROLE_FREE,
     ROLE_MOBILE,
-    symmetric_matrix_unique_values,
 )
 
 
@@ -53,23 +56,52 @@ def test_monotonic_improvement_loss_penalizes_regressions_only() -> None:
     assert torch.isclose(loss, torch.tensor((0.0 + 0.5 + 0.0) / 3.0))
 
 
-def test_response_statistics_clone_freezes_sampling_buffer() -> None:
-    stats = ResponseStatistics.empty(
-        device=torch.device("cpu"),
-        capacity=8,
-        covariance_regularization=1e-3,
-        sampling_temperature=1.0,
-    )
-    first = torch.eye(3, dtype=torch.float32).unsqueeze(0)
-    second = (2.0 * torch.eye(3, dtype=torch.float32)).unsqueeze(0)
-    stats.update(first)
-    frozen = stats.clone()
-    stats.update(second)
+def test_fixed_stiffness_targets_are_positive_definite() -> None:
+    specs = _fixed_stiffness_target_specs(torch.device("cpu"))
+    matrices = torch.stack([matrix for _, matrix in specs], dim=0)
+    eigenvalues = torch.linalg.eigvalsh(matrices)
 
-    assert torch.allclose(
-        frozen._current_buffer(), symmetric_matrix_unique_values(first)
+    assert len(specs) == 6
+    assert torch.all(eigenvalues > 0.0)
+
+
+def test_stiffness_target_sampling_draws_from_fixed_library() -> None:
+    library = torch.stack(
+        [matrix for _, matrix in _fixed_stiffness_target_specs(torch.device("cpu"))],
+        dim=0,
     )
-    assert not torch.allclose(stats._current_buffer(), frozen._current_buffer())
+    sampled = _sample_stiffness_targets(8, torch.device("cpu"))
+
+    assert sampled.shape == (8, 3, 3)
+    assert torch.allclose(sampled, sampled.transpose(1, 2))
+    assert all(
+        any(torch.allclose(target, base) for base in library) for target in sampled
+    )
+
+
+def test_matrix_loss_is_zero_for_exact_match_under_target_normalization() -> None:
+    specs = torch.stack(
+        [matrix for _, matrix in _fixed_stiffness_target_specs(torch.device("cpu"))],
+        dim=0,
+    )
+    normalization = _target_normalization(specs)
+    loss = _matrix_loss(specs[:1], specs[:1], normalization)
+
+    assert torch.isclose(loss, torch.tensor(0.0))
+
+
+def test_stiffness_to_response_inverts_each_target_matrix() -> None:
+    stiffness = torch.stack(
+        [
+            matrix
+            for _, matrix in _fixed_stiffness_target_specs(torch.device("cpu"))[:2]
+        ],
+        dim=0,
+    )
+    response = _stiffness_to_response(stiffness)
+    eye = torch.eye(3).expand_as(stiffness)
+
+    assert torch.allclose(stiffness @ response, eye, atol=1e-5)
 
 
 def test_pure_noise_batch_is_reproducible_with_explicit_seed() -> None:

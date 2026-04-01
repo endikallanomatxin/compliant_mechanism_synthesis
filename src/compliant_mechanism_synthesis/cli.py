@@ -67,10 +67,6 @@ class TrainConfig:
     max_beam_diameter: float = 2e-3
     min_free_node_spacing: float = 5e-3
     boundary_margin: float = 5e-3
-    target_buffer_size: int = 4096
-    target_covariance_regularization: float = 1e-3
-    target_sampling_temperature: float = 1.0
-    target_stats_refresh_steps: int = 100
     animation_every_steps: int = 100
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
@@ -79,97 +75,6 @@ class TrainConfig:
     name: str = "prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
     seed: int = 7
-
-
-@dataclass
-class ResponseStatistics:
-    buffer: torch.Tensor
-    capacity: int
-    count: int
-    next_index: int
-    covariance_regularization: float
-    sampling_temperature: float
-
-    @classmethod
-    def empty(
-        cls,
-        device: torch.device,
-        capacity: int,
-        covariance_regularization: float,
-        sampling_temperature: float,
-    ) -> "ResponseStatistics":
-        buffer = torch.zeros((capacity, 6), device=device, dtype=torch.float32)
-        return cls(
-            buffer=buffer,
-            capacity=capacity,
-            count=0,
-            next_index=0,
-            covariance_regularization=covariance_regularization,
-            sampling_temperature=sampling_temperature,
-        )
-
-    def _current_buffer(self) -> torch.Tensor:
-        if self.count == 0:
-            raise RuntimeError("response statistics buffer is empty")
-        valid = min(self.count, self.capacity)
-        return self.buffer[:valid]
-
-    def update(self, response_matrix: torch.Tensor) -> None:
-        features = symmetric_matrix_unique_values(response_matrix.detach())
-        feature_count = features.shape[0]
-        if feature_count >= self.capacity:
-            self.buffer.copy_(features[-self.capacity :])
-            self.count += feature_count
-            self.next_index = 0
-            return
-
-        end = self.next_index + feature_count
-        if end <= self.capacity:
-            self.buffer[self.next_index : end] = features
-        else:
-            split = self.capacity - self.next_index
-            self.buffer[self.next_index :] = features[:split]
-            self.buffer[: end - self.capacity] = features[split:]
-        self.next_index = end % self.capacity
-        self.count += feature_count
-
-    def clone(self) -> "ResponseStatistics":
-        return ResponseStatistics(
-            buffer=self.buffer.clone(),
-            capacity=self.capacity,
-            count=self.count,
-            next_index=self.next_index,
-            covariance_regularization=self.covariance_regularization,
-            sampling_temperature=self.sampling_temperature,
-        )
-
-    def normalization(self) -> dict[str, list[float]]:
-        buffer = self._current_buffer()
-        mean = buffer.mean(dim=0)
-        variance = buffer.var(dim=0, unbiased=False)
-        std = variance.clamp_min(1e-6).sqrt()
-        return {"mean": mean.tolist(), "std": std.tolist()}
-
-    def covariance(self) -> torch.Tensor:
-        buffer = self._current_buffer()
-        centered = buffer - buffer.mean(dim=0, keepdim=True)
-        covariance = centered.transpose(0, 1) @ centered / max(buffer.shape[0], 1)
-        scale = covariance.diagonal().mean().clamp_min(1e-6)
-        covariance = covariance + (self.covariance_regularization * scale) * torch.eye(
-            covariance.shape[0], device=covariance.device, dtype=covariance.dtype
-        )
-        return covariance
-
-    def sample_targets(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        buffer = self._current_buffer()
-        mean = buffer.mean(dim=0)
-        covariance = self.covariance()
-        cholesky = torch.linalg.cholesky(covariance)
-        sampled = mean.unsqueeze(0) + self.sampling_temperature * (
-            torch.randn((batch_size, mean.shape[0]), device=device, dtype=torch.float32)
-            @ cholesky.transpose(0, 1)
-        )
-        return unique_values_to_symmetric_matrix(sampled, size=3)
 
 
 def _device(device_spec: str = "auto") -> torch.device:
@@ -233,48 +138,64 @@ def _pure_noise_batch(
     )
 
 
-def _canonical_target_specs(
-    normalization: dict[str, list[float]],
+def _fixed_stiffness_target_specs(
     device: torch.device,
 ) -> list[tuple[str, torch.Tensor]]:
-    mean = torch.tensor(normalization["mean"], device=device, dtype=torch.float32)
-    std = torch.tensor(normalization["std"], device=device, dtype=torch.float32)
-    low = mean - std
-    high = mean + std
-    specs = []
-    first = mean.clone()
-    first[0] = low[0]
-    first[3] = high[3]
-    first[5] = high[5]
-    specs.append(
+    specs = [
         (
             "01_flex_x",
-            unique_values_to_symmetric_matrix(first.unsqueeze(0), size=3)[0],
-        )
-    )
-
-    second = mean.clone()
-    second[0] = high[0]
-    second[3] = low[3]
-    second[5] = high[5]
-    specs.append(
+            [1.45e-4, 0.0, 0.0, 2.65e-4, 0.0, 1.035e-4],
+        ),
         (
             "02_flex_y",
-            unique_values_to_symmetric_matrix(second.unsqueeze(0), size=3)[0],
-        )
-    )
-
-    third = mean.clone()
-    third[0] = high[0]
-    third[3] = high[3]
-    third[5] = low[5]
-    specs.append(
+            [2.65e-4, 0.0, 0.0, 1.45e-4, 0.0, 1.035e-4],
+        ),
         (
             "03_flex_theta",
-            unique_values_to_symmetric_matrix(third.unsqueeze(0), size=3)[0],
+            [2.35e-4, 0.0, 0.0, 2.35e-4, 0.0, 1.005e-4],
+        ),
+        (
+            "04_balanced",
+            [2.05e-4, 0.0, 0.0, 2.05e-4, 0.0, 1.045e-4],
+        ),
+        (
+            "05_couple_xy_pos",
+            [2.25e-4, 2.50e-5, -3.00e-6, 1.90e-4, 2.00e-6, 1.040e-4],
+        ),
+        (
+            "06_couple_xy_neg",
+            [1.90e-4, -2.50e-5, 3.00e-6, 2.25e-4, -2.00e-6, 1.040e-4],
+        ),
+    ]
+    return [
+        (
+            name,
+            unique_values_to_symmetric_matrix(
+                torch.tensor(values, device=device, dtype=torch.float32).unsqueeze(0),
+                size=3,
+            )[0],
         )
+        for name, values in specs
+    ]
+
+
+def _sample_stiffness_targets(
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    library = torch.stack(
+        [matrix for _, matrix in _fixed_stiffness_target_specs(device)], dim=0
     )
-    return specs
+    indices = torch.randint(library.shape[0], (batch_size,), device=device)
+    return library.index_select(0, indices)
+
+
+def _target_normalization(targets: torch.Tensor) -> dict[str, list[float]]:
+    features = symmetric_matrix_unique_values(targets)
+    mean = features.mean(dim=0)
+    std = features.var(dim=0, unbiased=False).clamp_min(1e-12).sqrt()
+    std = torch.maximum(std, features.new_tensor([1e-5, 1e-5, 2e-6, 1e-5, 2e-6, 2e-6]))
+    return {"mean": mean.tolist(), "std": std.tolist()}
 
 
 def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
@@ -289,16 +210,16 @@ def _format_matrix(matrix: torch.Tensor | list[list[float]]) -> str:
     return "[" + ";".join(rows) + "]"
 
 
-def _parse_target_response(raw: str) -> list[float]:
+def _parse_target_stiffness(raw: str) -> list[float]:
     values = [float(value.strip()) for value in raw.split(",") if value.strip()]
     if len(values) != 9:
         raise ValueError(
-            "target response must contain exactly 9 comma-separated values"
+            "target stiffness must contain exactly 9 comma-separated values"
         )
     return values
 
 
-def _normalize_target_response(
+def _normalize_target_matrix(
     raw_targets: torch.Tensor,
     normalization: dict[str, list[float]],
 ) -> torch.Tensor:
@@ -309,7 +230,7 @@ def _normalize_target_response(
     return unique_values_to_symmetric_matrix(normalized, size=3)
 
 
-def _response_matrix_loss(
+def _matrix_loss(
     predicted: torch.Tensor,
     target: torch.Tensor,
     normalization: dict[str, list[float]],
@@ -319,6 +240,12 @@ def _response_matrix_loss(
     mean = predicted.new_tensor(normalization["mean"])
     std = predicted.new_tensor(normalization["std"])
     return F.mse_loss((pred_unique - mean) / std, (target_unique - mean) / std)
+
+
+def _stiffness_to_response(stiffness_matrix: torch.Tensor) -> torch.Tensor:
+    stabilized = 0.5 * (stiffness_matrix + stiffness_matrix.transpose(1, 2))
+    eye = torch.eye(3, device=stabilized.device, dtype=stabilized.dtype)
+    return torch.linalg.solve(stabilized, eye.unsqueeze(0).expand_as(stabilized))
 
 
 def _inject_rollout_noise(
@@ -373,16 +300,16 @@ def _geometry_regularization_config(
     )
 
 
-def _log_response_matrix(
+def _log_matrix(
     writer: SummaryWriter,
     prefix: str,
     matrix: torch.Tensor,
     step: int,
 ) -> None:
     names = [
-        ["ux_fx", "ux_fy", "ux_m"],
-        ["uy_fx", "uy_fy", "uy_m"],
-        ["theta_fx", "theta_fy", "theta_m"],
+        ["ux_ux", "ux_uy", "ux_theta"],
+        ["uy_ux", "uy_uy", "uy_theta"],
+        ["theta_ux", "theta_uy", "theta_theta"],
     ]
     for row_idx in range(3):
         for col_idx in range(3):
@@ -470,7 +397,8 @@ def _log_canonical_evaluation(
     raw_targets = torch.stack([values for _, values in canonical_specs], dim=0).to(
         device
     )
-    targets = _normalize_target_response(raw_targets, target_normalization)
+    targets = _normalize_target_matrix(raw_targets, target_normalization)
+    target_responses = _stiffness_to_response(raw_targets)
     base_time = torch.ones((len(canonical_specs),), device=device)
     rollout = rollout_refinement(
         model,
@@ -506,15 +434,21 @@ def _log_canonical_evaluation(
             title=name,
         )
         writer.add_figure(f"canonical/00_designs/{name}", figure, global_step=step)
-        _log_response_matrix(
+        _log_matrix(
             writer,
-            f"canonical/10_target_response/{name}",
+            f"canonical/10_target_stiffness/{name}",
             target_values,
             step,
         )
-        _log_response_matrix(
+        _log_matrix(
             writer,
-            f"canonical/20_achieved_response/{name}",
+            f"canonical/20_achieved_stiffness/{name}",
+            final_terms["stiffness_matrix"][idx],
+            step,
+        )
+        _log_matrix(
+            writer,
+            f"canonical/25_achieved_response/{name}",
             final_terms["response_matrix"][idx],
             step,
         )
@@ -525,8 +459,8 @@ def _log_canonical_evaluation(
                 state["adjacency"][idx : idx + 1],
                 geometry_config=geometry_config,
             )
-            step_error = _response_matrix_loss(
-                step_terms["response_matrix"],
+            step_error = _matrix_loss(
+                step_terms["stiffness_matrix"],
                 raw_targets[idx : idx + 1],
                 target_normalization,
             )
@@ -555,7 +489,7 @@ def _log_canonical_evaluation(
             roles[0],
             adjacency[0],
             animation_rollout,
-            raw_targets[0],
+            target_responses[0],
             threshold=config.sample_threshold,
             frame_config=FrameFEMConfig(),
             title=name,
@@ -572,30 +506,13 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         f"train:start device={device} train_steps={train_steps} batch_size={config.batch_size} num_nodes={config.num_nodes}"
     )
 
-    response_stats = ResponseStatistics.empty(
-        device=device,
-        capacity=config.target_buffer_size,
-        covariance_regularization=config.target_covariance_regularization,
-        sampling_temperature=config.target_sampling_temperature,
+    fixed_targets = torch.stack(
+        [matrix for _, matrix in _fixed_stiffness_target_specs(device)], dim=0
     )
-    bootstrap_positions, bootstrap_roles, bootstrap_adjacency = _pure_noise_batch(
-        max(config.batch_size * 4, 64),
-        config.num_nodes,
-        device,
-        seed=config.seed + 17,
-    )
-    bootstrap_terms = mechanical_terms(
-        bootstrap_positions,
-        bootstrap_roles,
-        bootstrap_adjacency,
-        geometry_config=geometry_config,
-    )
-    response_stats.update(bootstrap_terms["response_matrix"])
-    sampling_stats = response_stats.clone()
-    target_normalization = sampling_stats.normalization()
-    canonical_specs = _canonical_target_specs(target_normalization, device)
+    target_normalization = _target_normalization(fixed_targets)
+    canonical_specs = _fixed_stiffness_target_specs(device)[:3]
     _progress(
-        "train:canonical_targets "
+        "train:canonical_stiffness_targets "
         + " ".join(
             f"{name}={_format_matrix(values)}" for name, values in canonical_specs
         )
@@ -638,8 +555,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             device,
             seed=current_seed,
         )
-        raw_targets = sampling_stats.sample_targets(config.batch_size, device)
-        target_features = _normalize_target_response(raw_targets, target_normalization)
+        raw_targets = _sample_stiffness_targets(config.batch_size, device)
+        target_features = _normalize_target_matrix(raw_targets, target_normalization)
         base_time = torch.rand((positions.shape[0],), device=device)
 
         rollout = rollout_refinement(
@@ -675,8 +592,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 state["adjacency"],
                 geometry_config=geometry_config,
             )
-            step_error = _response_matrix_loss(
-                step_terms["response_matrix"],
+            step_error = _matrix_loss(
+                step_terms["stiffness_matrix"],
                 raw_targets,
                 target_normalization,
             )
@@ -724,13 +641,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         monotonic_loss = _monotonic_improvement_loss(step_errors)
 
         final_state = rollout[-1]
-        final_terms = mechanical_terms(
-            final_state["positions"],
-            roles,
-            final_state["adjacency"],
-            geometry_config=geometry_config,
-        )
-
         total = (
             config.property_weight * property_loss
             + config.monotonic_improvement_weight * monotonic_loss
@@ -765,12 +675,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["thick_diameter"] += thick_diameter_loss.item()
         running_totals["node_spacing"] += node_spacing_loss.item()
         running_totals["boundary"] += boundary_loss.item()
-
-        response_stats.update(final_terms["response_matrix"])
-        if step % max(config.target_stats_refresh_steps, 1) == 0:
-            sampling_stats = response_stats.clone()
-            target_normalization = sampling_stats.normalization()
-            canonical_specs = _canonical_target_specs(target_normalization, device)
 
         writer.add_scalar("train/total_loss", total.item(), global_step)
         writer.add_scalar("train/property_loss", property_loss.item(), global_step)
@@ -846,8 +750,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     payload = {
         "state_dict": model.state_dict(),
         "config": asdict(config),
-        "target_normalization": sampling_stats.normalization(),
-        "response_stats_count": response_stats.count,
+        "target_normalization": target_normalization,
     }
     torch.save(payload, checkpoint_path)
     writer.close()
@@ -859,7 +762,7 @@ def refine_sample_state(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
-    raw_target_response: torch.Tensor,
+    raw_target_stiffness: torch.Tensor,
     target_normalization: dict[str, list[float]],
     config: TrainConfig,
     steps: int = 12,
@@ -884,9 +787,9 @@ def refine_sample_state(
             current_adjacency,
             geometry_config=geometry_config,
         )
-        property_loss = _response_matrix_loss(
-            terms["response_matrix"],
-            raw_target_response,
+        property_loss = _matrix_loss(
+            terms["stiffness_matrix"],
+            raw_target_stiffness,
             target_normalization,
         )
         loss = (
@@ -919,7 +822,7 @@ def refine_sample_state(
 
 def sample(
     checkpoint_path: str,
-    target_response: list[float],
+    target_stiffness: list[float],
     name: str,
     output_path: str,
     steps: int,
@@ -953,10 +856,11 @@ def sample(
         seed=sample_seed + 500,
     )
     raw_targets = torch.tensor(
-        target_response, dtype=torch.float32, device=device
+        target_stiffness, dtype=torch.float32, device=device
     ).reshape(1, 3, 3)
     raw_targets = 0.5 * (raw_targets + raw_targets.transpose(1, 2))
-    targets = _normalize_target_response(raw_targets, target_normalization)
+    targets = _normalize_target_matrix(raw_targets, target_normalization)
+    target_responses = _stiffness_to_response(raw_targets)
     base_time = torch.ones((1,), device=device)
     with torch.no_grad():
         rollout = rollout_refinement(
@@ -1002,13 +906,9 @@ def sample(
         title=name,
     )
     writer.add_figure("sample/00_design/final_graph", figure, global_step=0)
-    _log_response_matrix(writer, "sample/10_target_response", raw_targets[0], 0)
-    _log_response_matrix(
-        writer, "sample/20_achieved_response", terms["response_matrix"][0], 0
-    )
-    _log_response_matrix(
-        writer, "sample/30_achieved_stiffness", terms["stiffness_matrix"][0], 0
-    )
+    _log_matrix(writer, "sample/10_target_stiffness", raw_targets[0], 0)
+    _log_matrix(writer, "sample/20_achieved_stiffness", terms["stiffness_matrix"][0], 0)
+    _log_matrix(writer, "sample/30_achieved_response", terms["response_matrix"][0], 0)
     writer.add_scalar("sample/40_sparsity_loss", terms["sparsity"][0].item(), 0)
     writer.add_scalar(
         "sample/40_short_beam_penalty", terms["short_beam_penalty"][0].item(), 0
@@ -1043,7 +943,7 @@ def sample(
         roles[0],
         adjacency[0],
         animation_rollout,
-        raw_targets[0],
+        target_responses[0],
         threshold=sample_threshold,
         frame_config=FrameFEMConfig(),
         title=name,
@@ -1176,11 +1076,6 @@ def _train_parser() -> argparse.ArgumentParser:
         "--boundary-margin", type=float, default=defaults.boundary_margin
     )
     parser.add_argument(
-        "--target-stats-refresh-steps",
-        type=int,
-        default=defaults.target_stats_refresh_steps,
-    )
-    parser.add_argument(
         "--animation-every-steps",
         type=int,
         default=defaults.animation_every_steps,
@@ -1208,9 +1103,9 @@ def _sample_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
     parser.add_argument(
-        "--target-response",
+        "--target-stiffness",
         required=True,
-        help="Nine comma-separated row-major values for the 3x3 target response matrix",
+        help="Nine comma-separated row-major values for the 3x3 target stiffness matrix",
     )
     parser.add_argument("--steps", type=int, default=6)
     parser.add_argument(
@@ -1234,7 +1129,7 @@ def sample_main() -> None:
     args = _sample_parser().parse_args()
     result = sample(
         checkpoint_path=args.checkpoint_path,
-        target_response=_parse_target_response(args.target_response),
+        target_stiffness=_parse_target_stiffness(args.target_stiffness),
         name=args.name,
         output_path=args.output_path,
         steps=args.steps,
