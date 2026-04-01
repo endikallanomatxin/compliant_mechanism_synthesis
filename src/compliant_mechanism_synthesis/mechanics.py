@@ -231,15 +231,14 @@ def _reduced_stiffness(
     return reduced, transforms
 
 
-def effective_response(
+def _stabilized_reduced_system(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
-    config: FrameFEMConfig | None = None,
+    config: FrameFEMConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    config = config or FrameFEMConfig()
-    reduced, _ = _reduced_stiffness(positions, roles, adjacency, config)
-    batch_size, reduced_size, _ = reduced.shape
+    reduced, transforms = _reduced_stiffness(positions, roles, adjacency, config)
+    _, reduced_size, _ = reduced.shape
     eye = torch.eye(reduced_size, device=reduced.device, dtype=reduced.dtype)
     trace = reduced.diagonal(dim1=1, dim2=2).sum(dim=1)
     stabilized = (
@@ -249,22 +248,47 @@ def effective_response(
         ]
         * eye[None, :, :]
     )
+    return stabilized, transforms
 
+
+def _mobile_load_cases(
+    positions: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    reduced_size = 3 * (positions.shape[1] - 4) + 3
     free_count = positions.shape[1] - 4
     mobile_base = 3 * free_count
-    load_cases = torch.zeros(
-        (3, reduced_size), device=reduced.device, dtype=reduced.dtype
-    )
+    load_cases = torch.zeros((3, reduced_size), device=device, dtype=dtype)
     load_cases[0, mobile_base + 0] = 1.0
     load_cases[1, mobile_base + 1] = 1.0
     load_cases[2, mobile_base + 2] = 1.0
+    return load_cases
+
+
+def effective_response(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    config = config or FrameFEMConfig()
+    stabilized, _ = _stabilized_reduced_system(positions, roles, adjacency, config)
+    batch_size = positions.shape[0]
+    free_count = positions.shape[1] - 4
+    mobile_base = 3 * free_count
+    load_cases = _mobile_load_cases(
+        positions,
+        device=stabilized.device,
+        dtype=stabilized.dtype,
+    )
 
     rhs = load_cases.transpose(0, 1).unsqueeze(0).expand(batch_size, -1, -1)
     solved = torch.linalg.solve(stabilized, rhs)
 
     response_matrix = solved[:, mobile_base : mobile_base + 3, :]
     response_matrix = 0.5 * (response_matrix + response_matrix.transpose(1, 2))
-    response_eye = torch.eye(3, device=reduced.device, dtype=reduced.dtype)
+    response_eye = torch.eye(3, device=stabilized.device, dtype=stabilized.dtype)
     response_trace = response_matrix.diagonal(dim1=1, dim2=2).sum(dim=1)
     stabilized_response = (
         response_matrix
@@ -279,6 +303,39 @@ def effective_response(
     )
     stiffness_matrix = 0.5 * (stiffness_matrix + stiffness_matrix.transpose(1, 2))
     return response_matrix, stiffness_matrix
+
+
+def load_case_deformations(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    config = config or FrameFEMConfig()
+    stabilized, transforms = _stabilized_reduced_system(
+        positions,
+        roles,
+        adjacency,
+        config,
+    )
+    batch_size, num_nodes, _ = positions.shape
+    free_count = num_nodes - 4
+    mobile_base = 3 * free_count
+    load_cases = _mobile_load_cases(
+        positions,
+        device=stabilized.device,
+        dtype=stabilized.dtype,
+    )
+    rhs = load_cases.transpose(0, 1).unsqueeze(0).expand(batch_size, -1, -1)
+    reduced_displacements = torch.linalg.solve(stabilized, rhs)
+    full_displacements = transforms @ reduced_displacements
+    full_displacements = full_displacements.view(batch_size, num_nodes, 3, 3).permute(
+        0, 3, 1, 2
+    )
+    translations = full_displacements[..., :2]
+    mobile_response = reduced_displacements[:, mobile_base : mobile_base + 3, :]
+    mobile_response = 0.5 * (mobile_response + mobile_response.transpose(1, 2))
+    return translations, mobile_response
 
 
 def _graph_reachability(adjacency: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:

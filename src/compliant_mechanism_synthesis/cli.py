@@ -21,13 +21,17 @@ from compliant_mechanism_synthesis.common import (
 )
 from compliant_mechanism_synthesis.data import generate_noise_sample
 from compliant_mechanism_synthesis.mechanics import (
+    FrameFEMConfig,
     GeometryRegularizationConfig,
     mechanical_terms,
     refine_connectivity,
     threshold_connectivity,
 )
 from compliant_mechanism_synthesis.model import GraphRefinementModel
-from compliant_mechanism_synthesis.viz import plot_graph_design
+from compliant_mechanism_synthesis.viz import (
+    export_rollout_animation,
+    plot_graph_design,
+)
 
 
 @dataclass
@@ -67,6 +71,7 @@ class TrainConfig:
     target_covariance_regularization: float = 1e-3
     target_sampling_temperature: float = 1.0
     target_stats_refresh_steps: int = 100
+    animation_every_steps: int = 100
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 20
     sample_threshold: float = 0.5
@@ -409,23 +414,23 @@ def rollout_refinement(
         time_fraction = 1.0 - step_idx / max(steps - 1, 1)
         timestep = base_time * time_fraction
         outputs = model(current_positions, roles, current_adjacency, targets, timestep)
-        current_positions = apply_free_node_update(
+        refined_positions = apply_free_node_update(
             current_positions,
             outputs["displacements"],
             roles,
             position_step_size,
         )
-        current_adjacency = refine_connectivity(
+        refined_adjacency = refine_connectivity(
             current_adjacency,
-            current_positions,
+            refined_positions,
             roles,
             outputs["delta_scores"],
             connectivity_step_size,
         )
         current_positions, current_adjacency = _inject_rollout_noise(
-            current_positions,
+            refined_positions,
             roles,
-            current_adjacency,
+            refined_adjacency,
             base_time * time_fraction,
             position_noise_scale,
             connectivity_noise_scale,
@@ -435,6 +440,8 @@ def rollout_refinement(
                 "positions": current_positions,
                 "roles": roles,
                 "adjacency": current_adjacency,
+                "refined_positions": refined_positions,
+                "refined_adjacency": refined_adjacency,
                 "displacements": outputs["displacements"],
                 "node_latents": outputs["node_latents"],
                 "delta_scores": outputs["delta_scores"],
@@ -451,6 +458,7 @@ def _log_canonical_evaluation(
     device: torch.device,
     canonical_specs: list[tuple[str, torch.Tensor]],
     target_normalization: dict[str, list[float]],
+    animation_output_dir: Path | None = None,
 ) -> None:
     geometry_config = _geometry_regularization_config(config)
     positions, roles, adjacency = _pure_noise_batch(
@@ -529,6 +537,30 @@ def _log_canonical_evaluation(
             )
         plt = figure
         plt.clf()
+
+    if animation_output_dir is not None and canonical_specs:
+        name, _ = canonical_specs[0]
+        animation_rollout = []
+        for state in rollout:
+            animation_rollout.append(
+                {
+                    key: value[0]
+                    for key, value in state.items()
+                    if isinstance(value, torch.Tensor)
+                }
+            )
+        animation_path = export_rollout_animation(
+            animation_output_dir / f"step_{step:05d}_{name}.gif",
+            positions[0],
+            roles[0],
+            adjacency[0],
+            animation_rollout,
+            raw_targets[0],
+            threshold=config.sample_threshold,
+            frame_config=FrameFEMConfig(),
+            title=name,
+        )
+        _progress(f"train:animation path={animation_path}")
 
 
 def train(config: TrainConfig) -> tuple[Path, Path]:
@@ -800,8 +832,14 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     config,
                     global_step,
                     device,
-                    _canonical_target_specs(target_normalization, device),
+                    canonical_specs,
                     target_normalization,
+                    (
+                        log_dir / "animations"
+                        if config.animation_every_steps > 0
+                        and global_step % config.animation_every_steps == 0
+                        else None
+                    ),
                 )
             model.train()
 
@@ -990,9 +1028,32 @@ def sample(
     writer.add_scalar(
         "sample/40_boundary_penalty", terms["boundary_penalty"][0].item(), 0
     )
+    animation_rollout = []
+    for state in rollout:
+        animation_rollout.append(
+            {
+                key: value[0]
+                for key, value in state.items()
+                if isinstance(value, torch.Tensor)
+            }
+        )
+    animation_path = export_rollout_animation(
+        log_dir / "sample_rollout.gif",
+        positions[0],
+        roles[0],
+        adjacency[0],
+        animation_rollout,
+        raw_targets[0],
+        threshold=sample_threshold,
+        frame_config=FrameFEMConfig(),
+        title=name,
+        final_positions=refined_positions[0],
+        final_adjacency=refined_adjacency[0],
+    )
     writer.close()
 
     result = {
+        "animation_path": str(animation_path),
         "seed": sample_seed,
         "positions": refined_positions.cpu(),
         "roles": roles.cpu(),
@@ -1017,7 +1078,7 @@ def sample(
     torch.save(result, output)
     _progress(
         "sample:done "
-        f"seed={sample_seed} response={_format_matrix(terms['response_matrix'][0])} log_dir={log_dir}"
+        f"seed={sample_seed} response={_format_matrix(terms['response_matrix'][0])} animation={animation_path} log_dir={log_dir}"
     )
     return result
 
@@ -1119,6 +1180,11 @@ def _train_parser() -> argparse.ArgumentParser:
         type=int,
         default=defaults.target_stats_refresh_steps,
     )
+    parser.add_argument(
+        "--animation-every-steps",
+        type=int,
+        default=defaults.animation_every_steps,
+    )
     parser.add_argument("--log-every-steps", type=int, default=defaults.log_every_steps)
     parser.add_argument(
         "--canonical-eval-every-steps",
@@ -1178,5 +1244,6 @@ def sample_main() -> None:
     )
     print(f"seed={result['seed']}")
     print(f"log_dir={result['log_dir']}")
+    print(f"animation_path={result['animation_path']}")
     print(f"achieved_response={_format_matrix(result['response_matrix'][0])}")
     print(f"achieved_stiffness={_format_matrix(result['stiffness_matrix'][0])}")

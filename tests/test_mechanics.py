@@ -15,6 +15,7 @@ from compliant_mechanism_synthesis.mechanics import (
     effective_response,
     fixed_mobile_connectivity_penalty,
     geometric_regularization_terms,
+    load_case_deformations,
     mechanical_terms,
     refine_connectivity,
     threshold_connectivity,
@@ -41,6 +42,19 @@ def test_rigid_body_effective_response_is_finite_and_symmetric() -> None:
     assert torch.isfinite(stiffness_matrix).all()
     assert torch.allclose(response_matrix, response_matrix.transpose(1, 2), atol=1e-5)
     assert torch.allclose(stiffness_matrix, stiffness_matrix.transpose(1, 2), atol=1e-5)
+
+
+def test_load_case_deformations_match_response_shape() -> None:
+    positions, roles, adjacency = generate_graph_sample(10)
+    deformations, response_matrix = load_case_deformations(
+        positions.unsqueeze(0),
+        roles.unsqueeze(0),
+        adjacency.unsqueeze(0),
+    )
+    assert deformations.shape == (1, 3, 10, 2)
+    assert response_matrix.shape == (1, 3, 3)
+    assert torch.isfinite(deformations).all()
+    assert torch.isfinite(response_matrix).all()
 
 
 def test_mechanical_terms_have_expected_keys() -> None:

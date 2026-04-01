@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
+from PIL import Image
 
 from compliant_mechanism_synthesis.common import ROLE_FIXED, ROLE_FREE, ROLE_MOBILE
-from compliant_mechanism_synthesis.mechanics import FrameFEMConfig
+from compliant_mechanism_synthesis.mechanics import (
+    FrameFEMConfig,
+    load_case_deformations,
+)
 
 
 ROLE_STYLE = {
@@ -13,28 +20,72 @@ ROLE_STYLE = {
     ROLE_FREE: {"label": "free", "color": "tab:green", "marker": "o"},
 }
 
+LOAD_CASES = [
+    ("Fx", "tab:red"),
+    ("Fy", "tab:purple"),
+    ("M", "tab:brown"),
+]
 
-def plot_graph_design(
+LOAD_CASE_DISPLAY_SCALE = {
+    "Fx": 1.0,
+    "Fy": 1.0,
+    "M": 16.0,
+}
+
+
+def _setup_axis(
+    ax: plt.Axes,
+    x_limits: tuple[float, float] = (-0.15, 1.15),
+    y_limits: tuple[float, float] = (-0.15, 1.15),
+) -> None:
+    ax.set_xlim(*x_limits)
+    ax.set_ylim(*y_limits)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.15)
+
+
+def _draw_rigid_pair(
+    ax: plt.Axes, positions: torch.Tensor, roles: torch.Tensor
+) -> None:
+    for role in (ROLE_FIXED, ROLE_MOBILE):
+        indices = torch.where(roles == role)[0]
+        if indices.numel() != 2:
+            continue
+        style = ROLE_STYLE[role]
+        pair = positions[indices]
+        ax.plot(
+            pair[:, 0].numpy(),
+            pair[:, 1].numpy(),
+            color=style["color"],
+            linewidth=2.4,
+            alpha=0.75,
+            solid_capstyle="round",
+            zorder=2,
+        )
+
+
+def _draw_graph(
+    ax: plt.Axes,
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
-    threshold: float = 0.5,
+    threshold: float,
+    frame_config: FrameFEMConfig,
     title: str | None = None,
-    frame_config: FrameFEMConfig | None = None,
-) -> plt.Figure:
-    frame_config = frame_config or FrameFEMConfig()
+    legend: bool = False,
+    edge_color: str = "black",
+    edge_alpha_scale: float = 1.0,
+    x_limits: tuple[float, float] = (-0.15, 1.15),
+    y_limits: tuple[float, float] = (-0.15, 1.15),
+) -> None:
+    _setup_axis(ax, x_limits=x_limits, y_limits=y_limits)
     positions = positions.detach().cpu()
     roles = roles.detach().cpu()
     adjacency = adjacency.detach().cpu()
 
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.set_xlim(0.0, 1.0)
-    ax.set_ylim(0.0, 1.0)
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.15)
-    fig.canvas.draw()
+    ax.figure.canvas.draw()
     axis_width_in = (
-        ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted()).width
+        ax.get_window_extent().transformed(ax.figure.dpi_scale_trans.inverted()).width
     )
 
     for i in range(positions.shape[0]):
@@ -47,10 +98,13 @@ def plot_graph_design(
             ax.plot(
                 [positions[i, 0].item(), positions[j, 0].item()],
                 [positions[i, 1].item(), positions[j, 1].item()],
-                color="black",
-                alpha=min(0.2 + activation, 1.0),
-                linewidth=linewidth,
+                color=edge_color,
+                alpha=min((0.2 + activation) * edge_alpha_scale, 1.0),
+                linewidth=max(linewidth, 0.4),
+                zorder=1,
             )
+
+    _draw_rigid_pair(ax, positions, roles)
 
     for role, style in ROLE_STYLE.items():
         mask = roles == role
@@ -64,9 +118,338 @@ def plot_graph_design(
                 s=55,
                 edgecolors="white",
                 linewidths=0.6,
+                zorder=3,
             )
 
     if title:
         ax.set_title(title)
-    ax.legend(loc="upper right")
+    if legend:
+        ax.legend(loc="upper right")
+
+
+def plot_graph_design(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    threshold: float = 0.5,
+    title: str | None = None,
+    frame_config: FrameFEMConfig | None = None,
+) -> plt.Figure:
+    frame_config = frame_config or FrameFEMConfig()
+    fig, ax = plt.subplots(figsize=(5, 5))
+    _draw_graph(
+        ax,
+        positions,
+        roles,
+        adjacency,
+        threshold=threshold,
+        frame_config=frame_config,
+        title=title,
+        legend=True,
+    )
     return fig
+
+
+def _mobile_pair_positions(
+    positions: torch.Tensor, roles: torch.Tensor
+) -> torch.Tensor | None:
+    indices = torch.where(roles == ROLE_MOBILE)[0]
+    if indices.numel() != 2:
+        return None
+    return positions[indices]
+
+
+def _target_mobile_pair(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    response_column: torch.Tensor,
+    frame_config: FrameFEMConfig,
+    response_scale: float = 1.0,
+) -> torch.Tensor | None:
+    pair = _mobile_pair_positions(positions, roles)
+    if pair is None:
+        return None
+    physical_pair = pair * frame_config.workspace_size
+    centroid = physical_pair.mean(dim=0, keepdim=True)
+    rel = physical_pair - centroid
+    theta = response_scale * response_column[2].item()
+    rotation = torch.tensor(
+        [
+            [np.cos(theta), -np.sin(theta)],
+            [np.sin(theta), np.cos(theta)],
+        ],
+        dtype=physical_pair.dtype,
+    )
+    translation = response_scale * response_column[:2].to(dtype=physical_pair.dtype)
+    transformed = centroid + rel @ rotation.transpose(0, 1) + translation.unsqueeze(0)
+    return transformed / frame_config.workspace_size
+
+
+def _draw_mobile_pair_overlay(
+    ax: plt.Axes,
+    pair: torch.Tensor | None,
+    color: str,
+    linestyle: str,
+    label: str,
+    marker: str,
+) -> None:
+    if pair is None:
+        return
+    pair = pair.detach().cpu()
+    ax.plot(
+        pair[:, 0].numpy(),
+        pair[:, 1].numpy(),
+        color=color,
+        linestyle=linestyle,
+        linewidth=4.0,
+        alpha=0.95,
+        solid_capstyle="round",
+        zorder=5,
+    )
+    scatter_kwargs = {
+        "color": color,
+        "marker": marker,
+        "s": 90,
+        "linewidths": 1.0,
+        "zorder": 6,
+    }
+    if marker != "x":
+        scatter_kwargs["edgecolors"] = "white"
+    ax.scatter(
+        pair[:, 0].numpy(),
+        pair[:, 1].numpy(),
+        **scatter_kwargs,
+    )
+    center = pair.mean(dim=0)
+    ax.text(
+        center[0].item(),
+        center[1].item(),
+        label,
+        fontsize=7,
+        color=color,
+        ha="center",
+        va="bottom",
+        bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none"},
+        zorder=7,
+    )
+
+
+def _display_scale(
+    deformations: torch.Tensor,
+    frame_config: FrameFEMConfig,
+) -> float:
+    max_norm = (
+        torch.linalg.vector_norm(deformations.detach().cpu(), dim=-1).max().item()
+        / frame_config.workspace_size
+    )
+    if max_norm <= 1e-8:
+        return 1.0
+    return min(max(0.16 / max_norm, 0.016), 5.0)
+
+
+def _draw_load_case_panel(
+    ax: plt.Axes,
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    deformation: torch.Tensor,
+    achieved_response: torch.Tensor,
+    target_response: torch.Tensor,
+    load_name: str,
+    color: str,
+    threshold: float,
+    frame_config: FrameFEMConfig,
+    scale: float,
+) -> None:
+    case_scale = scale * LOAD_CASE_DISPLAY_SCALE.get(load_name, 1.0)
+    normalized_deformation = deformation / frame_config.workspace_size
+    deformed_positions = positions + case_scale * normalized_deformation
+    achieved_mobile_pair = _mobile_pair_positions(deformed_positions, roles)
+    target_pair = _target_mobile_pair(
+        positions,
+        roles,
+        target_response,
+        frame_config=frame_config,
+        response_scale=case_scale,
+    )
+    _draw_graph(
+        ax,
+        positions,
+        roles,
+        adjacency,
+        threshold=threshold,
+        frame_config=frame_config,
+        title=f"{load_name} eval",
+        legend=False,
+        edge_color="0.75",
+        edge_alpha_scale=0.45,
+    )
+    _draw_graph(
+        ax,
+        deformed_positions,
+        roles,
+        adjacency,
+        threshold=threshold,
+        frame_config=frame_config,
+        legend=False,
+        edge_color=color,
+        edge_alpha_scale=0.85,
+    )
+    if target_pair is not None:
+        _draw_mobile_pair_overlay(
+            ax,
+            target_pair,
+            color="tab:pink",
+            linestyle="--",
+            label="target mobile",
+            marker="x",
+        )
+    _draw_mobile_pair_overlay(
+        ax,
+        achieved_mobile_pair,
+        color=color,
+        linestyle="-",
+        label="achieved mobile",
+        marker="^",
+    )
+    ax.text(
+        0.02,
+        0.02,
+        (
+            f"target=({target_response[0].item():.2e}, {target_response[1].item():.2e}, {target_response[2].item():.2e})\n"
+            f"done=({achieved_response[0].item():.2e}, {achieved_response[1].item():.2e}, {achieved_response[2].item():.2e})\n"
+            f"mobile: solid=achieved  dashed=target\n"
+            f"disp x{case_scale:.2e}"
+        ),
+        transform=ax.transAxes,
+        fontsize=7,
+        va="bottom",
+        ha="left",
+        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+    )
+
+
+def _render_rollout_frame(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    target_response: torch.Tensor,
+    phase_label: str,
+    threshold: float,
+    frame_config: FrameFEMConfig,
+    title: str | None,
+) -> Image.Image:
+    positions = positions.detach().cpu()
+    roles = roles.detach().cpu()
+    adjacency = adjacency.detach().cpu()
+    target_response = target_response.detach().cpu()
+    deformations, achieved = load_case_deformations(
+        positions.unsqueeze(0),
+        roles.unsqueeze(0),
+        adjacency.unsqueeze(0),
+        config=frame_config,
+    )
+    deformations = deformations[0].detach().cpu()
+    achieved = achieved[0].detach().cpu()
+    scale = _display_scale(deformations, frame_config)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    fig.subplots_adjust(
+        left=0.05,
+        right=0.98,
+        bottom=0.05,
+        top=0.94,
+        wspace=0.16,
+        hspace=0.20,
+    )
+    main_title = phase_label if title is None else f"{title} | {phase_label}"
+    _draw_graph(
+        axes[0, 0],
+        positions,
+        roles,
+        adjacency,
+        threshold=threshold,
+        frame_config=frame_config,
+        title=main_title,
+        legend=True,
+    )
+    for idx, ((load_name, color), ax) in enumerate(
+        zip(LOAD_CASES, [axes[0, 1], axes[1, 0], axes[1, 1]])
+    ):
+        _draw_load_case_panel(
+            ax,
+            positions,
+            roles,
+            adjacency,
+            deformations[idx],
+            achieved[:, idx],
+            target_response[:, idx],
+            load_name,
+            color,
+            threshold,
+            frame_config,
+            scale,
+        )
+    fig.canvas.draw()
+    image = Image.fromarray(np.asarray(fig.canvas.buffer_rgba())[..., :3])
+    plt.close(fig)
+    return image
+
+
+def export_rollout_animation(
+    output_path: str | Path,
+    initial_positions: torch.Tensor,
+    roles: torch.Tensor,
+    initial_adjacency: torch.Tensor,
+    rollout: list[dict[str, torch.Tensor]],
+    target_response: torch.Tensor,
+    threshold: float = 0.5,
+    frame_config: FrameFEMConfig | None = None,
+    title: str | None = None,
+    final_positions: torch.Tensor | None = None,
+    final_adjacency: torch.Tensor | None = None,
+) -> Path:
+    frame_config = frame_config or FrameFEMConfig()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    frames = [
+        (initial_positions, initial_adjacency, "00 init_noise"),
+    ]
+    for idx, state in enumerate(rollout, start=1):
+        refined_positions = state.get("refined_positions", state["positions"])
+        refined_adjacency = state.get("refined_adjacency", state["adjacency"])
+        frames.append((refined_positions, refined_adjacency, f"{idx:02d} refine"))
+        if (
+            "positions" in state
+            and "adjacency" in state
+            and not (
+                torch.allclose(state["positions"], refined_positions)
+                and torch.allclose(state["adjacency"], refined_adjacency)
+            )
+        ):
+            frames.append((state["positions"], state["adjacency"], f"{idx:02d} noise"))
+    if final_positions is not None and final_adjacency is not None:
+        frames.append((final_positions, final_adjacency, "99 final_eval"))
+
+    images = [
+        _render_rollout_frame(
+            positions,
+            roles,
+            adjacency,
+            target_response,
+            phase_label,
+            threshold,
+            frame_config,
+            title,
+        )
+        for positions, adjacency, phase_label in frames
+    ]
+    images[0].save(
+        output_path,
+        save_all=True,
+        append_images=images[1:],
+        duration=550,
+        loop=0,
+    )
+    return output_path
