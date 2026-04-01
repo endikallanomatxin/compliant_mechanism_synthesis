@@ -586,6 +586,15 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         )
         weights = _step_weights(config.rollout_steps, device)
         property_loss = torch.zeros((), device=device)
+        material_loss = torch.zeros((), device=device)
+        sparsity_loss = torch.zeros((), device=device)
+        connectivity_loss = torch.zeros((), device=device)
+        short_beam_loss = torch.zeros((), device=device)
+        long_beam_loss = torch.zeros((), device=device)
+        thin_diameter_loss = torch.zeros((), device=device)
+        thick_diameter_loss = torch.zeros((), device=device)
+        node_spacing_loss = torch.zeros((), device=device)
+        boundary_loss = torch.zeros((), device=device)
         step_errors: list[torch.Tensor] = []
         for step_idx, state in enumerate(rollout):
             step_terms = mechanical_terms(
@@ -601,6 +610,40 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             step_errors.append(step_error)
             property_loss = property_loss + weights[step_idx] * step_error
+            material_loss = (
+                material_loss + weights[step_idx] * step_terms["material"].mean()
+            )
+            sparsity_loss = (
+                sparsity_loss + weights[step_idx] * step_terms["sparsity"].mean()
+            )
+            connectivity_loss = (
+                connectivity_loss
+                + weights[step_idx] * step_terms["connectivity_penalty"].mean()
+            )
+            short_beam_loss = (
+                short_beam_loss
+                + weights[step_idx] * step_terms["short_beam_penalty"].mean()
+            )
+            long_beam_loss = (
+                long_beam_loss
+                + weights[step_idx] * step_terms["long_beam_penalty"].mean()
+            )
+            thin_diameter_loss = (
+                thin_diameter_loss
+                + weights[step_idx] * step_terms["thin_diameter_penalty"].mean()
+            )
+            thick_diameter_loss = (
+                thick_diameter_loss
+                + weights[step_idx] * step_terms["thick_diameter_penalty"].mean()
+            )
+            node_spacing_loss = (
+                node_spacing_loss
+                + weights[step_idx] * step_terms["node_spacing_penalty"].mean()
+            )
+            boundary_loss = (
+                boundary_loss
+                + weights[step_idx] * step_terms["boundary_penalty"].mean()
+            )
         monotonic_loss = _monotonic_improvement_loss(step_errors)
 
         final_state = rollout[-1]
@@ -610,15 +653,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             final_state["adjacency"],
             geometry_config=geometry_config,
         )
-        material_loss = final_terms["material"].mean()
-        sparsity_loss = final_terms["sparsity"].mean()
-        connectivity_loss = final_terms["connectivity_penalty"].mean()
-        short_beam_loss = final_terms["short_beam_penalty"].mean()
-        long_beam_loss = final_terms["long_beam_penalty"].mean()
-        thin_diameter_loss = final_terms["thin_diameter_penalty"].mean()
-        thick_diameter_loss = final_terms["thick_diameter_penalty"].mean()
-        node_spacing_loss = final_terms["node_spacing_penalty"].mean()
-        boundary_loss = final_terms["boundary_penalty"].mean()
 
         total = (
             config.property_weight * property_loss
