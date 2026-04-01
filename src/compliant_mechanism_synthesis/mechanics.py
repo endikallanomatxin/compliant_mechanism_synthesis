@@ -246,13 +246,10 @@ def effective_response(
     load_cases[1, mobile_base + 1] = 1.0
     load_cases[2, mobile_base + 2] = 1.0
 
-    displacements = []
-    for load_idx in range(3):
-        rhs = load_cases[load_idx].expand(batch_size, -1)
-        displacements.append(torch.linalg.solve(stabilized, rhs))
-    solved = torch.stack(displacements, dim=1)
+    rhs = load_cases.transpose(0, 1).unsqueeze(0).expand(batch_size, -1, -1)
+    solved = torch.linalg.solve(stabilized, rhs)
 
-    response_matrix = solved[:, :, mobile_base : mobile_base + 3].transpose(1, 2)
+    response_matrix = solved[:, mobile_base : mobile_base + 3, :]
     response_matrix = 0.5 * (response_matrix + response_matrix.transpose(1, 2))
     response_eye = torch.eye(3, device=reduced.device, dtype=reduced.dtype)
     response_trace = response_matrix.diagonal(dim1=1, dim2=2).sum(dim=1)
