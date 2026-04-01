@@ -721,8 +721,8 @@ def sample(
     figure = plot_graph_design(
         refined_positions[0],
         roles[0],
-        thresholded_adjacency[0],
-        threshold=0.05,
+        refined_adjacency[0],
+        threshold=sample_threshold,
         title=name,
     )
     writer.add_figure("sample/final_graph", figure, global_step=0)
