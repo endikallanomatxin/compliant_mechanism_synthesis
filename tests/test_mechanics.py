@@ -13,6 +13,7 @@ from compliant_mechanism_synthesis.mechanics import (
     GeometryRegularizationConfig,
     assemble_global_stiffness,
     effective_response,
+    fixed_mobile_connectivity_penalty,
     geometric_regularization_terms,
     mechanical_terms,
     refine_connectivity,
@@ -55,6 +56,7 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert torch.allclose(terms["response_matrix"], response_matrix)
     assert torch.allclose(terms["stiffness_matrix"], stiffness_matrix)
     assert terms["connectivity_penalty"].shape == (1,)
+    assert terms["fixed_mobile_connectivity_penalty"].shape == (1,)
     assert terms["sparsity"].shape == (1,)
     assert terms["material"].shape == (1,)
     assert terms["short_beam_penalty"].shape == (1,)
@@ -196,6 +198,32 @@ def test_sparsity_penalty_increases_with_more_active_edges() -> None:
     sparse_terms = mechanical_terms(positions.unsqueeze(0), roles.unsqueeze(0), sparse)
     dense_terms = mechanical_terms(positions.unsqueeze(0), roles.unsqueeze(0), dense)
     assert dense_terms["sparsity"][0] > sparse_terms["sparsity"][0]
+
+
+def test_fixed_mobile_connectivity_penalty_detects_flying_mobile_nodes() -> None:
+    roles = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.long)
+    adjacency = torch.zeros((1, 6, 6), dtype=torch.float32)
+
+    penalty = fixed_mobile_connectivity_penalty(roles, adjacency)
+
+    assert torch.isclose(penalty[0], torch.tensor(1.0))
+
+
+def test_fixed_mobile_connectivity_penalty_drops_when_mobile_is_anchored() -> None:
+    roles = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.long)
+    adjacency = torch.zeros((1, 6, 6), dtype=torch.float32)
+    adjacency[0, 0, 4] = 1.0
+    adjacency[0, 4, 0] = 1.0
+    adjacency[0, 4, 2] = 1.0
+    adjacency[0, 2, 4] = 1.0
+    adjacency[0, 1, 5] = 1.0
+    adjacency[0, 5, 1] = 1.0
+    adjacency[0, 5, 3] = 1.0
+    adjacency[0, 3, 5] = 1.0
+
+    penalty = fixed_mobile_connectivity_penalty(roles, adjacency)
+
+    assert torch.isclose(penalty[0], torch.tensor(0.0))
 
 
 def test_proximity_bias_prefers_closer_pairs() -> None:

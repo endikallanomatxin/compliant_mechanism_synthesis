@@ -231,7 +231,7 @@ def _canonical_target_specs(
     first[5] = high[5]
     specs.append(
         (
-            "low-cxx_high-cyy-ctheta",
+            "01_flex_x",
             unique_values_to_symmetric_matrix(first.unsqueeze(0), size=3)[0],
         )
     )
@@ -242,7 +242,7 @@ def _canonical_target_specs(
     second[5] = high[5]
     specs.append(
         (
-            "high-cxx_low-cyy-high-ctheta",
+            "02_flex_y",
             unique_values_to_symmetric_matrix(second.unsqueeze(0), size=3)[0],
         )
     )
@@ -253,7 +253,7 @@ def _canonical_target_specs(
     third[5] = low[5]
     specs.append(
         (
-            "high-cxx-cyy_low-ctheta",
+            "03_flex_theta",
             unique_values_to_symmetric_matrix(third.unsqueeze(0), size=3)[0],
         )
     )
@@ -565,6 +565,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "material": 0.0,
         "sparsity": 0.0,
         "connectivity": 0.0,
+        "fixed_mobile_connectivity": 0.0,
         "short_beam": 0.0,
         "long_beam": 0.0,
         "thin_diameter": 0.0,
@@ -601,6 +602,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         material_loss = torch.zeros((), device=device)
         sparsity_loss = torch.zeros((), device=device)
         connectivity_loss = torch.zeros((), device=device)
+        fixed_mobile_connectivity_loss = torch.zeros((), device=device)
         short_beam_loss = torch.zeros((), device=device)
         long_beam_loss = torch.zeros((), device=device)
         thin_diameter_loss = torch.zeros((), device=device)
@@ -631,6 +633,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             connectivity_loss = (
                 connectivity_loss
                 + weights[step_idx] * step_terms["connectivity_penalty"].mean()
+            )
+            fixed_mobile_connectivity_loss = (
+                fixed_mobile_connectivity_loss
+                + weights[step_idx]
+                * step_terms["fixed_mobile_connectivity_penalty"].mean()
             )
             short_beam_loss = (
                 short_beam_loss
@@ -671,7 +678,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             + config.monotonic_improvement_weight * monotonic_loss
             + config.material_weight * material_loss
             + config.sparsity_weight * sparsity_loss
-            + config.connectivity_weight * connectivity_loss
+            + config.connectivity_weight
+            * 0.5
+            * (connectivity_loss + fixed_mobile_connectivity_loss)
             + config.short_beam_weight * short_beam_loss
             + config.long_beam_weight * long_beam_loss
             + config.thin_diameter_weight * thin_diameter_loss
@@ -690,6 +699,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["material"] += material_loss.item()
         running_totals["sparsity"] += sparsity_loss.item()
         running_totals["connectivity"] += connectivity_loss.item()
+        running_totals["fixed_mobile_connectivity"] += (
+            fixed_mobile_connectivity_loss.item()
+        )
         running_totals["short_beam"] += short_beam_loss.item()
         running_totals["long_beam"] += long_beam_loss.item()
         running_totals["thin_diameter"] += thin_diameter_loss.item()
@@ -712,6 +724,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         writer.add_scalar("train/sparsity_loss", sparsity_loss.item(), global_step)
         writer.add_scalar(
             "train/connectivity_penalty", connectivity_loss.item(), global_step
+        )
+        writer.add_scalar(
+            "train/fixed_mobile_connectivity_penalty",
+            fixed_mobile_connectivity_loss.item(),
+            global_step,
         )
         writer.add_scalar(
             "train/short_beam_penalty", short_beam_loss.item(), global_step
@@ -813,7 +830,12 @@ def refine_sample_state(
             config.property_weight * property_loss
             + config.material_weight * terms["material"].mean()
             + config.sparsity_weight * terms["sparsity"].mean()
-            + config.connectivity_weight * terms["connectivity_penalty"].mean()
+            + config.connectivity_weight
+            * 0.5
+            * (
+                terms["connectivity_penalty"].mean()
+                + terms["fixed_mobile_connectivity_penalty"].mean()
+            )
             + config.short_beam_weight * terms["short_beam_penalty"].mean()
             + config.long_beam_weight * terms["long_beam_penalty"].mean()
             + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
@@ -949,6 +971,9 @@ def sample(
         "response_matrix": terms["response_matrix"].cpu(),
         "stiffness_matrix": terms["stiffness_matrix"].cpu(),
         "sparsity": terms["sparsity"].cpu(),
+        "fixed_mobile_connectivity_penalty": terms[
+            "fixed_mobile_connectivity_penalty"
+        ].cpu(),
         "short_beam_penalty": terms["short_beam_penalty"].cpu(),
         "long_beam_penalty": terms["long_beam_penalty"].cpu(),
         "thin_diameter_penalty": terms["thin_diameter_penalty"].cpu(),

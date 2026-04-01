@@ -321,6 +321,20 @@ def connectivity_penalty(
     return torch.stack(penalties, dim=0).mean(dim=0).clamp(0.0, 1.0)
 
 
+def fixed_mobile_connectivity_penalty(
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+) -> torch.Tensor:
+    fixed, mobile, _ = role_masks(roles)
+    fixed_seed = fixed.to(dtype=adjacency.dtype)
+    mobile_mask = mobile.to(dtype=adjacency.dtype)
+    fixed_reach = _graph_reachability(adjacency, fixed_seed)
+    mobile_support = (fixed_reach * mobile_mask).sum(dim=1) / mobile_mask.sum(
+        dim=1
+    ).clamp_min(1.0)
+    return (1.0 - mobile_support).clamp(0.0, 1.0)
+
+
 def beam_material(
     positions: torch.Tensor,
     adjacency: torch.Tensor,
@@ -467,6 +481,10 @@ def mechanical_terms(
         "response_matrix": response_matrix,
         "stiffness_matrix": stiffness_matrix,
         "connectivity_penalty": connectivity_penalty(roles, adjacency),
+        "fixed_mobile_connectivity_penalty": fixed_mobile_connectivity_penalty(
+            roles,
+            adjacency,
+        ),
         "sparsity": connectivity_sparsity(adjacency),
         "material": beam_material(positions, adjacency, config),
         **geometry_terms,
