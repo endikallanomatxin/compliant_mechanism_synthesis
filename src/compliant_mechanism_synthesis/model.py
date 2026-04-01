@@ -125,7 +125,7 @@ class GraphRefinementModel(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, latent_dim),
         )
-        nn.init.zeros_(self.displacement_head[-1].weight)
+        nn.init.normal_(self.displacement_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.displacement_head[-1].bias)
 
     def forward(
