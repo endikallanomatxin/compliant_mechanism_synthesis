@@ -44,6 +44,7 @@ class GeometryRegularizationConfig:
     max_diameter: float = 2e-3
     min_free_node_spacing: float = 5e-3
     min_centered_free_std: float = 0.22
+    min_rigid_attachment_activation: float = 0.30
 
 
 def characteristic_scales(
@@ -559,6 +560,30 @@ def fixed_mobile_connectivity_penalty(
     return (1.0 - mobile_support).clamp(0.0, 1.0)
 
 
+def rigid_attachment_penalty(
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    min_attachment_activation: float,
+) -> torch.Tensor:
+    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    fixed, mobile, free = role_masks(roles)
+
+    def _attachment(mask: torch.Tensor) -> torch.Tensor:
+        attachment = adjacency * (
+            mask.unsqueeze(-1) & free.unsqueeze(-2)
+        ).to(dtype=adjacency.dtype)
+        incident = attachment.sum(dim=2)
+        active = mask.to(dtype=adjacency.dtype).sum(dim=1).clamp_min(1.0)
+        mean_incident = incident.sum(dim=1) / active
+        return (
+            (min_attachment_activation - mean_incident).clamp_min(0.0).square()
+        )
+
+    fixed_penalty = _attachment(fixed)
+    mobile_penalty = _attachment(mobile)
+    return 0.5 * (fixed_penalty + mobile_penalty)
+
+
 def beam_material(
     positions: torch.Tensor,
     adjacency: torch.Tensor,
@@ -672,6 +697,11 @@ def geometric_regularization_terms(
         "centroid_penalty": centroid_penalty,
         "spread_penalty": spread_penalty,
         "soft_domain_penalty": soft_domain_penalty,
+        "rigid_attachment_penalty": rigid_attachment_penalty(
+            roles,
+            adjacency,
+            geometry_config.min_rigid_attachment_activation,
+        ),
     }
 
 
@@ -701,6 +731,7 @@ def mechanical_terms(
             "centroid_penalty": zeros,
             "spread_penalty": zeros,
             "soft_domain_penalty": zeros,
+            "rigid_attachment_penalty": zeros,
         }
     else:
         geometry_terms = geometric_regularization_terms(

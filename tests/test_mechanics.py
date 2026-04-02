@@ -19,6 +19,7 @@ from compliant_mechanism_synthesis.mechanics import (
     load_case_deformations,
     mechanical_terms,
     refine_connectivity,
+    rigid_attachment_penalty,
     threshold_connectivity,
 )
 
@@ -86,6 +87,7 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["thin_diameter_penalty"].shape == (1,)
     assert terms["thick_diameter_penalty"].shape == (1,)
     assert terms["node_spacing_penalty"].shape == (1,)
+    assert terms["rigid_attachment_penalty"].shape == (1,)
     assert terms["centroid_penalty"].shape == (1,)
     assert terms["spread_penalty"].shape == (1,)
     assert terms["soft_domain_penalty"].shape == (1,)
@@ -370,6 +372,44 @@ def test_fixed_mobile_connectivity_penalty_drops_when_mobile_is_anchored() -> No
     adjacency[0, 3, 5] = 1.0
 
     penalty = fixed_mobile_connectivity_penalty(roles, adjacency)
+
+    assert torch.isclose(penalty[0], torch.tensor(0.0))
+
+
+def test_rigid_attachment_penalty_detects_weak_endpoint_attachment() -> None:
+    roles = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.long)
+    adjacency = torch.zeros((1, 6, 6), dtype=torch.float32)
+    adjacency[0, 0, 4] = 0.1
+    adjacency[0, 4, 0] = 0.1
+    adjacency[0, 2, 5] = 0.1
+    adjacency[0, 5, 2] = 0.1
+
+    penalty = rigid_attachment_penalty(
+        roles,
+        adjacency,
+        min_attachment_activation=0.3,
+    )
+
+    assert penalty[0] > 0.0
+
+
+def test_rigid_attachment_penalty_drops_with_strong_endpoint_attachment() -> None:
+    roles = torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.long)
+    adjacency = torch.zeros((1, 6, 6), dtype=torch.float32)
+    adjacency[0, 0, 4] = 0.6
+    adjacency[0, 4, 0] = 0.6
+    adjacency[0, 1, 5] = 0.6
+    adjacency[0, 5, 1] = 0.6
+    adjacency[0, 2, 4] = 0.6
+    adjacency[0, 4, 2] = 0.6
+    adjacency[0, 3, 5] = 0.6
+    adjacency[0, 5, 3] = 0.6
+
+    penalty = rigid_attachment_penalty(
+        roles,
+        adjacency,
+        min_attachment_activation=0.3,
+    )
 
     assert torch.isclose(penalty[0], torch.tensor(0.0))
 
