@@ -15,6 +15,7 @@ from compliant_mechanism_synthesis.mechanics import (
     effective_response,
     fixed_mobile_connectivity_penalty,
     geometric_regularization_terms,
+    mechanical_response_fields,
     load_case_deformations,
     mechanical_terms,
     refine_connectivity,
@@ -67,6 +68,8 @@ def test_mechanical_terms_have_expected_keys() -> None:
     )
     assert terms["response_matrix"].shape == (1, 3, 3)
     assert terms["stiffness_matrix"].shape == (1, 3, 3)
+    assert terms["translations"].shape == (1, 3, 10, 2)
+    assert terms["nodal_stress"].shape == (1, 10)
     assert torch.allclose(terms["response_matrix"], response_matrix)
     assert torch.allclose(terms["stiffness_matrix"], stiffness_matrix)
     assert terms["connectivity_penalty"].shape == (1,)
@@ -79,6 +82,33 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["thick_diameter_penalty"].shape == (1,)
     assert terms["node_spacing_penalty"].shape == (1,)
     assert terms["boundary_penalty"].shape == (1,)
+    assert terms["yield_stress_penalty"].shape == (1,)
+
+
+def test_yield_stress_terms_are_zero_for_absent_bars() -> None:
+    positions, roles, _ = generate_graph_sample(10)
+    adjacency = torch.zeros((1, 10, 10), dtype=torch.float32)
+    fields = mechanical_response_fields(
+        positions.unsqueeze(0), roles.unsqueeze(0), adjacency
+    )
+
+    assert torch.allclose(
+        fields["nodal_stress"], torch.zeros_like(fields["nodal_stress"])
+    )
+    assert torch.isclose(fields["yield_stress_penalty"][0], torch.tensor(0.0))
+
+
+def test_yield_stress_penalty_accumulates_subyield_stress() -> None:
+    positions, roles, adjacency = generate_graph_sample(10)
+    fields = mechanical_response_fields(
+        positions.unsqueeze(0),
+        roles.unsqueeze(0),
+        adjacency.unsqueeze(0),
+        config=FrameFEMConfig(yield_stress=1e12),
+    )
+
+    assert fields["nodal_stress"].max() > 0.0
+    assert fields["yield_stress_penalty"][0] > 0.0
 
 
 def test_geometric_regularization_penalizes_extreme_lengths_and_diameters() -> None:

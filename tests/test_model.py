@@ -31,7 +31,7 @@ def _dummy_inputs(batch_size: int = 2, num_nodes: int = 8) -> tuple[torch.Tensor
     current_stiffness = torch.rand(batch_size, 3, 3)
     current_stiffness = 0.5 * (current_stiffness + current_stiffness.transpose(1, 2))
     residual_stiffness = target_stiffness - current_stiffness
-    nodal_mechanics = torch.rand(batch_size, num_nodes, 6)
+    nodal_mechanics = torch.rand(batch_size, num_nodes, 7)
     timesteps = torch.rand(batch_size)
     position_noise_levels = torch.rand(batch_size)
     connectivity_noise_levels = torch.rand(batch_size)

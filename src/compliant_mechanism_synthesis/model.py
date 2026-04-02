@@ -114,7 +114,7 @@ class GraphRefinementModel(nn.Module):
     ) -> None:
         super().__init__()
         self.position_mlp = nn.Sequential(
-            nn.Linear(8, d_model),
+            nn.Linear(9, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )

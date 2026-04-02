@@ -24,8 +24,8 @@ from compliant_mechanism_synthesis.mechanics import (
     FrameFEMConfig,
     GeometryRegularizationConfig,
     mechanical_terms,
+    mechanical_response_fields,
     refine_connectivity,
-    stiffness_and_deformations,
     threshold_connectivity,
 )
 from compliant_mechanism_synthesis.model import GraphRefinementModel
@@ -37,14 +37,14 @@ from compliant_mechanism_synthesis.viz import (
 
 @dataclass
 class TrainConfig:
-    num_nodes: int = 64
-    d_model: int = 256
-    nhead: int = 8
-    num_layers: int = 8
+    num_nodes: int = 32
+    d_model: int = 128
+    nhead: int = 16
+    num_layers: int = 12
     latent_dim: int = 128
-    batch_size: int = 64
-    train_steps: int = 4_000
-    learning_rate: float = 1e-5
+    batch_size: int = 128
+    train_steps: int = 20_000
+    learning_rate: float = 1e-4
     rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 0.1
@@ -58,7 +58,7 @@ class TrainConfig:
     supervised_every_steps: int = 1
     training_goal_blend_start: float = 0.0
     training_goal_blend_end: float = 1.0
-    property_weight: float = 2.0
+    property_weight: float = 1.0
     monotonic_improvement_weight: float = 0.25
     material_weight: float = 1e4
     sparsity_weight: float = 0.5
@@ -70,15 +70,16 @@ class TrainConfig:
     thick_diameter_weight: float = 0.10
     node_spacing_weight: float = 0.20
     boundary_weight: float = 0.10
+    yield_stress_weight: float = 0.10
     min_beam_length: float = 1e-3
-    max_beam_length: float = 2e-2
+    max_beam_length: float = 3e-2
     min_beam_diameter: float = 2e-4
-    max_beam_diameter: float = 2e-3
+    max_beam_diameter: float = 4e-3
     min_free_node_spacing: float = 5e-3
     boundary_margin: float = 5e-3
-    animation_every_steps: int = 200
+    animation_every_steps: int = 1_000
     log_every_steps: int = 5
-    canonical_eval_every_steps: int = 40
+    canonical_eval_every_steps: int = 100
     sample_threshold: float = 0.5
     device: str = "auto"
     name: str = "prototype"
@@ -159,6 +160,7 @@ def _pure_noise_batch(
 def _fixed_stiffness_target_specs(
     device: torch.device,
 ) -> list[tuple[str, torch.Tensor]]:
+    stiffness_scale = FrameFEMConfig().young_modulus
     specs = [
         (
             "01_flex_x",
@@ -189,7 +191,10 @@ def _fixed_stiffness_target_specs(
         (
             name,
             unique_values_to_symmetric_matrix(
-                torch.tensor(values, device=device, dtype=torch.float32).unsqueeze(0),
+                (
+                    stiffness_scale
+                    * torch.tensor(values, device=device, dtype=torch.float32)
+                ).unsqueeze(0),
                 size=3,
             )[0],
         )
@@ -303,12 +308,25 @@ def _nodal_mechanics_features(
     adjacency: torch.Tensor,
 ) -> torch.Tensor:
     with torch.no_grad():
-        _, deformations, _ = stiffness_and_deformations(positions, roles, adjacency)
+        response_fields = mechanical_response_fields(positions, roles, adjacency)
+    return _nodal_mechanics_features_from_fields(positions, response_fields)
+
+
+def _nodal_mechanics_features_from_fields(
+    positions: torch.Tensor,
+    response_fields: dict[str, torch.Tensor],
+) -> torch.Tensor:
     batch_size = positions.shape[0]
-    features = deformations.permute(0, 2, 1, 3).reshape(
-        batch_size, positions.shape[1], 6
+    deformation_features = (
+        response_fields["translations"]
+        .permute(0, 2, 1, 3)
+        .reshape(batch_size, positions.shape[1], 6)
+        / FrameFEMConfig().workspace_size
     )
-    return features / FrameFEMConfig().workspace_size
+    stress_feature = (
+        response_fields["nodal_stress"] / FrameFEMConfig().yield_stress
+    ).unsqueeze(-1)
+    return torch.cat([deformation_features, stress_feature], dim=-1)
 
 
 def _sample_supervised_denoising_batch(
@@ -462,27 +480,21 @@ def rollout_refinement(
         connectivity_noise_levels = connectivity_noise_scale * timestep
         if current_stiffness is None:
             with torch.no_grad():
-                current_stiffness, current_deformations, _ = stiffness_and_deformations(
+                current_response_fields = mechanical_response_fields(
                     current_positions,
                     roles,
                     current_adjacency,
                 )
+            current_stiffness = current_response_fields["stiffness_matrix"]
+            current_nodal_mechanics = _nodal_mechanics_features_from_fields(
+                current_positions,
+                current_response_fields,
+            )
         else:
-            current_deformations = None
-        if current_deformations is None:
             current_nodal_mechanics = _nodal_mechanics_features(
                 current_positions,
                 roles,
                 current_adjacency,
-            )
-        else:
-            current_nodal_mechanics = (
-                current_deformations.permute(0, 2, 1, 3).reshape(
-                    current_positions.shape[0],
-                    current_positions.shape[1],
-                    6,
-                )
-                / FrameFEMConfig().workspace_size
             )
         target_features, current_features, residual_features = (
             _mechanics_condition_matrices(
@@ -715,6 +727,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "thick_diameter": 0.0,
         "node_spacing": 0.0,
         "boundary": 0.0,
+        "yield_stress": 0.0,
     }
     step_weights = _step_weights(config.rollout_steps, device)
 
@@ -770,6 +783,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         thick_diameter_loss = torch.zeros((), device=device)
         node_spacing_loss = torch.zeros((), device=device)
         boundary_loss = torch.zeros((), device=device)
+        yield_stress_loss = torch.zeros((), device=device)
         step_errors: list[torch.Tensor] = []
         for step_idx, state in enumerate(rollout):
             step_terms = state["terms"]
@@ -819,6 +833,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 boundary_loss
                 + step_weights[step_idx] * step_terms["boundary_penalty"].mean()
             )
+            yield_stress_loss = (
+                yield_stress_loss
+                + step_weights[step_idx] * step_terms["yield_stress_penalty"].mean()
+            )
         monotonic_loss = _monotonic_improvement_loss(step_errors)
 
         final_state = rollout[-1]
@@ -835,6 +853,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             + config.thick_diameter_weight * thick_diameter_loss
             + config.node_spacing_weight * node_spacing_loss
             + config.boundary_weight * boundary_loss
+            + config.yield_stress_weight * yield_stress_loss
         )
 
         supervised_position_loss = torch.zeros((), device=device)
@@ -855,10 +874,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             with torch.no_grad():
                 noisy_terms = mechanical_terms(noisy_positions, roles, noisy_adjacency)
-                noisy_nodal_mechanics = _nodal_mechanics_features(
+                noisy_nodal_mechanics = _nodal_mechanics_features_from_fields(
                     noisy_positions,
-                    roles,
-                    noisy_adjacency,
+                    noisy_terms,
                 )
             target_features, current_features, residual_features = (
                 _mechanics_condition_matrices(
@@ -931,6 +949,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["thick_diameter"] += thick_diameter_loss.item()
         running_totals["node_spacing"] += node_spacing_loss.item()
         running_totals["boundary"] += boundary_loss.item()
+        running_totals["yield_stress"] += yield_stress_loss.item()
 
         if config.log_every_steps > 0 and step % config.log_every_steps == 0:
             writer.add_scalar("train/total_loss", total.item(), global_step)
@@ -979,6 +998,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             writer.add_scalar(
                 "train/boundary_penalty", boundary_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/yield_stress_penalty",
+                yield_stress_loss.item(),
+                global_step,
             )
         global_step += 1
 
@@ -1080,6 +1104,7 @@ def refine_sample_state(
             + config.thick_diameter_weight * terms["thick_diameter_penalty"].mean()
             + config.node_spacing_weight * terms["node_spacing_penalty"].mean()
             + config.boundary_weight * terms["boundary_penalty"].mean()
+            + config.yield_stress_weight * terms["yield_stress_penalty"].mean()
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -1203,6 +1228,11 @@ def sample(
     writer.add_scalar(
         "sample/40_boundary_penalty", terms["boundary_penalty"][0].item(), 0
     )
+    writer.add_scalar(
+        "sample/40_yield_stress_penalty",
+        terms["yield_stress_penalty"][0].item(),
+        0,
+    )
     animation_rollout = []
     for state in rollout:
         animation_rollout.append(
@@ -1240,12 +1270,14 @@ def sample(
         "fixed_mobile_connectivity_penalty": terms[
             "fixed_mobile_connectivity_penalty"
         ].cpu(),
+        "nodal_stress": terms["nodal_stress"].cpu(),
         "short_beam_penalty": terms["short_beam_penalty"].cpu(),
         "long_beam_penalty": terms["long_beam_penalty"].cpu(),
         "thin_diameter_penalty": terms["thin_diameter_penalty"].cpu(),
         "thick_diameter_penalty": terms["thick_diameter_penalty"].cpu(),
         "node_spacing_penalty": terms["node_spacing_penalty"].cpu(),
         "boundary_penalty": terms["boundary_penalty"].cpu(),
+        "yield_stress_penalty": terms["yield_stress_penalty"].cpu(),
         "log_dir": str(log_dir),
     }
     output = Path(output_path)
@@ -1369,6 +1401,11 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--boundary-weight", type=float, default=defaults.boundary_weight
+    )
+    parser.add_argument(
+        "--yield-stress-weight",
+        type=float,
+        default=defaults.yield_stress_weight,
     )
     parser.add_argument(
         "--min-beam-length", type=float, default=defaults.min_beam_length

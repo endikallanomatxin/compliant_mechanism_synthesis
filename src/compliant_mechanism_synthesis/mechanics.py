@@ -20,10 +20,11 @@ from compliant_mechanism_synthesis.common import (
 
 @dataclass(frozen=True)
 class FrameFEMConfig:
-    young_modulus: float = 1.0
+    young_modulus: float = 210e9
     workspace_size: float = 0.2
     r_max: float = 1.5e-3
     stiffness_regularization: float = 1e-4
+    yield_stress: float = 250e6
 
 
 @dataclass(frozen=True)
@@ -266,27 +267,36 @@ def _mobile_load_cases(
     return load_cases
 
 
-def effective_response(
+def _solve_load_cases(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
-    config: FrameFEMConfig | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    config = config or FrameFEMConfig()
-    stabilized, _ = _stabilized_reduced_system(positions, roles, adjacency, config)
+    config: FrameFEMConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    stabilized, transforms = _stabilized_reduced_system(
+        positions, roles, adjacency, config
+    )
     batch_size = positions.shape[0]
-    free_count = positions.shape[1] - 4
-    mobile_base = 3 * free_count
     load_cases = _mobile_load_cases(
         positions,
         device=stabilized.device,
         dtype=stabilized.dtype,
     )
-
     rhs = load_cases.transpose(0, 1).unsqueeze(0).expand(batch_size, -1, -1)
-    solved = torch.linalg.solve(stabilized, rhs)
+    reduced_displacements = torch.linalg.solve(stabilized, rhs)
+    return stabilized, transforms, reduced_displacements
 
-    response_matrix = solved[:, mobile_base : mobile_base + 3, :]
+
+def _response_and_stiffness_from_solution(
+    positions: torch.Tensor,
+    stabilized: torch.Tensor,
+    reduced_displacements: torch.Tensor,
+    config: FrameFEMConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = positions.shape[0]
+    free_count = positions.shape[1] - 4
+    mobile_base = 3 * free_count
+    response_matrix = reduced_displacements[:, mobile_base : mobile_base + 3, :]
     response_matrix = 0.5 * (response_matrix + response_matrix.transpose(1, 2))
     response_eye = torch.eye(3, device=stabilized.device, dtype=stabilized.dtype)
     response_trace = response_matrix.diagonal(dim1=1, dim2=2).sum(dim=1)
@@ -305,37 +315,140 @@ def effective_response(
     return response_matrix, stiffness_matrix
 
 
+def _stress_response_fields(
+    positions: torch.Tensor,
+    adjacency: torch.Tensor,
+    transforms: torch.Tensor,
+    reduced_displacements: torch.Tensor,
+    config: FrameFEMConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    physical_positions = _physical_positions(positions, config)
+    batch_size, num_nodes, _ = positions.shape
+    edge_i, edge_j = _cached_edge_index_pairs(num_nodes)
+    edge_i = edge_i.to(positions.device)
+    edge_j = edge_j.to(positions.device)
+    activations = adjacency[:, edge_i, edge_j]
+    delta = physical_positions[:, edge_j] - physical_positions[:, edge_i]
+    length = torch.linalg.vector_norm(delta, dim=-1).clamp_min(1e-4)
+    radius = (config.r_max * activations).clamp_min(1e-8)
+    area = (math.pi * radius.square()).clamp_min(1e-12)
+    inertia = (math.pi * radius.pow(4) / 4.0).clamp_min(1e-16)
+    local = _frame_local_stiffness(length, area, inertia, config.young_modulus)
+    transform = _frame_transform(delta, length)
+    full_displacements = transforms @ reduced_displacements
+    dofs = torch.stack(
+        [
+            3 * edge_i + 0,
+            3 * edge_i + 1,
+            3 * edge_i + 2,
+            3 * edge_j + 0,
+            3 * edge_j + 1,
+            3 * edge_j + 2,
+        ],
+        dim=1,
+    )
+    edge_displacements = full_displacements[:, dofs.reshape(-1), :].view(
+        batch_size,
+        -1,
+        6,
+        3,
+    )
+    local_displacements = torch.einsum("beij,bejk->beik", transform, edge_displacements)
+    local_forces = torch.einsum("beij,bejk->beik", local, local_displacements)
+
+    axial_force = torch.maximum(
+        local_forces[..., 0, :].abs(),
+        local_forces[..., 3, :].abs(),
+    )
+    moment_i = local_forces[..., 2, :].abs()
+    moment_j = local_forces[..., 5, :].abs()
+    axial_stress = axial_force / area.unsqueeze(-1)
+    bending_i = moment_i * radius.unsqueeze(-1) / inertia.unsqueeze(-1)
+    bending_j = moment_j * radius.unsqueeze(-1) / inertia.unsqueeze(-1)
+    edge_stress = torch.maximum(axial_stress + bending_i, axial_stress + bending_j)
+    edge_stress = edge_stress.masked_fill(activations.unsqueeze(-1) <= 1e-6, 0.0)
+    max_edge_stress = edge_stress.max(dim=-1).values
+
+    weighted_stress = activations * max_edge_stress
+    stress_sum = torch.zeros(
+        (batch_size, num_nodes), device=positions.device, dtype=positions.dtype
+    )
+    weight_sum = torch.zeros(
+        (batch_size, num_nodes), device=positions.device, dtype=positions.dtype
+    )
+    scatter_i = edge_i.unsqueeze(0).expand(batch_size, -1)
+    scatter_j = edge_j.unsqueeze(0).expand(batch_size, -1)
+    stress_sum.scatter_add_(1, scatter_i, weighted_stress)
+    stress_sum.scatter_add_(1, scatter_j, weighted_stress)
+    weight_sum.scatter_add_(1, scatter_i, activations)
+    weight_sum.scatter_add_(1, scatter_j, activations)
+    nodal_stress = stress_sum / weight_sum.clamp_min(1e-6)
+    yield_ratio = max_edge_stress / config.yield_stress
+    yield_penalty = (activations * yield_ratio.square()).sum(dim=1) / activations.sum(
+        dim=1
+    ).clamp_min(1e-6)
+    return nodal_stress, yield_penalty
+
+
+def mechanical_response_fields(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig | None = None,
+) -> dict[str, torch.Tensor]:
+    config = config or FrameFEMConfig()
+    stabilized, transforms, reduced_displacements = _solve_load_cases(
+        positions,
+        roles,
+        adjacency,
+        config,
+    )
+    response_matrix, stiffness_matrix = _response_and_stiffness_from_solution(
+        positions,
+        stabilized,
+        reduced_displacements,
+        config,
+    )
+    full_displacements = transforms @ reduced_displacements
+    batch_size, num_nodes, _ = positions.shape
+    full_displacements = full_displacements.view(batch_size, num_nodes, 3, 3).permute(
+        0, 3, 1, 2
+    )
+    translations = full_displacements[..., :2]
+    nodal_stress, yield_penalty = _stress_response_fields(
+        positions,
+        adjacency,
+        transforms,
+        reduced_displacements,
+        config,
+    )
+    return {
+        "response_matrix": response_matrix,
+        "stiffness_matrix": stiffness_matrix,
+        "translations": translations,
+        "nodal_stress": nodal_stress,
+        "yield_stress_penalty": yield_penalty,
+    }
+
+
+def effective_response(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fields = mechanical_response_fields(positions, roles, adjacency, config)
+    return fields["response_matrix"], fields["stiffness_matrix"]
+
+
 def load_case_deformations(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
     config: FrameFEMConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    config = config or FrameFEMConfig()
-    stabilized, transforms = _stabilized_reduced_system(
-        positions,
-        roles,
-        adjacency,
-        config,
-    )
-    batch_size, num_nodes, _ = positions.shape
-    free_count = num_nodes - 4
-    mobile_base = 3 * free_count
-    load_cases = _mobile_load_cases(
-        positions,
-        device=stabilized.device,
-        dtype=stabilized.dtype,
-    )
-    rhs = load_cases.transpose(0, 1).unsqueeze(0).expand(batch_size, -1, -1)
-    reduced_displacements = torch.linalg.solve(stabilized, rhs)
-    full_displacements = transforms @ reduced_displacements
-    full_displacements = full_displacements.view(batch_size, num_nodes, 3, 3).permute(
-        0, 3, 1, 2
-    )
-    translations = full_displacements[..., :2]
-    mobile_response = reduced_displacements[:, mobile_base : mobile_base + 3, :]
-    mobile_response = 0.5 * (mobile_response + mobile_response.transpose(1, 2))
-    return translations, mobile_response
+    fields = mechanical_response_fields(positions, roles, adjacency, config)
+    return fields["translations"], fields["response_matrix"]
 
 
 def stiffness_and_deformations(
@@ -344,45 +457,12 @@ def stiffness_and_deformations(
     adjacency: torch.Tensor,
     config: FrameFEMConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    config = config or FrameFEMConfig()
-    stabilized, transforms = _stabilized_reduced_system(
-        positions,
-        roles,
-        adjacency,
-        config,
+    fields = mechanical_response_fields(positions, roles, adjacency, config)
+    return (
+        fields["stiffness_matrix"],
+        fields["translations"],
+        fields["response_matrix"],
     )
-    batch_size, num_nodes, _ = positions.shape
-    free_count = num_nodes - 4
-    mobile_base = 3 * free_count
-    load_cases = _mobile_load_cases(
-        positions,
-        device=stabilized.device,
-        dtype=stabilized.dtype,
-    )
-    rhs = load_cases.transpose(0, 1).unsqueeze(0).expand(batch_size, -1, -1)
-    reduced_displacements = torch.linalg.solve(stabilized, rhs)
-    response_matrix = reduced_displacements[:, mobile_base : mobile_base + 3, :]
-    response_matrix = 0.5 * (response_matrix + response_matrix.transpose(1, 2))
-    response_eye = torch.eye(3, device=stabilized.device, dtype=stabilized.dtype)
-    response_trace = response_matrix.diagonal(dim1=1, dim2=2).sum(dim=1)
-    stabilized_response = (
-        response_matrix
-        + (config.stiffness_regularization * (1.0 + response_trace / 3.0))[
-            :, None, None
-        ]
-        * response_eye[None, :, :]
-    )
-    stiffness_matrix = torch.linalg.solve(
-        stabilized_response,
-        response_eye[None, :, :].expand(batch_size, -1, -1),
-    )
-    stiffness_matrix = 0.5 * (stiffness_matrix + stiffness_matrix.transpose(1, 2))
-    full_displacements = transforms @ reduced_displacements
-    full_displacements = full_displacements.view(batch_size, num_nodes, 3, 3).permute(
-        0, 3, 1, 2
-    )
-    translations = full_displacements[..., :2]
-    return stiffness_matrix, translations, response_matrix
 
 
 def _graph_reachability(adjacency: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
@@ -558,9 +638,7 @@ def mechanical_terms(
         adjacency.float().clamp(0.0, 1.0),
         roles,
     )
-    response_matrix, stiffness_matrix = effective_response(
-        positions, roles, adjacency, config
-    )
+    response_fields = mechanical_response_fields(positions, roles, adjacency, config)
     if geometry_config is None:
         zeros = torch.zeros(
             adjacency.shape[0], device=adjacency.device, dtype=adjacency.dtype
@@ -582,8 +660,11 @@ def mechanical_terms(
             frame_config=config,
         )
     return {
-        "response_matrix": response_matrix,
-        "stiffness_matrix": stiffness_matrix,
+        "response_matrix": response_fields["response_matrix"],
+        "stiffness_matrix": response_fields["stiffness_matrix"],
+        "translations": response_fields["translations"],
+        "nodal_stress": response_fields["nodal_stress"],
+        "yield_stress_penalty": response_fields["yield_stress_penalty"],
         "connectivity_penalty": connectivity_penalty(roles, adjacency),
         "fixed_mobile_connectivity_penalty": fixed_mobile_connectivity_penalty(
             roles,
