@@ -42,8 +42,8 @@ class TrainConfig:
     num_layers: int = 8
     latent_dim: int = 128
     batch_size: int = 64
-    train_steps: int = 2_000
-    learning_rate: float = 1e-4
+    train_steps: int = 4_000
+    learning_rate: float = 1e-5
     rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 0.1
