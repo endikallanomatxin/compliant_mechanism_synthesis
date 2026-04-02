@@ -23,6 +23,7 @@ from compliant_mechanism_synthesis.common import (
     ROLE_FIXED,
     ROLE_FREE,
     ROLE_MOBILE,
+    apply_free_node_update,
 )
 
 
@@ -49,6 +50,24 @@ def test_rollout_noise_preserves_adjacency_symmetry_and_zero_diagonal() -> None:
     assert torch.allclose(
         torch.diagonal(noisy_adjacency, dim1=1, dim2=2), torch.zeros(2, 8)
     )
+
+
+def test_apply_free_node_update_does_not_clamp_free_nodes() -> None:
+    positions = torch.tensor(
+        [[[0.0, 0.0], [1.0, 1.0], [0.0, 1.0], [1.0, 0.0], [0.95, 0.05]]],
+        dtype=torch.float32,
+    )
+    roles = torch.tensor([[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_MOBILE, ROLE_FREE]])
+    delta = torch.tensor(
+        [[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, -1.0]]],
+        dtype=torch.float32,
+    )
+
+    updated = apply_free_node_update(positions, delta, roles, step_size=0.2)
+
+    assert torch.allclose(updated[:, :4], positions[:, :4])
+    assert updated[0, 4, 0] > 1.0
+    assert updated[0, 4, 1] < 0.0
 
 
 def test_monotonic_improvement_loss_penalizes_regressions_only() -> None:

@@ -46,17 +46,12 @@ def logits_to_adjacency(logits: torch.Tensor) -> torch.Tensor:
     return symmetrize_adjacency(torch.sigmoid(logits))
 
 
-def clamp_positions(positions: torch.Tensor) -> torch.Tensor:
-    return positions.clamp(0.0, 1.0)
-
-
 def apply_free_node_update(
     positions: torch.Tensor, delta: torch.Tensor, roles: torch.Tensor, step_size: float
 ) -> torch.Tensor:
     _, _, free = role_masks(roles)
     free_mask = free.unsqueeze(-1).to(dtype=positions.dtype)
-    updated = positions + step_size * delta * free_mask
-    return clamp_positions(updated)
+    return positions + step_size * delta * free_mask
 
 
 def distance_affinity(

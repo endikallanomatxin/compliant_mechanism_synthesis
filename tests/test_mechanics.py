@@ -81,7 +81,7 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["thin_diameter_penalty"].shape == (1,)
     assert terms["thick_diameter_penalty"].shape == (1,)
     assert terms["node_spacing_penalty"].shape == (1,)
-    assert terms["boundary_penalty"].shape == (1,)
+    assert terms["soft_domain_penalty"].shape == (1,)
     assert terms["yield_stress_penalty"].shape == (1,)
 
 
@@ -168,7 +168,7 @@ def test_thin_diameter_penalty_is_zero_for_absent_or_fabricable_bars() -> None:
     assert torch.isclose(fabricable["thin_diameter_penalty"][0], torch.tensor(0.0))
 
 
-def test_geometric_regularization_penalizes_node_clustering_and_boundary_crowding() -> (
+def test_geometric_regularization_penalizes_node_clustering_and_soft_domain_escape() -> (
     None
 ):
     positions = torch.tensor(
@@ -192,12 +192,13 @@ def test_geometric_regularization_penalizes_node_clustering_and_boundary_crowdin
         adjacency,
         GeometryRegularizationConfig(
             min_free_node_spacing=5e-3,
-            boundary_margin=5e-3,
+            soft_domain_min=0.1,
+            soft_domain_max=0.9,
         ),
         frame_config=FrameFEMConfig(workspace_size=0.2, r_max=1e-3),
     )
     assert penalties["node_spacing_penalty"][0] > 0.0
-    assert penalties["boundary_penalty"][0] > 0.0
+    assert penalties["soft_domain_penalty"][0] > 0.0
 
 
 def test_thresholded_connectivity_is_symmetric_and_zero_diagonal() -> None:

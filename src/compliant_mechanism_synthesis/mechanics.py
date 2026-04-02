@@ -34,7 +34,8 @@ class GeometryRegularizationConfig:
     min_diameter: float = 2e-4
     max_diameter: float = 2e-3
     min_free_node_spacing: float = 5e-3
-    boundary_margin: float = 5e-3
+    soft_domain_min: float = 0.1
+    soft_domain_max: float = 0.9
 
 
 def threshold_connectivity(
@@ -598,23 +599,17 @@ def geometric_regularization_terms(
         dim=(1, 2)
     ) / active_pairs.to(dtype=pairwise.dtype).sum(dim=(1, 2)).clamp_min(1.0)
 
-    boundary_violation = torch.stack(
+    soft_domain_violation = torch.stack(
         [
-            (geometry_config.boundary_margin - free_positions[..., 0]).clamp_min(0.0),
-            (
-                free_positions[..., 0]
-                - (frame_config.workspace_size - geometry_config.boundary_margin)
-            ).clamp_min(0.0),
-            (geometry_config.boundary_margin - free_positions[..., 1]).clamp_min(0.0),
-            (
-                free_positions[..., 1]
-                - (frame_config.workspace_size - geometry_config.boundary_margin)
-            ).clamp_min(0.0),
+            (geometry_config.soft_domain_min - positions[..., 0]).clamp_min(0.0),
+            (positions[..., 0] - geometry_config.soft_domain_max).clamp_min(0.0),
+            (geometry_config.soft_domain_min - positions[..., 1]).clamp_min(0.0),
+            (positions[..., 1] - geometry_config.soft_domain_max).clamp_min(0.0),
         ],
         dim=-1,
     )
-    boundary_penalty = (
-        boundary_violation.sum(dim=-1) * free_mask.to(dtype=positions.dtype)
+    soft_domain_penalty = (
+        soft_domain_violation.square().sum(dim=-1) * free_mask.to(dtype=positions.dtype)
     ).sum(dim=1) / free_mask.to(dtype=positions.dtype).sum(dim=1).clamp_min(1.0)
     return {
         "short_beam_penalty": short,
@@ -622,7 +617,7 @@ def geometric_regularization_terms(
         "thin_diameter_penalty": thin,
         "thick_diameter_penalty": thick,
         "node_spacing_penalty": spacing_penalty,
-        "boundary_penalty": boundary_penalty,
+        "soft_domain_penalty": soft_domain_penalty,
     }
 
 
@@ -649,7 +644,7 @@ def mechanical_terms(
             "thin_diameter_penalty": zeros,
             "thick_diameter_penalty": zeros,
             "node_spacing_penalty": zeros,
-            "boundary_penalty": zeros,
+            "soft_domain_penalty": zeros,
         }
     else:
         geometry_terms = geometric_regularization_terms(

@@ -69,14 +69,15 @@ class TrainConfig:
     thin_diameter_weight: float = 0.20
     thick_diameter_weight: float = 0.10
     node_spacing_weight: float = 0.20
-    boundary_weight: float = 0.10
+    soft_domain_weight: float = 10.0
     yield_stress_weight: float = 0.10
     min_beam_length: float = 1e-3
     max_beam_length: float = 3e-2
     min_beam_diameter: float = 2e-4
     max_beam_diameter: float = 4e-3
     min_free_node_spacing: float = 5e-3
-    boundary_margin: float = 5e-3
+    soft_domain_min: float = 0.1
+    soft_domain_max: float = 0.9
     animation_every_steps: int = 1_000
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 100
@@ -396,7 +397,7 @@ def _inject_rollout_noise(
         position_noise = torch.randn_like(positions) * (
             position_noise_scale * time_fraction[:, None, None]
         )
-        positions = (positions + free_mask * position_noise).clamp(0.0, 1.0)
+        positions = positions + free_mask * position_noise
 
     if connectivity_noise_scale > 0.0:
         adjacency_noise = torch.randn_like(adjacency) * (
@@ -428,7 +429,8 @@ def _geometry_regularization_config(
         min_diameter=config.min_beam_diameter,
         max_diameter=config.max_beam_diameter,
         min_free_node_spacing=config.min_free_node_spacing,
-        boundary_margin=config.boundary_margin,
+        soft_domain_min=config.soft_domain_min,
+        soft_domain_max=config.soft_domain_max,
     )
 
 
@@ -726,7 +728,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "thin_diameter": 0.0,
         "thick_diameter": 0.0,
         "node_spacing": 0.0,
-        "boundary": 0.0,
+        "soft_domain": 0.0,
         "yield_stress": 0.0,
     }
     step_weights = _step_weights(config.rollout_steps, device)
@@ -782,7 +784,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         thin_diameter_loss = torch.zeros((), device=device)
         thick_diameter_loss = torch.zeros((), device=device)
         node_spacing_loss = torch.zeros((), device=device)
-        boundary_loss = torch.zeros((), device=device)
+        soft_domain_loss = torch.zeros((), device=device)
         yield_stress_loss = torch.zeros((), device=device)
         step_errors: list[torch.Tensor] = []
         for step_idx, state in enumerate(rollout):
@@ -829,9 +831,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 node_spacing_loss
                 + step_weights[step_idx] * step_terms["node_spacing_penalty"].mean()
             )
-            boundary_loss = (
-                boundary_loss
-                + step_weights[step_idx] * step_terms["boundary_penalty"].mean()
+            soft_domain_loss = (
+                soft_domain_loss
+                + step_weights[step_idx] * step_terms["soft_domain_penalty"].mean()
             )
             yield_stress_loss = (
                 yield_stress_loss
@@ -852,7 +854,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             + config.thin_diameter_weight * thin_diameter_loss
             + config.thick_diameter_weight * thick_diameter_loss
             + config.node_spacing_weight * node_spacing_loss
-            + config.boundary_weight * boundary_loss
+            + config.soft_domain_weight * soft_domain_loss
             + config.yield_stress_weight * yield_stress_loss
         )
 
@@ -948,7 +950,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["thin_diameter"] += thin_diameter_loss.item()
         running_totals["thick_diameter"] += thick_diameter_loss.item()
         running_totals["node_spacing"] += node_spacing_loss.item()
-        running_totals["boundary"] += boundary_loss.item()
+        running_totals["soft_domain"] += soft_domain_loss.item()
         running_totals["yield_stress"] += yield_stress_loss.item()
 
         if config.log_every_steps > 0 and step % config.log_every_steps == 0:
@@ -997,7 +999,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 "train/node_spacing_penalty", node_spacing_loss.item(), global_step
             )
             writer.add_scalar(
-                "train/boundary_penalty", boundary_loss.item(), global_step
+                "train/soft_domain_penalty", soft_domain_loss.item(), global_step
             )
             writer.add_scalar(
                 "train/yield_stress_penalty",
@@ -1075,7 +1077,6 @@ def refine_sample_state(
 
     for _ in range(steps):
         current_positions = positions + free_mask * (position_param - positions)
-        current_positions = current_positions.clamp(0.0, 1.0)
         current_adjacency = enforce_role_adjacency_constraints(
             adjacency_param.clamp(0.0, 1.0),
             roles,
@@ -1103,16 +1104,14 @@ def refine_sample_state(
             + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
             + config.thick_diameter_weight * terms["thick_diameter_penalty"].mean()
             + config.node_spacing_weight * terms["node_spacing_penalty"].mean()
-            + config.boundary_weight * terms["boundary_penalty"].mean()
+            + config.soft_domain_weight * terms["soft_domain_penalty"].mean()
             + config.yield_stress_weight * terms["yield_stress_penalty"].mean()
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-    refined_positions = (
-        (positions + free_mask * (position_param - positions)).detach().clamp(0.0, 1.0)
-    )
+    refined_positions = (positions + free_mask * (position_param - positions)).detach()
     refined_adjacency = enforce_role_adjacency_constraints(
         adjacency_param.detach().clamp(0.0, 1.0),
         roles,
@@ -1226,7 +1225,7 @@ def sample(
         "sample/40_node_spacing_penalty", terms["node_spacing_penalty"][0].item(), 0
     )
     writer.add_scalar(
-        "sample/40_boundary_penalty", terms["boundary_penalty"][0].item(), 0
+        "sample/40_soft_domain_penalty", terms["soft_domain_penalty"][0].item(), 0
     )
     writer.add_scalar(
         "sample/40_yield_stress_penalty",
@@ -1276,7 +1275,7 @@ def sample(
         "thin_diameter_penalty": terms["thin_diameter_penalty"].cpu(),
         "thick_diameter_penalty": terms["thick_diameter_penalty"].cpu(),
         "node_spacing_penalty": terms["node_spacing_penalty"].cpu(),
-        "boundary_penalty": terms["boundary_penalty"].cpu(),
+        "soft_domain_penalty": terms["soft_domain_penalty"].cpu(),
         "yield_stress_penalty": terms["yield_stress_penalty"].cpu(),
         "log_dir": str(log_dir),
     }
@@ -1400,7 +1399,7 @@ def _train_parser() -> argparse.ArgumentParser:
         "--node-spacing-weight", type=float, default=defaults.node_spacing_weight
     )
     parser.add_argument(
-        "--boundary-weight", type=float, default=defaults.boundary_weight
+        "--soft-domain-weight", type=float, default=defaults.soft_domain_weight
     )
     parser.add_argument(
         "--yield-stress-weight",
@@ -1425,7 +1424,10 @@ def _train_parser() -> argparse.ArgumentParser:
         default=defaults.min_free_node_spacing,
     )
     parser.add_argument(
-        "--boundary-margin", type=float, default=defaults.boundary_margin
+        "--soft-domain-min", type=float, default=defaults.soft_domain_min
+    )
+    parser.add_argument(
+        "--soft-domain-max", type=float, default=defaults.soft_domain_max
     )
     parser.add_argument(
         "--animation-every-steps",

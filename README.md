@@ -84,7 +84,8 @@ The loss includes:
 - soft beam-length regularization for bars that are too short or too long
 - soft diameter regularization for bars that are too thin or too thick
 - soft free-node spacing regularization to avoid node collapse
-- soft boundary-margin regularization to avoid crowding against workspace edges
+- soft quadratic domain regularization outside the interior band `[0.1, 0.9]^2`
+  for free nodes
 
 The default geometric regularization thresholds are expressed in physical units:
 
