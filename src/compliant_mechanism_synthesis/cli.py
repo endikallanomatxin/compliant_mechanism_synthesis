@@ -112,6 +112,15 @@ def _resolve_sample_seed(seed_override: int | None) -> int:
     return random.SystemRandom().randrange(0, 2**31)
 
 
+def _load_train_config(config_dict: dict[str, object]) -> TrainConfig:
+    data = dict(config_dict)
+    if "training_goal_blend" in data:
+        blend = float(data.pop("training_goal_blend"))
+        data.setdefault("training_goal_blend_start", blend)
+        data.setdefault("training_goal_blend_end", blend)
+    return TrainConfig(**data)
+
+
 def _timestamped_run_dir(name: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Path("runs") / f"{timestamp}-{name}"
@@ -231,6 +240,10 @@ def _scheduled_goal_blend(
 def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
     weights = torch.linspace(1.0, float(steps), steps=steps, device=device)
     return weights / weights.sum()
+
+
+def _visualization_threshold() -> float:
+    return 0.0
 
 
 def _format_matrix(matrix: torch.Tensor | list[list[float]]) -> str:
@@ -532,12 +545,8 @@ def _log_canonical_evaluation(
         figure = plot_graph_design(
             final_state["positions"][idx],
             roles[idx],
-            threshold_connectivity(
-                final_state["adjacency"][idx : idx + 1],
-                roles[idx : idx + 1],
-                threshold=config.sample_threshold,
-            )[0],
-            threshold=0.05,
+            final_state["adjacency"][idx],
+            threshold=_visualization_threshold(),
             title=name,
         )
         writer.add_figure(f"canonical/00_designs/{name}", figure, global_step=step)
@@ -597,7 +606,7 @@ def _log_canonical_evaluation(
             adjacency[0],
             animation_rollout,
             target_responses[0],
-            threshold=config.sample_threshold,
+            threshold=_visualization_threshold(),
             frame_config=FrameFEMConfig(),
             title=name,
         )
@@ -1036,7 +1045,7 @@ def sample(
 ) -> dict[str, object]:
     device = _device(device_override or "auto")
     payload = torch.load(checkpoint_path, map_location=device)
-    config = TrainConfig(**payload["config"])
+    config = _load_train_config(payload["config"])
     if device_override is not None:
         config.device = device_override
     geometry_config = _geometry_regularization_config(config)
@@ -1089,14 +1098,14 @@ def sample(
         target_normalization,
         config,
     )
-    thresholded_adjacency = threshold_connectivity(
-        refined_adjacency, roles, threshold=sample_threshold
-    )
     terms = mechanical_terms(
         refined_positions,
         roles,
-        thresholded_adjacency,
+        refined_adjacency,
         geometry_config=geometry_config,
+    )
+    thresholded_adjacency = threshold_connectivity(
+        refined_adjacency, roles, threshold=sample_threshold
     )
 
     log_dir = _timestamped_run_dir(name)
@@ -1106,7 +1115,7 @@ def sample(
         refined_positions[0],
         roles[0],
         refined_adjacency[0],
-        threshold=sample_threshold,
+        threshold=_visualization_threshold(),
         title=name,
     )
     writer.add_figure("sample/00_design/final_graph", figure, global_step=0)
@@ -1148,7 +1157,7 @@ def sample(
         adjacency[0],
         animation_rollout,
         target_responses[0],
-        threshold=sample_threshold,
+        threshold=_visualization_threshold(),
         frame_config=FrameFEMConfig(),
         title=name,
         final_positions=refined_positions[0],

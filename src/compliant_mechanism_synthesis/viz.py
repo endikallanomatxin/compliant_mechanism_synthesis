@@ -95,12 +95,14 @@ def _draw_graph(
                 continue
             diameter = 2.0 * frame_config.r_max * activation
             linewidth = (diameter / frame_config.workspace_size) * axis_width_in * 72.0
+            if linewidth <= 0.0 or activation <= 0.0:
+                continue
             ax.plot(
                 [positions[i, 0].item(), positions[j, 0].item()],
                 [positions[i, 1].item(), positions[j, 1].item()],
                 color=edge_color,
-                alpha=min((0.2 + activation) * edge_alpha_scale, 1.0),
-                linewidth=max(linewidth, 0.4),
+                alpha=min(activation * edge_alpha_scale, 1.0),
+                linewidth=linewidth,
                 zorder=1,
             )
 
