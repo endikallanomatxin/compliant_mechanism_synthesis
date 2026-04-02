@@ -772,7 +772,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         monotonic_loss = _monotonic_improvement_loss(step_errors)
 
         final_state = rollout[-1]
-        total = (
+        free_loss = (
             config.property_weight * property_loss
             + config.monotonic_improvement_weight * monotonic_loss
             + config.material_weight * material_loss
@@ -786,10 +786,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             + config.node_spacing_weight * node_spacing_loss
             + config.boundary_weight * boundary_loss
         )
-
-        optimizer.zero_grad(set_to_none=True)
-        total.backward()
-        optimizer.step()
 
         supervised_position_loss = torch.zeros((), device=device)
         supervised_adjacency_loss = torch.zeros((), device=device)
@@ -854,9 +850,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 config.supervised_position_weight * supervised_position_loss
                 + config.supervised_adjacency_weight * supervised_adjacency_loss
             )
-            optimizer.zero_grad(set_to_none=True)
-            supervised_loss.backward()
-            optimizer.step()
+
+        total = free_loss + supervised_loss
+        optimizer.zero_grad(set_to_none=True)
+        total.backward()
+        optimizer.step()
 
         running_totals["total"] += total.item()
         running_totals["property"] += property_loss.item()
