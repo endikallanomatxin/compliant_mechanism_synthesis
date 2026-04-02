@@ -59,21 +59,21 @@ class TrainConfig:
     supervised_position_noise: float = 0.02
     supervised_connectivity_noise: float = 0.08
     supervised_every_steps: int = 1
-    training_goal_blend_start: float = 0.0
+    training_goal_blend_start: float = 0.1
     training_goal_blend_end: float = 1.0
     property_weight: float = 1.0
     monotonic_improvement_weight: float = 0.1
-    material_weight: float = 0.02
-    sparsity_weight: float = 0.05
-    connectivity_weight: float = 0.1
-    fixed_mobile_connectivity_weight: float = 0.5
-    short_beam_weight: float = 0.25
-    long_beam_weight: float = 0.5
+    material_weight: float = 0.01
+    sparsity_weight: float = 0.03
+    connectivity_weight: float = 0.08
+    fixed_mobile_connectivity_weight: float = 0.4
+    short_beam_weight: float = 0.15
+    long_beam_weight: float = 0.3
     thin_diameter_weight: float = 0.05
     thick_diameter_weight: float = 0.05
     node_spacing_weight: float = 0.1
-    spread_weight: float = 0.05
-    soft_domain_weight: float = 20.0
+    spread_weight: float = 0.12
+    soft_domain_weight: float = 30.0
     yield_stress_weight: float = 0.05
     min_beam_length: float = 5e-3
     max_beam_length: float = 3e-2
@@ -167,27 +167,27 @@ def _fixed_stiffness_target_specs(
     specs = [
         (
             "01_flex_x",
-            [4.2, 0.0, 0.0, 6.7, 0.0, 2.8],
+            [6.3, 0.0, 0.0, 10.1, 0.0, 4.2],
         ),
         (
             "02_flex_y",
-            [6.7, 0.0, 0.0, 4.2, 0.0, 2.8],
+            [10.1, 0.0, 0.0, 6.3, 0.0, 4.2],
         ),
         (
             "03_flex_theta",
-            [6.1, 0.0, 0.0, 6.1, 0.0, 2.1],
+            [9.2, 0.0, 0.0, 9.2, 0.0, 3.2],
         ),
         (
             "04_balanced",
-            [5.2, 0.0, 0.0, 5.2, 0.0, 3.0],
+            [7.8, 0.0, 0.0, 7.8, 0.0, 4.5],
         ),
         (
             "05_couple_xy_pos",
-            [5.9, 0.6, -0.3, 4.6, 0.2, 2.9],
+            [8.9, 0.9, -0.45, 6.9, 0.3, 4.4],
         ),
         (
             "06_couple_xy_neg",
-            [4.6, -0.6, 0.3, 5.9, -0.2, 2.9],
+            [6.9, -0.9, 0.45, 8.9, -0.3, 4.4],
         ),
     ]
     return [
