@@ -72,8 +72,8 @@ class TrainConfig:
     thin_diameter_weight: float = 0.20
     thick_diameter_weight: float = 0.10
     node_spacing_weight: float = 0.20
-    spread_weight: float = 0.5
-    soft_domain_weight: float = 10.0
+    spread_weight: float = 0.15
+    soft_domain_weight: float = 40.0
     yield_stress_weight: float = 0.10
     min_beam_length: float = 5e-3
     max_beam_length: float = 3e-2

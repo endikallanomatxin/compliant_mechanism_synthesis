@@ -644,13 +644,14 @@ def geometric_regularization_terms(
     )
 
     centered_positions = center_positions(positions)
-    centered_free_positions = centered_positions * free_mask.unsqueeze(-1).to(
+    bounded_centered_positions = centered_positions.clamp(-1.0, 1.0)
+    centered_free_positions = bounded_centered_positions * free_mask.unsqueeze(-1).to(
         dtype=positions.dtype
     )
     free_count = free_mask.to(dtype=positions.dtype).sum(dim=1).clamp_min(1.0)
     free_centroid = centered_free_positions.sum(dim=1) / free_count.unsqueeze(-1)
     centered_free_offsets = (
-        centered_positions - free_centroid.unsqueeze(1)
+        bounded_centered_positions - free_centroid.unsqueeze(1)
     ) * free_mask.unsqueeze(-1).to(dtype=positions.dtype)
     centered_free_variance = centered_free_offsets.square().sum(dim=1) / free_count.unsqueeze(-1)
     min_variance = geometry_config.min_centered_free_std**2

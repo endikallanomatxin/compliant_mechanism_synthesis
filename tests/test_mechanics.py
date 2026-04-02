@@ -232,6 +232,49 @@ def test_geometric_regularization_penalizes_insufficient_free_node_spread() -> N
     assert penalties["spread_penalty"][0] > 0.0
 
 
+def test_soft_domain_penalty_detects_far_escaped_free_nodes() -> None:
+    roles = torch.tensor([[0, 0, 1, 1, 2, 2, 2]], dtype=torch.long)
+    adjacency = torch.zeros((1, 7, 7), dtype=torch.float32)
+
+    inside_cluster = torch.tensor(
+        [
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [0.48, 0.49],
+                [0.50, 0.50],
+                [0.52, 0.51],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    escaped_cluster = torch.tensor(
+        [
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [-2.0, -2.0],
+                [0.50, 0.50],
+                [3.0, 3.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    escaped_penalties = geometric_regularization_terms(
+        escaped_cluster,
+        roles,
+        adjacency,
+        GeometryRegularizationConfig(min_free_node_spacing=1e-3),
+    )
+
+    assert escaped_penalties["soft_domain_penalty"][0] > 0.0
+
+
 def test_thresholded_connectivity_is_symmetric_and_zero_diagonal() -> None:
     positions, roles, adjacency = generate_graph_sample(10)
     thresholded = threshold_connectivity(
