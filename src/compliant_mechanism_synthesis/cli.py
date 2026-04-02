@@ -446,11 +446,12 @@ def rollout_refinement(
         position_noise_levels = position_noise_scale * timestep
         connectivity_noise_levels = connectivity_noise_scale * timestep
         if current_stiffness is None:
-            current_stiffness = mechanical_terms(
-                current_positions,
-                roles,
-                current_adjacency,
-            )["stiffness_matrix"]
+            with torch.no_grad():
+                current_stiffness = mechanical_terms(
+                    current_positions,
+                    roles,
+                    current_adjacency,
+                )["stiffness_matrix"]
         target_features, current_features, residual_features = (
             _mechanics_condition_matrices(
                 target_stiffness,
@@ -508,7 +509,7 @@ def rollout_refinement(
                 geometry_config=geometry_config,
             )
             state["terms"] = step_terms
-            current_stiffness = step_terms["stiffness_matrix"]
+            current_stiffness = step_terms["stiffness_matrix"].detach()
         else:
             current_stiffness = None
         states.append(state)
@@ -694,7 +695,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             seed=current_seed,
         )
         goal_targets = _sample_stiffness_targets(config.batch_size, device)
-        start_terms = mechanical_terms(positions, roles, adjacency)
+        with torch.no_grad():
+            start_terms = mechanical_terms(positions, roles, adjacency)
         goal_blend = _scheduled_goal_blend(
             step,
             train_steps,
@@ -818,7 +820,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 position_noise_scale=config.supervised_position_noise,
                 connectivity_noise_scale=config.supervised_connectivity_noise,
             )
-            noisy_terms = mechanical_terms(noisy_positions, roles, noisy_adjacency)
+            with torch.no_grad():
+                noisy_terms = mechanical_terms(noisy_positions, roles, noisy_adjacency)
             target_features, current_features, residual_features = (
                 _mechanics_condition_matrices(
                     raw_targets,
