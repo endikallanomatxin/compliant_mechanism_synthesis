@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from compliant_mechanism_synthesis.cli import (
+    _blend_training_targets,
     _fixed_stiffness_target_specs,
     _inject_rollout_noise,
     _mechanics_condition_matrices,
@@ -163,6 +164,30 @@ def test_mechanics_condition_residual_matches_difference() -> None:
 
     assert residual.shape == targets.shape
     assert torch.allclose(residual, expected, atol=1e-6)
+
+
+def test_blend_training_targets_interpolates_start_and_goal() -> None:
+    start = torch.eye(3).unsqueeze(0)
+    goal = 3.0 * torch.eye(3).unsqueeze(0)
+
+    blended = _blend_training_targets(start, goal, goal_blend=0.5)
+
+    assert torch.allclose(blended, 2.0 * torch.eye(3).unsqueeze(0))
+
+
+def test_blend_training_targets_preserves_positive_definiteness() -> None:
+    specs = torch.stack(
+        [
+            matrix
+            for _, matrix in _fixed_stiffness_target_specs(torch.device("cpu"))[:2]
+        ],
+        dim=0,
+    )
+    start = 0.5 * specs
+    blended = _blend_training_targets(start, specs, goal_blend=0.5)
+    eigenvalues = torch.linalg.eigvalsh(blended)
+
+    assert torch.all(eigenvalues > 0.0)
 
 
 def test_pure_noise_batch_is_reproducible_with_explicit_seed() -> None:

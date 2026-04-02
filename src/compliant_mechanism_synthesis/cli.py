@@ -55,6 +55,7 @@ class TrainConfig:
     supervised_position_noise: float = 0.02
     supervised_connectivity_noise: float = 0.08
     supervised_every_steps: int = 1
+    training_goal_blend: float = 0.5
     property_weight: float = 2.0
     monotonic_improvement_weight: float = 0.25
     material_weight: float = 1e4
@@ -202,6 +203,15 @@ def _target_normalization(targets: torch.Tensor) -> dict[str, list[float]]:
     std = features.var(dim=0, unbiased=False).clamp_min(1e-12).sqrt()
     std = torch.maximum(std, features.new_tensor([1e-5, 1e-5, 2e-6, 1e-5, 2e-6, 2e-6]))
     return {"mean": mean.tolist(), "std": std.tolist()}
+
+
+def _blend_training_targets(
+    start_stiffness: torch.Tensor,
+    goal_stiffness: torch.Tensor,
+    goal_blend: float,
+) -> torch.Tensor:
+    blend = float(min(max(goal_blend, 0.0), 1.0))
+    return (1.0 - blend) * start_stiffness + blend * goal_stiffness
 
 
 def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
@@ -641,7 +651,13 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             device,
             seed=current_seed,
         )
-        raw_targets = _sample_stiffness_targets(config.batch_size, device)
+        goal_targets = _sample_stiffness_targets(config.batch_size, device)
+        start_terms = mechanical_terms(positions, roles, adjacency)
+        raw_targets = _blend_training_targets(
+            start_terms["stiffness_matrix"],
+            goal_targets,
+            goal_blend=config.training_goal_blend,
+        )
         base_time = torch.rand((positions.shape[0],), device=device)
 
         rollout = rollout_refinement(
@@ -1211,6 +1227,11 @@ def _train_parser() -> argparse.ArgumentParser:
         "--supervised-every-steps",
         type=int,
         default=defaults.supervised_every_steps,
+    )
+    parser.add_argument(
+        "--training-goal-blend",
+        type=float,
+        default=defaults.training_goal_blend,
     )
     parser.add_argument(
         "--property-weight", type=float, default=defaults.property_weight
