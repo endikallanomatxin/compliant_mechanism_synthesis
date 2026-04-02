@@ -62,19 +62,19 @@ class TrainConfig:
     training_goal_blend_start: float = 0.0
     training_goal_blend_end: float = 1.0
     property_weight: float = 1.0
-    monotonic_improvement_weight: float = 0.25
-    material_weight: float = 0.1
-    sparsity_weight: float = 0.2
-    connectivity_weight: float = 0.25
-    fixed_mobile_connectivity_weight: float = 2.0
-    short_beam_weight: float = 1.0
-    long_beam_weight: float = 2.0
-    thin_diameter_weight: float = 0.20
-    thick_diameter_weight: float = 0.10
-    node_spacing_weight: float = 0.20
-    spread_weight: float = 0.15
-    soft_domain_weight: float = 40.0
-    yield_stress_weight: float = 0.10
+    monotonic_improvement_weight: float = 0.1
+    material_weight: float = 0.02
+    sparsity_weight: float = 0.05
+    connectivity_weight: float = 0.1
+    fixed_mobile_connectivity_weight: float = 0.5
+    short_beam_weight: float = 0.25
+    long_beam_weight: float = 0.5
+    thin_diameter_weight: float = 0.05
+    thick_diameter_weight: float = 0.05
+    node_spacing_weight: float = 0.1
+    spread_weight: float = 0.05
+    soft_domain_weight: float = 20.0
+    yield_stress_weight: float = 0.05
     min_beam_length: float = 5e-3
     max_beam_length: float = 3e-2
     min_beam_diameter: float = 2e-4
@@ -562,6 +562,7 @@ def _log_canonical_evaluation(
         base_time=base_time,
         position_noise_scale=0.0,
         connectivity_noise_scale=0.0,
+        geometry_config=geometry_config,
     )
     final_state = rollout[-1]
     final_terms = mechanical_terms(
@@ -1137,6 +1138,7 @@ def sample(
             base_time=base_time,
             position_noise_scale=0.0,
             connectivity_noise_scale=0.0,
+            geometry_config=geometry_config,
         )
     final_state = rollout[-1]
     refined_positions, refined_adjacency = refine_sample_state(
