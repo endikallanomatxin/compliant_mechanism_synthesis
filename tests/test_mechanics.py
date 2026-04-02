@@ -87,6 +87,7 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["thin_diameter_penalty"].shape == (1,)
     assert terms["thick_diameter_penalty"].shape == (1,)
     assert terms["node_spacing_penalty"].shape == (1,)
+    assert terms["free_repulsion_penalty"].shape == (1,)
     assert terms["rigid_attachment_penalty"].shape == (1,)
     assert terms["centroid_penalty"].shape == (1,)
     assert terms["spread_penalty"].shape == (1,)
@@ -203,6 +204,7 @@ def test_geometric_regularization_penalizes_node_clustering_and_soft_domain_esca
         frame_config=FrameFEMConfig(workspace_size=0.2, r_max=1e-3),
     )
     assert penalties["node_spacing_penalty"][0] > 0.0
+    assert penalties["free_repulsion_penalty"][0] > 0.0
     assert penalties["spread_penalty"][0] > 0.0
     assert penalties["soft_domain_penalty"][0] > 0.0
 
@@ -233,6 +235,35 @@ def test_geometric_regularization_penalizes_insufficient_free_node_spread() -> N
     )
 
     assert penalties["spread_penalty"][0] > 0.0
+
+
+def test_geometric_regularization_penalizes_dense_free_clusters_before_overlap() -> None:
+    positions = torch.tensor(
+        [
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [0.45, 0.50],
+                [0.48, 0.50],
+                [0.51, 0.50],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    roles = torch.tensor([[0, 0, 1, 1, 2, 2, 2]], dtype=torch.long)
+    adjacency = torch.zeros((1, 7, 7), dtype=torch.float32)
+
+    penalties = geometric_regularization_terms(
+        positions,
+        roles,
+        adjacency,
+        GeometryRegularizationConfig(min_free_node_spacing=5e-3),
+    )
+
+    assert penalties["node_spacing_penalty"][0] == 0.0
+    assert penalties["free_repulsion_penalty"][0] > 0.0
 
 
 def test_geometric_regularization_penalizes_free_node_centroid_drift() -> None:

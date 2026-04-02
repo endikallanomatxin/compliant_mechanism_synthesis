@@ -59,7 +59,7 @@ class TrainConfig:
     supervised_position_noise: float = 0.02
     supervised_connectivity_noise: float = 0.08
     supervised_every_steps: int = 1
-    training_goal_blend_start: float = 0.08
+    training_goal_blend_start: float = 0.2
     training_goal_blend_end: float = 1.0
     property_weight: float = 1.0
     monotonic_improvement_weight: float = 0.1
@@ -71,7 +71,8 @@ class TrainConfig:
     long_beam_weight: float = 0.3
     thin_diameter_weight: float = 0.05
     thick_diameter_weight: float = 0.05
-    node_spacing_weight: float = 0.3
+    node_spacing_weight: float = 0.4
+    free_repulsion_weight: float = 0.4
     rigid_attachment_weight: float = 0.5
     centroid_weight: float = 0.2
     spread_weight: float = 0.12
@@ -677,6 +678,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "thin_diameter": 0.0,
         "thick_diameter": 0.0,
         "node_spacing": 0.0,
+        "free_repulsion": 0.0,
         "rigid_attachment": 0.0,
         "centroid": 0.0,
         "spread": 0.0,
@@ -735,6 +737,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         thin_diameter_loss = torch.zeros((), device=device)
         thick_diameter_loss = torch.zeros((), device=device)
         node_spacing_loss = torch.zeros((), device=device)
+        free_repulsion_loss = torch.zeros((), device=device)
         rigid_attachment_loss = torch.zeros((), device=device)
         centroid_loss = torch.zeros((), device=device)
         spread_loss = torch.zeros((), device=device)
@@ -785,6 +788,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 node_spacing_loss
                 + step_weights[step_idx] * step_terms["node_spacing_penalty"].mean()
             )
+            free_repulsion_loss = (
+                free_repulsion_loss
+                + step_weights[step_idx] * step_terms["free_repulsion_penalty"].mean()
+            )
             rigid_attachment_loss = (
                 rigid_attachment_loss
                 + step_weights[step_idx]
@@ -821,6 +828,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             + config.thin_diameter_weight * thin_diameter_loss
             + config.thick_diameter_weight * thick_diameter_loss
             + config.node_spacing_weight * node_spacing_loss
+            + config.free_repulsion_weight * free_repulsion_loss
             + config.rigid_attachment_weight * rigid_attachment_loss
             + config.centroid_weight * centroid_loss
             + config.spread_weight * spread_loss
@@ -919,6 +927,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["thin_diameter"] += thin_diameter_loss.item()
         running_totals["thick_diameter"] += thick_diameter_loss.item()
         running_totals["node_spacing"] += node_spacing_loss.item()
+        running_totals["free_repulsion"] += free_repulsion_loss.item()
         running_totals["rigid_attachment"] += rigid_attachment_loss.item()
         running_totals["centroid"] += centroid_loss.item()
         running_totals["spread"] += spread_loss.item()
@@ -969,6 +978,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             writer.add_scalar(
                 "train/node_spacing_penalty", node_spacing_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/free_repulsion_penalty",
+                free_repulsion_loss.item(),
+                global_step,
             )
             writer.add_scalar(
                 "train/rigid_attachment_penalty",
@@ -1083,6 +1097,7 @@ def refine_sample_state(
             + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
             + config.thick_diameter_weight * terms["thick_diameter_penalty"].mean()
             + config.node_spacing_weight * terms["node_spacing_penalty"].mean()
+            + config.free_repulsion_weight * terms["free_repulsion_penalty"].mean()
             + config.rigid_attachment_weight
             * terms["rigid_attachment_penalty"].mean()
             + config.centroid_weight * terms["centroid_penalty"].mean()
@@ -1206,6 +1221,11 @@ def sample(
         "sample/40_node_spacing_penalty", terms["node_spacing_penalty"][0].item(), 0
     )
     writer.add_scalar(
+        "sample/40_free_repulsion_penalty",
+        terms["free_repulsion_penalty"][0].item(),
+        0,
+    )
+    writer.add_scalar(
         "sample/40_rigid_attachment_penalty",
         terms["rigid_attachment_penalty"][0].item(),
         0,
@@ -1265,6 +1285,7 @@ def sample(
         "thin_diameter_penalty": terms["thin_diameter_penalty"].cpu(),
         "thick_diameter_penalty": terms["thick_diameter_penalty"].cpu(),
         "node_spacing_penalty": terms["node_spacing_penalty"].cpu(),
+        "free_repulsion_penalty": terms["free_repulsion_penalty"].cpu(),
         "rigid_attachment_penalty": terms["rigid_attachment_penalty"].cpu(),
         "centroid_penalty": terms["centroid_penalty"].cpu(),
         "spread_penalty": terms["spread_penalty"].cpu(),
@@ -1390,6 +1411,11 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--node-spacing-weight", type=float, default=defaults.node_spacing_weight
+    )
+    parser.add_argument(
+        "--free-repulsion-weight",
+        type=float,
+        default=defaults.free_repulsion_weight,
     )
     parser.add_argument(
         "--rigid-attachment-weight",

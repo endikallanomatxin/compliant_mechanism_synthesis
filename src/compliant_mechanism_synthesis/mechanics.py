@@ -43,6 +43,7 @@ class GeometryRegularizationConfig:
     min_diameter: float = 2e-4
     max_diameter: float = 2e-3
     min_free_node_spacing: float = 5e-3
+    preferred_free_node_spacing_factor: float = 3.0
     min_centered_free_std: float = 0.22
     min_rigid_attachment_activation: float = 0.30
 
@@ -667,6 +668,19 @@ def geometric_regularization_terms(
         active_pairs.to(dtype=pairwise.dtype).sum(dim=(1, 2)).clamp_min(1.0)
         * scales.length
     )
+    preferred_spacing = (
+        geometry_config.preferred_free_node_spacing_factor
+        * geometry_config.min_free_node_spacing
+    )
+    repulsion_violation = (preferred_spacing - pairwise).clamp_min(0.0) / max(
+        preferred_spacing,
+        1e-8,
+    )
+    free_repulsion_penalty = (
+        repulsion_violation.square() * active_pairs.to(dtype=pairwise.dtype)
+    ).sum(dim=(1, 2)) / active_pairs.to(dtype=pairwise.dtype).sum(dim=(1, 2)).clamp_min(
+        1.0
+    )
 
     centered_positions = center_positions(positions)
     bounded_centered_positions = centered_positions.clamp(-1.0, 1.0)
@@ -694,6 +708,7 @@ def geometric_regularization_terms(
         "thin_diameter_penalty": thin,
         "thick_diameter_penalty": thick,
         "node_spacing_penalty": spacing_penalty,
+        "free_repulsion_penalty": free_repulsion_penalty,
         "centroid_penalty": centroid_penalty,
         "spread_penalty": spread_penalty,
         "soft_domain_penalty": soft_domain_penalty,
@@ -728,6 +743,7 @@ def mechanical_terms(
             "thin_diameter_penalty": zeros,
             "thick_diameter_penalty": zeros,
             "node_spacing_penalty": zeros,
+            "free_repulsion_penalty": zeros,
             "centroid_penalty": zeros,
             "spread_penalty": zeros,
             "soft_domain_penalty": zeros,
