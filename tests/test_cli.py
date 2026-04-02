@@ -9,7 +9,6 @@ from compliant_mechanism_synthesis.cli import (
     _mechanics_condition_matrices,
     _matrix_loss,
     _monotonic_improvement_loss,
-    _normalize_residual_matrix,
     _pure_noise_batch,
     _resolve_sample_seed,
     _sample_stiffness_targets,
@@ -17,7 +16,6 @@ from compliant_mechanism_synthesis.cli import (
     _stiffness_to_response,
     _supervised_reconstruction_losses,
     _sample_supervised_denoising_batch,
-    _target_normalization,
 )
 from compliant_mechanism_synthesis.common import (
     ROLE_FIXED,
@@ -25,6 +23,8 @@ from compliant_mechanism_synthesis.common import (
     ROLE_MOBILE,
     apply_free_node_update,
 )
+from compliant_mechanism_synthesis.mechanics import characteristic_scales, FrameFEMConfig
+from compliant_mechanism_synthesis.scaling import normalize_generalized_stiffness_matrix
 
 
 def test_rollout_noise_preserves_adjacency_symmetry_and_zero_diagonal() -> None:
@@ -104,13 +104,12 @@ def test_stiffness_target_sampling_draws_from_fixed_library() -> None:
     )
 
 
-def test_matrix_loss_is_zero_for_exact_match_under_target_normalization() -> None:
+def test_matrix_loss_is_zero_for_exact_match_under_characteristic_scaling() -> None:
     specs = torch.stack(
         [matrix for _, matrix in _fixed_stiffness_target_specs(torch.device("cpu"))],
         dim=0,
     )
-    normalization = _target_normalization(specs)
-    loss = _matrix_loss(specs[:1], specs[:1], normalization)
+    loss = _matrix_loss(specs[:1], specs[:1])
 
     assert torch.isclose(loss, torch.tensor(0.0))
 
@@ -178,9 +177,11 @@ def test_mechanics_condition_residual_matches_difference() -> None:
         dim=0,
     )
     current = 0.5 * targets
-    normalization = _target_normalization(targets)
-    _, _, residual = _mechanics_condition_matrices(targets, current, normalization)
-    expected = _normalize_residual_matrix(targets - current, normalization)
+    _, _, residual = _mechanics_condition_matrices(targets, current)
+    expected = normalize_generalized_stiffness_matrix(
+        targets - current,
+        characteristic_scales(FrameFEMConfig()),
+    )
 
     assert residual.shape == targets.shape
     assert torch.allclose(residual, expected, atol=1e-6)

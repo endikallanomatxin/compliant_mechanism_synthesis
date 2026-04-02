@@ -14,6 +14,7 @@ from compliant_mechanism_synthesis.common import (
     symmetric_matrix_unique_values,
     symmetrize_adjacency,
 )
+from compliant_mechanism_synthesis.scaling import center_positions
 
 
 def sinusoidal_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
@@ -169,8 +170,9 @@ class GraphRefinementModel(nn.Module):
         position_noise_levels: torch.Tensor,
         connectivity_noise_levels: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        centered_positions = center_positions(positions)
         hidden = self.position_mlp(
-            torch.cat([positions, nodal_mechanics], dim=-1)
+            torch.cat([centered_positions, nodal_mechanics], dim=-1)
         ) + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
         mechanics_features = torch.cat(

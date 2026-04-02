@@ -18,6 +18,9 @@ By default, the preferred fabricable beam diameters span `0.2 mm` to `2.0 mm`,
 while the internal representation can explore somewhat thicker bars and penalize
 them back down.
 
+For model-facing features, positions are re-centered to a symmetric domain
+`[-1, 1] x [-1, 1]`, where `0` is the workspace center.
+
 ## Mechanics
 
 The mechanics module uses a differentiable 2D Euler-Bernoulli frame FEM in
@@ -55,16 +58,27 @@ Connectivity updates are produced only from dot products between these latent
 vectors.
 
 The mechanics module reports both the raw mobile-body response matrix and the
-derived effective stiffness matrix. The training loop normalizes the response
-matrix internally only for model conditioning and loss scaling.
+derived effective stiffness matrix.
+
+The FEM stays in SI units internally. The learning code uses an explicit
+adimensionalization layer built from characteristic scales:
+
+- characteristic length `L_c = 0.5 * workspace_size = 0.1 m`
+- characteristic force `F_c = E * pi * r_max^2`
+- characteristic moment `M_c = F_c * L_c`
+- characteristic stress `sigma_c = yield_stress`
+
+Generalized stiffness, generalized response, nodal translations, nodal stresses,
+and material usage are normalized through these scales before they are fed to
+the model or used in the main mechanical loss terms.
 
 ## Training Loop
 
 For each batch:
 
 - sample an initial graph state from pure noise
-- sample a target response matrix from the empirical distribution of previously
-  simulated responses
+- sample a target generalized stiffness matrix from a fixed normalized target
+  library and map it back to SI for evaluation
 - refine the noisy graph over several learned rollout steps
 - inject additional Gaussian noise into positions and connectivity at each
   rollout step during training
@@ -84,8 +98,8 @@ The loss includes:
 - soft beam-length regularization for bars that are too short or too long
 - soft diameter regularization for bars that are too thin or too thick
 - soft free-node spacing regularization to avoid node collapse
-- soft quadratic domain regularization outside the interior band `[0.1, 0.9]^2`
-  for free nodes
+- soft quadratic domain regularization outside the true workspace bounds for
+  free nodes
 
 The default geometric regularization thresholds are expressed in physical units:
 
@@ -120,6 +134,7 @@ The default training configuration uses:
 - iterative rollout refinement
 - pure-noise initial states with no reference-design reconstruction loss
 - canonical TensorBoard evaluations during training
+- explicit SI-to-model characteristic scaling for mechanics features and losses
 - configurable geometric regularization thresholds and weights for beam length
   and diameter
 

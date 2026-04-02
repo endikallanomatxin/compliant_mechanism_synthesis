@@ -16,6 +16,15 @@ from compliant_mechanism_synthesis.common import (
     role_masks,
     symmetrize_adjacency,
 )
+from compliant_mechanism_synthesis.scaling import (
+    CharacteristicScales,
+    center_positions,
+    normalize_generalized_response_matrix,
+    normalize_generalized_stiffness_matrix,
+    normalize_material,
+    normalize_stress,
+    normalize_translations,
+)
 
 
 @dataclass(frozen=True)
@@ -34,8 +43,22 @@ class GeometryRegularizationConfig:
     min_diameter: float = 2e-4
     max_diameter: float = 2e-3
     min_free_node_spacing: float = 5e-3
-    soft_domain_min: float = 0.1
-    soft_domain_max: float = 0.9
+
+
+def characteristic_scales(
+    config: FrameFEMConfig | None = None,
+) -> CharacteristicScales:
+    config = config or FrameFEMConfig()
+    area_scale = math.pi * config.r_max**2
+    length_scale = 0.5 * config.workspace_size
+    force_scale = config.young_modulus * area_scale
+    return CharacteristicScales(
+        length=length_scale,
+        force=force_scale,
+        moment=force_scale * length_scale,
+        stress=config.yield_stress,
+        material=area_scale * length_scale,
+    )
 
 
 def threshold_connectivity(
@@ -398,6 +421,7 @@ def mechanical_response_fields(
     config: FrameFEMConfig | None = None,
 ) -> dict[str, torch.Tensor]:
     config = config or FrameFEMConfig()
+    scales = characteristic_scales(config)
     stabilized, transforms, reduced_displacements = _solve_load_cases(
         positions,
         roles,
@@ -423,11 +447,25 @@ def mechanical_response_fields(
         reduced_displacements,
         config,
     )
+    normalized_response_matrix = normalize_generalized_response_matrix(
+        response_matrix,
+        scales,
+    )
+    normalized_stiffness_matrix = normalize_generalized_stiffness_matrix(
+        stiffness_matrix,
+        scales,
+    )
+    normalized_translations = normalize_translations(translations, scales)
+    normalized_nodal_stress = normalize_stress(nodal_stress, scales)
     return {
         "response_matrix": response_matrix,
         "stiffness_matrix": stiffness_matrix,
         "translations": translations,
         "nodal_stress": nodal_stress,
+        "normalized_response_matrix": normalized_response_matrix,
+        "normalized_stiffness_matrix": normalized_stiffness_matrix,
+        "normalized_translations": normalized_translations,
+        "normalized_nodal_stress": normalized_nodal_stress,
         "yield_stress_penalty": yield_penalty,
     }
 
@@ -555,6 +593,7 @@ def geometric_regularization_terms(
     frame_config: FrameFEMConfig | None = None,
 ) -> dict[str, torch.Tensor]:
     frame_config = frame_config or FrameFEMConfig()
+    scales = characteristic_scales(frame_config)
     adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
     physical_positions = _physical_positions(positions, frame_config)
     edge_i, edge_j = _cached_edge_index_pairs(positions.shape[1])
@@ -566,20 +605,21 @@ def geometric_regularization_terms(
         physical_positions[:, edge_j] - physical_positions[:, edge_i], dim=-1
     ).clamp_min(1e-4)
     diameters = 2.0 * frame_config.r_max * activations
+    diameter_scale = 2.0 * frame_config.r_max
     normalizer = activations.sum(dim=1).clamp_min(1e-6)
 
     short = (activations * (geometry_config.min_length - lengths).clamp_min(0.0)).sum(
         dim=1
-    ) / normalizer
+    ) / (normalizer * scales.length)
     long = (activations * (lengths - geometry_config.max_length).clamp_min(0.0)).sum(
         dim=1
-    ) / normalizer
+    ) / (normalizer * scales.length)
     normalized_diameter = (diameters / geometry_config.min_diameter).clamp(0.0, 1.0)
     thin_profile = normalized_diameter * (1.0 - normalized_diameter)
     thin = thin_profile.sum(dim=1) / normalizer
     thick = ((diameters - geometry_config.max_diameter).clamp_min(0.0).square()).sum(
         dim=1
-    ) / normalizer
+    ) / (normalizer * diameter_scale**2)
 
     free_mask = roles == ROLE_FREE
     free_positions = physical_positions
@@ -597,17 +637,13 @@ def geometric_regularization_terms(
     )
     spacing_penalty = (spacing_violation * active_pairs.to(dtype=pairwise.dtype)).sum(
         dim=(1, 2)
-    ) / active_pairs.to(dtype=pairwise.dtype).sum(dim=(1, 2)).clamp_min(1.0)
-
-    soft_domain_violation = torch.stack(
-        [
-            (geometry_config.soft_domain_min - positions[..., 0]).clamp_min(0.0),
-            (positions[..., 0] - geometry_config.soft_domain_max).clamp_min(0.0),
-            (geometry_config.soft_domain_min - positions[..., 1]).clamp_min(0.0),
-            (positions[..., 1] - geometry_config.soft_domain_max).clamp_min(0.0),
-        ],
-        dim=-1,
+    ) / (
+        active_pairs.to(dtype=pairwise.dtype).sum(dim=(1, 2)).clamp_min(1.0)
+        * scales.length
     )
+
+    centered_positions = center_positions(positions)
+    soft_domain_violation = (centered_positions.abs() - 1.0).clamp_min(0.0)
     soft_domain_penalty = (
         soft_domain_violation.square().sum(dim=-1) * free_mask.to(dtype=positions.dtype)
     ).sum(dim=1) / free_mask.to(dtype=positions.dtype).sum(dim=1).clamp_min(1.0)
@@ -659,6 +695,10 @@ def mechanical_terms(
         "stiffness_matrix": response_fields["stiffness_matrix"],
         "translations": response_fields["translations"],
         "nodal_stress": response_fields["nodal_stress"],
+        "normalized_response_matrix": response_fields["normalized_response_matrix"],
+        "normalized_stiffness_matrix": response_fields["normalized_stiffness_matrix"],
+        "normalized_translations": response_fields["normalized_translations"],
+        "normalized_nodal_stress": response_fields["normalized_nodal_stress"],
         "yield_stress_penalty": response_fields["yield_stress_penalty"],
         "connectivity_penalty": connectivity_penalty(roles, adjacency),
         "fixed_mobile_connectivity_penalty": fixed_mobile_connectivity_penalty(
@@ -667,6 +707,10 @@ def mechanical_terms(
         ),
         "sparsity": connectivity_sparsity(adjacency),
         "material": beam_material(positions, adjacency, config),
+        "normalized_material": normalize_material(
+            beam_material(positions, adjacency, config),
+            characteristic_scales(config),
+        ),
         **geometry_terms,
     }
 

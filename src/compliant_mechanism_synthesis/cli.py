@@ -15,20 +15,23 @@ from compliant_mechanism_synthesis.common import (
     enforce_role_adjacency_constraints,
     ROLE_FREE,
     apply_free_node_update,
-    symmetric_matrix_unique_values,
-    symmetrize_adjacency,
     unique_values_to_symmetric_matrix,
 )
 from compliant_mechanism_synthesis.data import generate_noise_sample
 from compliant_mechanism_synthesis.mechanics import (
     FrameFEMConfig,
     GeometryRegularizationConfig,
+    characteristic_scales,
     mechanical_terms,
     mechanical_response_fields,
     refine_connectivity,
     threshold_connectivity,
 )
 from compliant_mechanism_synthesis.model import GraphRefinementModel
+from compliant_mechanism_synthesis.scaling import (
+    denormalize_generalized_stiffness_matrix,
+    normalize_generalized_stiffness_matrix,
+)
 from compliant_mechanism_synthesis.viz import (
     export_rollout_animation,
     plot_graph_design,
@@ -60,7 +63,7 @@ class TrainConfig:
     training_goal_blend_end: float = 1.0
     property_weight: float = 1.0
     monotonic_improvement_weight: float = 0.25
-    material_weight: float = 1e4
+    material_weight: float = 0.1
     sparsity_weight: float = 0.5
     connectivity_weight: float = 0.25
     fixed_mobile_connectivity_weight: float = 2.0
@@ -76,8 +79,6 @@ class TrainConfig:
     min_beam_diameter: float = 2e-4
     max_beam_diameter: float = 3e-3
     min_free_node_spacing: float = 6e-3
-    soft_domain_min: float = 0.1
-    soft_domain_max: float = 0.9
     animation_every_steps: int = 1_000
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 100
@@ -161,42 +162,42 @@ def _pure_noise_batch(
 def _fixed_stiffness_target_specs(
     device: torch.device,
 ) -> list[tuple[str, torch.Tensor]]:
-    stiffness_scale = FrameFEMConfig().young_modulus
+    scales = characteristic_scales(FrameFEMConfig())
     specs = [
         (
             "01_flex_x",
-            [3.00e-4, 0.0, 0.0, 4.80e-4, 0.0, 1.80e-4],
+            [4.2, 0.0, 0.0, 6.7, 0.0, 2.8],
         ),
         (
             "02_flex_y",
-            [4.80e-4, 0.0, 0.0, 3.00e-4, 0.0, 1.80e-4],
+            [6.7, 0.0, 0.0, 4.2, 0.0, 2.8],
         ),
         (
             "03_flex_theta",
-            [4.40e-4, 0.0, 0.0, 4.40e-4, 0.0, 1.40e-4],
+            [6.1, 0.0, 0.0, 6.1, 0.0, 2.1],
         ),
         (
             "04_balanced",
-            [3.80e-4, 0.0, 0.0, 3.80e-4, 0.0, 1.95e-4],
+            [5.2, 0.0, 0.0, 5.2, 0.0, 3.0],
         ),
         (
             "05_couple_xy_pos",
-            [4.30e-4, 4.50e-5, -1.20e-5, 3.40e-4, 8.00e-6, 1.85e-4],
+            [5.9, 0.6, -0.3, 4.6, 0.2, 2.9],
         ),
         (
             "06_couple_xy_neg",
-            [3.40e-4, -4.50e-5, 1.20e-5, 4.30e-4, -8.00e-6, 1.85e-4],
+            [4.6, -0.6, 0.3, 5.9, -0.2, 2.9],
         ),
     ]
     return [
         (
             name,
-            unique_values_to_symmetric_matrix(
-                (
-                    stiffness_scale
-                    * torch.tensor(values, device=device, dtype=torch.float32)
-                ).unsqueeze(0),
-                size=3,
+            denormalize_generalized_stiffness_matrix(
+                unique_values_to_symmetric_matrix(
+                    torch.tensor(values, device=device, dtype=torch.float32).unsqueeze(0),
+                    size=3,
+                ),
+                scales,
             )[0],
         )
         for name, values in specs
@@ -212,14 +213,6 @@ def _sample_stiffness_targets(
     )
     indices = torch.randint(library.shape[0], (batch_size,), device=device)
     return library.index_select(0, indices)
-
-
-def _target_normalization(targets: torch.Tensor) -> dict[str, list[float]]:
-    features = symmetric_matrix_unique_values(targets)
-    mean = features.mean(dim=0)
-    std = features.var(dim=0, unbiased=False).clamp_min(1e-12).sqrt()
-    std = torch.maximum(std, features.new_tensor([1e-5, 1e-5, 2e-6, 1e-5, 2e-6, 2e-6]))
-    return {"mean": mean.tolist(), "std": std.tolist()}
 
 
 def _blend_training_targets(
@@ -269,37 +262,17 @@ def _parse_target_stiffness(raw: str) -> list[float]:
     return values
 
 
-def _normalize_matrix(
-    matrix: torch.Tensor,
-    normalization: dict[str, list[float]],
-) -> torch.Tensor:
-    flattened = symmetric_matrix_unique_values(matrix)
-    mean = matrix.new_tensor(normalization["mean"])
-    std = matrix.new_tensor(normalization["std"])
-    normalized = (flattened - mean) / std
-    return unique_values_to_symmetric_matrix(normalized, size=3)
-
-
-def _normalize_residual_matrix(
-    residual: torch.Tensor,
-    normalization: dict[str, list[float]],
-) -> torch.Tensor:
-    flattened = symmetric_matrix_unique_values(residual)
-    std = residual.new_tensor(normalization["std"])
-    normalized = flattened / std
-    return unique_values_to_symmetric_matrix(normalized, size=3)
-
-
 def _mechanics_condition_matrices(
     target_stiffness: torch.Tensor,
     current_stiffness: torch.Tensor,
-    normalization: dict[str, list[float]],
+    frame_config: FrameFEMConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scales = characteristic_scales(frame_config)
     residual_stiffness = target_stiffness - current_stiffness
     return (
-        _normalize_matrix(target_stiffness, normalization),
-        _normalize_matrix(current_stiffness, normalization),
-        _normalize_residual_matrix(residual_stiffness, normalization),
+        normalize_generalized_stiffness_matrix(target_stiffness, scales),
+        normalize_generalized_stiffness_matrix(current_stiffness, scales),
+        normalize_generalized_stiffness_matrix(residual_stiffness, scales),
     )
 
 
@@ -319,14 +292,11 @@ def _nodal_mechanics_features_from_fields(
 ) -> torch.Tensor:
     batch_size = positions.shape[0]
     deformation_features = (
-        response_fields["translations"]
+        response_fields["normalized_translations"]
         .permute(0, 2, 1, 3)
         .reshape(batch_size, positions.shape[1], 6)
-        / FrameFEMConfig().workspace_size
     )
-    stress_feature = (
-        response_fields["nodal_stress"] / FrameFEMConfig().yield_stress
-    ).unsqueeze(-1)
+    stress_feature = response_fields["normalized_nodal_stress"].unsqueeze(-1)
     return torch.cat([deformation_features, stress_feature], dim=-1)
 
 
@@ -366,13 +336,12 @@ def _supervised_reconstruction_losses(
 def _matrix_loss(
     predicted: torch.Tensor,
     target: torch.Tensor,
-    normalization: dict[str, list[float]],
+    frame_config: FrameFEMConfig | None = None,
 ) -> torch.Tensor:
-    pred_unique = symmetric_matrix_unique_values(predicted)
-    target_unique = symmetric_matrix_unique_values(target)
-    mean = predicted.new_tensor(normalization["mean"])
-    std = predicted.new_tensor(normalization["std"])
-    return F.mse_loss((pred_unique - mean) / std, (target_unique - mean) / std)
+    scales = characteristic_scales(frame_config)
+    normalized_predicted = normalize_generalized_stiffness_matrix(predicted, scales)
+    normalized_target = normalize_generalized_stiffness_matrix(target, scales)
+    return F.mse_loss(normalized_predicted, normalized_target)
 
 
 def _stiffness_to_response(stiffness_matrix: torch.Tensor) -> torch.Tensor:
@@ -429,8 +398,6 @@ def _geometry_regularization_config(
         min_diameter=config.min_beam_diameter,
         max_diameter=config.max_beam_diameter,
         min_free_node_spacing=config.min_free_node_spacing,
-        soft_domain_min=config.soft_domain_min,
-        soft_domain_max=config.soft_domain_max,
     )
 
 
@@ -460,7 +427,6 @@ def rollout_refinement(
     roles: torch.Tensor,
     adjacency: torch.Tensor,
     target_stiffness: torch.Tensor,
-    target_normalization: dict[str, list[float]],
     steps: int,
     position_step_size: float,
     connectivity_step_size: float,
@@ -502,7 +468,6 @@ def rollout_refinement(
             _mechanics_condition_matrices(
                 target_stiffness,
                 current_stiffness,
-                target_normalization,
             )
         )
         outputs = model(
@@ -570,7 +535,6 @@ def _log_canonical_evaluation(
     step: int,
     device: torch.device,
     canonical_specs: list[tuple[str, torch.Tensor]],
-    target_normalization: dict[str, list[float]],
     animation_output_dir: Path | None = None,
 ) -> None:
     geometry_config = _geometry_regularization_config(config)
@@ -591,7 +555,6 @@ def _log_canonical_evaluation(
         roles,
         adjacency,
         raw_targets,
-        target_normalization,
         steps=config.rollout_steps,
         position_step_size=config.position_step_size,
         connectivity_step_size=config.connectivity_step_size,
@@ -644,7 +607,6 @@ def _log_canonical_evaluation(
             step_error = _matrix_loss(
                 step_terms["stiffness_matrix"],
                 raw_targets[idx : idx + 1],
-                target_normalization,
             )
             writer.add_scalar(
                 f"canonical/30_property_error/{name}/step_{rollout_idx}",
@@ -688,10 +650,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         f"train:start device={device} train_steps={train_steps} batch_size={config.batch_size} num_nodes={config.num_nodes}"
     )
 
-    fixed_targets = torch.stack(
-        [matrix for _, matrix in _fixed_stiffness_target_specs(device)], dim=0
-    )
-    target_normalization = _target_normalization(fixed_targets)
     canonical_specs = _fixed_stiffness_target_specs(device)[:3]
     _progress(
         "train:canonical_stiffness_targets "
@@ -764,7 +722,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             roles,
             adjacency,
             raw_targets,
-            target_normalization,
             steps=config.rollout_steps,
             position_step_size=config.position_step_size,
             connectivity_step_size=config.connectivity_step_size,
@@ -792,12 +749,12 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             step_error = _matrix_loss(
                 step_terms["stiffness_matrix"],
                 raw_targets,
-                target_normalization,
             )
             step_errors.append(step_error)
             property_loss = property_loss + step_weights[step_idx] * step_error
             material_loss = (
-                material_loss + step_weights[step_idx] * step_terms["material"].mean()
+                material_loss
+                + step_weights[step_idx] * step_terms["normalized_material"].mean()
             )
             sparsity_loss = (
                 sparsity_loss + step_weights[step_idx] * step_terms["sparsity"].mean()
@@ -884,7 +841,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 _mechanics_condition_matrices(
                     raw_targets,
                     noisy_terms["stiffness_matrix"],
-                    target_normalization,
                 )
             )
             denoising_outputs = model(
@@ -1038,7 +994,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     global_step,
                     device,
                     canonical_specs,
-                    target_normalization,
                     (
                         log_dir / "animations"
                         if config.animation_every_steps > 0
@@ -1051,7 +1006,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     payload = {
         "state_dict": model.state_dict(),
         "config": asdict(config),
-        "target_normalization": target_normalization,
     }
     torch.save(payload, checkpoint_path)
     writer.close()
@@ -1064,7 +1018,6 @@ def refine_sample_state(
     roles: torch.Tensor,
     adjacency: torch.Tensor,
     raw_target_stiffness: torch.Tensor,
-    target_normalization: dict[str, list[float]],
     config: TrainConfig,
     steps: int = 12,
     lr: float = 0.15,
@@ -1090,11 +1043,10 @@ def refine_sample_state(
         property_loss = _matrix_loss(
             terms["stiffness_matrix"],
             raw_target_stiffness,
-            target_normalization,
         )
         loss = (
             config.property_weight * property_loss
-            + config.material_weight * terms["material"].mean()
+            + config.material_weight * terms["normalized_material"].mean()
             + config.sparsity_weight * terms["sparsity"].mean()
             + config.connectivity_weight * terms["connectivity_penalty"].mean()
             + config.fixed_mobile_connectivity_weight
@@ -1135,7 +1087,6 @@ def sample(
     if device_override is not None:
         config.device = device_override
     geometry_config = _geometry_regularization_config(config)
-    target_normalization = payload["target_normalization"]
     sample_seed = _resolve_sample_seed(seed_override)
     _seed_everything(sample_seed)
 
@@ -1167,7 +1118,6 @@ def sample(
             roles,
             adjacency,
             raw_targets,
-            target_normalization,
             steps=steps,
             position_step_size=config.position_step_size,
             connectivity_step_size=config.connectivity_step_size,
@@ -1181,7 +1131,6 @@ def sample(
         roles,
         final_state["adjacency"],
         raw_targets,
-        target_normalization,
         config,
     )
     terms = mechanical_terms(
@@ -1422,12 +1371,6 @@ def _train_parser() -> argparse.ArgumentParser:
         "--min-free-node-spacing",
         type=float,
         default=defaults.min_free_node_spacing,
-    )
-    parser.add_argument(
-        "--soft-domain-min", type=float, default=defaults.soft_domain_min
-    )
-    parser.add_argument(
-        "--soft-domain-max", type=float, default=defaults.soft_domain_max
     )
     parser.add_argument(
         "--animation-every-steps",

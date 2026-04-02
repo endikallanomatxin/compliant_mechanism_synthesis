@@ -70,6 +70,11 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["stiffness_matrix"].shape == (1, 3, 3)
     assert terms["translations"].shape == (1, 3, 10, 2)
     assert terms["nodal_stress"].shape == (1, 10)
+    assert terms["normalized_stiffness_matrix"].shape == (1, 3, 3)
+    assert terms["normalized_response_matrix"].shape == (1, 3, 3)
+    assert terms["normalized_translations"].shape == (1, 3, 10, 2)
+    assert terms["normalized_nodal_stress"].shape == (1, 10)
+    assert terms["normalized_material"].shape == (1,)
     assert torch.allclose(terms["response_matrix"], response_matrix)
     assert torch.allclose(terms["stiffness_matrix"], stiffness_matrix)
     assert terms["connectivity_penalty"].shape == (1,)
@@ -178,8 +183,8 @@ def test_geometric_regularization_penalizes_node_clustering_and_soft_domain_esca
                 [1.0, 0.0],
                 [0.0, 1.0],
                 [1.0, 1.0],
-                [0.01, 0.02],
-                [0.015, 0.021],
+                [-0.05, 0.02],
+                [-0.049, 0.021],
             ]
         ],
         dtype=torch.float32,
@@ -190,11 +195,7 @@ def test_geometric_regularization_penalizes_node_clustering_and_soft_domain_esca
         positions,
         roles,
         adjacency,
-        GeometryRegularizationConfig(
-            min_free_node_spacing=5e-3,
-            soft_domain_min=0.1,
-            soft_domain_max=0.9,
-        ),
+        GeometryRegularizationConfig(min_free_node_spacing=5e-3),
         frame_config=FrameFEMConfig(workspace_size=0.2, r_max=1e-3),
     )
     assert penalties["node_spacing_penalty"][0] > 0.0
