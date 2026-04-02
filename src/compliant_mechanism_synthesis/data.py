@@ -309,6 +309,39 @@ def spanning_tree_scaffold(
     return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)
 
 
+def rigid_endpoint_scaffold(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    neighbors_per_endpoint: int = 3,
+    min_activation: float = 0.75,
+    max_activation: float = 0.95,
+) -> torch.Tensor:
+    num_nodes = roles.shape[0]
+    adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    fixed, mobile, free = role_masks(roles.unsqueeze(0))
+    free_indices = torch.where(free[0])[0]
+    rigid_indices = torch.where((fixed | mobile)[0])[0]
+    if free_indices.numel() == 0 or rigid_indices.numel() == 0:
+        return adjacency
+
+    for rigid_idx in rigid_indices.tolist():
+        free_distances = torch.linalg.vector_norm(
+            positions[free_indices] - positions[rigid_idx],
+            dim=-1,
+        )
+        neighbor_count = min(neighbors_per_endpoint, int(free_indices.numel()))
+        nearest = torch.topk(
+            free_distances,
+            k=neighbor_count,
+            largest=False,
+        ).indices
+        for free_idx in free_indices[nearest].tolist():
+            activation = random.uniform(min_activation, max_activation)
+            adjacency[rigid_idx, free_idx] = activation
+            adjacency[free_idx, rigid_idx] = activation
+    return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)
+
+
 def generate_noise_connectivity(
     positions: torch.Tensor,
     roles: torch.Tensor,
@@ -317,11 +350,15 @@ def generate_noise_connectivity(
     proximity = proximity_bias_matrix(positions)
     spanning = spanning_tree_scaffold(positions, roles)
     scaffold = local_connectivity_scaffold(positions, roles)
+    rigid_scaffold = rigid_endpoint_scaffold(positions, roles)
     random_component = 0.25 + 0.75 * torch.rand(
         (num_nodes, num_nodes), dtype=torch.float32
     ).pow(1.5)
     adjacency = torch.maximum(
-        torch.maximum(proximity * random_component, scaffold),
+        torch.maximum(
+            torch.maximum(proximity * random_component, scaffold),
+            rigid_scaffold,
+        ),
         spanning,
     )
     return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)

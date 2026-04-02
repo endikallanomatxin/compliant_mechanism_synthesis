@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import torch
 
-from compliant_mechanism_synthesis.common import symmetrize_adjacency
+from compliant_mechanism_synthesis.common import (
+    ROLE_FIXED,
+    ROLE_FREE,
+    ROLE_MOBILE,
+    symmetrize_adjacency,
+)
 from compliant_mechanism_synthesis.data import (
     generate_graph_sample,
     generate_noise_sample,
     proximity_bias_matrix,
+    rigid_endpoint_scaffold,
 )
 from compliant_mechanism_synthesis.mechanics import (
     FrameFEMConfig,
@@ -459,6 +465,49 @@ def test_noise_connectivity_gives_each_node_a_local_allowed_edge() -> None:
     _, _, adjacency = generate_noise_sample(10)
     incident = adjacency.sum(dim=1)
     assert torch.all(incident > 0.0)
+
+
+def test_rigid_endpoint_scaffold_connects_each_rigid_node_to_three_nearest_free_nodes() -> (
+    None
+):
+    positions = torch.tensor(
+        [
+            [0.05, 0.05],
+            [0.95, 0.05],
+            [0.05, 0.95],
+            [0.95, 0.95],
+            [0.12, 0.10],
+            [0.14, 0.16],
+            [0.18, 0.08],
+            [0.86, 0.12],
+            [0.90, 0.16],
+            [0.82, 0.08],
+            [0.12, 0.84],
+            [0.18, 0.90],
+            [0.08, 0.80],
+            [0.88, 0.84],
+            [0.82, 0.90],
+            [0.92, 0.80],
+        ],
+        dtype=torch.float32,
+    )
+    roles = torch.tensor(
+        [
+            ROLE_FIXED,
+            ROLE_FIXED,
+            ROLE_MOBILE,
+            ROLE_MOBILE,
+            *([ROLE_FREE] * 12),
+        ],
+        dtype=torch.long,
+    )
+
+    adjacency = rigid_endpoint_scaffold(positions, roles)
+
+    for rigid_idx in range(4):
+        free_neighbors = torch.where(adjacency[rigid_idx, 4:] > 0.0)[0]
+        assert free_neighbors.numel() == 3
+        assert torch.all(adjacency[rigid_idx, 4:][free_neighbors] >= 0.75)
 
 
 def test_refine_connectivity_updates_near_edges_more_than_far_edges() -> None:
