@@ -432,21 +432,29 @@ def rollout_refinement(
     base_time: torch.Tensor,
     position_noise_scale: float = 0.0,
     connectivity_noise_scale: float = 0.0,
+    geometry_config: GeometryRegularizationConfig | None = None,
+    initial_stiffness: torch.Tensor | None = None,
 ) -> list[dict[str, torch.Tensor]]:
     current_positions = positions
     current_adjacency = adjacency
     states: list[dict[str, torch.Tensor]] = []
+    current_stiffness = initial_stiffness
 
     for step_idx in range(steps):
         time_fraction = 1.0 - step_idx / max(steps - 1, 1)
         timestep = base_time * time_fraction
         position_noise_levels = position_noise_scale * timestep
         connectivity_noise_levels = connectivity_noise_scale * timestep
-        current_terms = mechanical_terms(current_positions, roles, current_adjacency)
+        if current_stiffness is None:
+            current_stiffness = mechanical_terms(
+                current_positions,
+                roles,
+                current_adjacency,
+            )["stiffness_matrix"]
         target_features, current_features, residual_features = (
             _mechanics_condition_matrices(
                 target_stiffness,
-                current_terms["stiffness_matrix"],
+                current_stiffness,
                 target_normalization,
             )
         )
@@ -482,18 +490,28 @@ def rollout_refinement(
             position_noise_scale,
             connectivity_noise_scale,
         )
-        states.append(
-            {
-                "positions": current_positions,
-                "roles": roles,
-                "adjacency": current_adjacency,
-                "refined_positions": refined_positions,
-                "refined_adjacency": refined_adjacency,
-                "displacements": outputs["displacements"],
-                "node_latents": outputs["node_latents"],
-                "delta_scores": outputs["delta_scores"],
-            }
-        )
+        state = {
+            "positions": current_positions,
+            "roles": roles,
+            "adjacency": current_adjacency,
+            "refined_positions": refined_positions,
+            "refined_adjacency": refined_adjacency,
+            "displacements": outputs["displacements"],
+            "node_latents": outputs["node_latents"],
+            "delta_scores": outputs["delta_scores"],
+        }
+        if geometry_config is not None:
+            step_terms = mechanical_terms(
+                current_positions,
+                roles,
+                current_adjacency,
+                geometry_config=geometry_config,
+            )
+            state["terms"] = step_terms
+            current_stiffness = step_terms["stiffness_matrix"]
+        else:
+            current_stiffness = None
+        states.append(state)
     return states
 
 
@@ -664,6 +682,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "node_spacing": 0.0,
         "boundary": 0.0,
     }
+    step_weights = _step_weights(config.rollout_steps, device)
 
     model.train()
     for step in range(1, train_steps + 1):
@@ -702,8 +721,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             base_time=base_time,
             position_noise_scale=config.rollout_position_noise,
             connectivity_noise_scale=config.rollout_connectivity_noise,
+            geometry_config=geometry_config,
+            initial_stiffness=start_terms["stiffness_matrix"],
         )
-        weights = _step_weights(config.rollout_steps, device)
         property_loss = torch.zeros((), device=device)
         material_loss = torch.zeros((), device=device)
         sparsity_loss = torch.zeros((), device=device)
@@ -717,57 +737,52 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         boundary_loss = torch.zeros((), device=device)
         step_errors: list[torch.Tensor] = []
         for step_idx, state in enumerate(rollout):
-            step_terms = mechanical_terms(
-                state["positions"],
-                roles,
-                state["adjacency"],
-                geometry_config=geometry_config,
-            )
+            step_terms = state["terms"]
             step_error = _matrix_loss(
                 step_terms["stiffness_matrix"],
                 raw_targets,
                 target_normalization,
             )
             step_errors.append(step_error)
-            property_loss = property_loss + weights[step_idx] * step_error
+            property_loss = property_loss + step_weights[step_idx] * step_error
             material_loss = (
-                material_loss + weights[step_idx] * step_terms["material"].mean()
+                material_loss + step_weights[step_idx] * step_terms["material"].mean()
             )
             sparsity_loss = (
-                sparsity_loss + weights[step_idx] * step_terms["sparsity"].mean()
+                sparsity_loss + step_weights[step_idx] * step_terms["sparsity"].mean()
             )
             connectivity_loss = (
                 connectivity_loss
-                + weights[step_idx] * step_terms["connectivity_penalty"].mean()
+                + step_weights[step_idx] * step_terms["connectivity_penalty"].mean()
             )
             fixed_mobile_connectivity_loss = (
                 fixed_mobile_connectivity_loss
-                + weights[step_idx]
+                + step_weights[step_idx]
                 * step_terms["fixed_mobile_connectivity_penalty"].mean()
             )
             short_beam_loss = (
                 short_beam_loss
-                + weights[step_idx] * step_terms["short_beam_penalty"].mean()
+                + step_weights[step_idx] * step_terms["short_beam_penalty"].mean()
             )
             long_beam_loss = (
                 long_beam_loss
-                + weights[step_idx] * step_terms["long_beam_penalty"].mean()
+                + step_weights[step_idx] * step_terms["long_beam_penalty"].mean()
             )
             thin_diameter_loss = (
                 thin_diameter_loss
-                + weights[step_idx] * step_terms["thin_diameter_penalty"].mean()
+                + step_weights[step_idx] * step_terms["thin_diameter_penalty"].mean()
             )
             thick_diameter_loss = (
                 thick_diameter_loss
-                + weights[step_idx] * step_terms["thick_diameter_penalty"].mean()
+                + step_weights[step_idx] * step_terms["thick_diameter_penalty"].mean()
             )
             node_spacing_loss = (
                 node_spacing_loss
-                + weights[step_idx] * step_terms["node_spacing_penalty"].mean()
+                + step_weights[step_idx] * step_terms["node_spacing_penalty"].mean()
             )
             boundary_loss = (
                 boundary_loss
-                + weights[step_idx] * step_terms["boundary_penalty"].mean()
+                + step_weights[step_idx] * step_terms["boundary_penalty"].mean()
             )
         monotonic_loss = _monotonic_improvement_loss(step_errors)
 

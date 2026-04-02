@@ -256,25 +256,20 @@ def local_connectivity_scaffold(
     )
     adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
     forbidden = _forbidden_rigid_pairs(roles)
-
-    for node_idx in range(num_nodes):
-        allowed = ~forbidden[node_idx]
-        allowed[node_idx] = False
-        candidates = torch.where(allowed)[0]
-        if candidates.numel() == 0:
-            continue
-        distances = pairwise[node_idx, candidates]
-        nearest = candidates[
-            torch.argsort(distances)[: min(neighbors_per_node, candidates.numel())]
-        ]
-        for neighbor_idx in nearest.tolist():
-            activation = random.uniform(min_activation, max_activation)
-            adjacency[node_idx, neighbor_idx] = max(
-                adjacency[node_idx, neighbor_idx].item(), activation
-            )
-            adjacency[neighbor_idx, node_idx] = max(
-                adjacency[neighbor_idx, node_idx].item(), activation
-            )
+    allowed = ~forbidden
+    allowed.fill_diagonal_(False)
+    masked_distances = pairwise.masked_fill(~allowed, float("inf"))
+    neighbor_count = min(neighbors_per_node, max(num_nodes - 1, 1))
+    nearest = torch.topk(
+        masked_distances, k=neighbor_count, dim=1, largest=False
+    ).indices
+    activations = min_activation + (max_activation - min_activation) * torch.rand(
+        (num_nodes, neighbor_count), dtype=torch.float32
+    )
+    row_indices = torch.arange(num_nodes).unsqueeze(1).expand(-1, neighbor_count)
+    valid = torch.isfinite(masked_distances[row_indices, nearest])
+    adjacency[row_indices[valid], nearest[valid]] = activations[valid]
+    adjacency = torch.maximum(adjacency, adjacency.transpose(0, 1))
     return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)
 
 
@@ -291,28 +286,26 @@ def spanning_tree_scaffold(
     )
     adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
     forbidden = _forbidden_rigid_pairs(roles)
-
-    connected = {0}
-    remaining = set(range(1, num_nodes))
-    while remaining:
-        best_edge: tuple[int, int] | None = None
-        best_distance = float("inf")
-        for src in connected:
-            for dst in remaining:
-                if forbidden[src, dst]:
-                    continue
-                distance = float(pairwise[src, dst].item())
-                if distance < best_distance:
-                    best_distance = distance
-                    best_edge = (src, dst)
-        if best_edge is None:
+    connected = torch.zeros(num_nodes, dtype=torch.bool)
+    connected[0] = True
+    remaining = ~connected
+    masked_pairwise = pairwise.masked_fill(forbidden, float("inf"))
+    while remaining.any():
+        candidate_distances = masked_pairwise.masked_fill(
+            ~(connected[:, None] & remaining[None, :]),
+            float("inf"),
+        )
+        flat_index = torch.argmin(candidate_distances)
+        best_distance = candidate_distances.reshape(-1)[flat_index]
+        if not torch.isfinite(best_distance):
             break
-        src, dst = best_edge
+        src = int(flat_index // num_nodes)
+        dst = int(flat_index % num_nodes)
         activation = random.uniform(min_activation, max_activation)
         adjacency[src, dst] = activation
         adjacency[dst, src] = activation
-        connected.add(dst)
-        remaining.remove(dst)
+        connected[dst] = True
+        remaining[dst] = False
     return enforce_role_adjacency_constraints(symmetrize_adjacency(adjacency), roles)
 
 
