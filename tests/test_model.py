@@ -31,6 +31,7 @@ def _dummy_inputs(batch_size: int = 2, num_nodes: int = 8) -> tuple[torch.Tensor
     current_stiffness = torch.rand(batch_size, 3, 3)
     current_stiffness = 0.5 * (current_stiffness + current_stiffness.transpose(1, 2))
     residual_stiffness = target_stiffness - current_stiffness
+    nodal_mechanics = torch.rand(batch_size, num_nodes, 6)
     timesteps = torch.rand(batch_size)
     position_noise_levels = torch.rand(batch_size)
     connectivity_noise_levels = torch.rand(batch_size)
@@ -41,6 +42,7 @@ def _dummy_inputs(batch_size: int = 2, num_nodes: int = 8) -> tuple[torch.Tensor
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -55,6 +57,7 @@ def test_model_output_shapes() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -67,6 +70,7 @@ def test_model_output_shapes() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -85,6 +89,7 @@ def test_connectivity_update_is_symmetric_and_zero_diagonal() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -97,6 +102,7 @@ def test_connectivity_update_is_symmetric_and_zero_diagonal() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -117,6 +123,7 @@ def test_connectivity_delta_comes_from_node_latent_dot_products() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -129,6 +136,7 @@ def test_connectivity_delta_comes_from_node_latent_dot_products() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -161,6 +169,7 @@ def test_model_conditioning_depends_on_current_stiffness() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -173,6 +182,7 @@ def test_model_conditioning_depends_on_current_stiffness() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -186,6 +196,7 @@ def test_model_conditioning_depends_on_current_stiffness() -> None:
         target_stiffness,
         shifted_current,
         shifted_residual,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -202,6 +213,7 @@ def test_model_conditioning_depends_on_noise_levels() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -214,6 +226,7 @@ def test_model_conditioning_depends_on_noise_levels() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels,
         connectivity_noise_levels,
@@ -225,9 +238,52 @@ def test_model_conditioning_depends_on_noise_levels() -> None:
         target_stiffness,
         current_stiffness,
         residual_stiffness,
+        nodal_mechanics,
         timesteps,
         position_noise_levels + 0.25,
         connectivity_noise_levels + 0.25,
+    )
+
+    assert not torch.allclose(outputs_a["displacements"], outputs_b["displacements"])
+
+
+def test_model_conditioning_depends_on_nodal_mechanics() -> None:
+    (
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        nodal_mechanics,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    ) = _dummy_inputs(batch_size=1)
+    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
+    outputs_a = model(
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        nodal_mechanics,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    )
+    outputs_b = model(
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        nodal_mechanics + 0.25,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
     )
 
     assert not torch.allclose(outputs_a["displacements"], outputs_b["displacements"])

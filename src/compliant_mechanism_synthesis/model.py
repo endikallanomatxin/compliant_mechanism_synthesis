@@ -114,7 +114,7 @@ class GraphRefinementModel(nn.Module):
     ) -> None:
         super().__init__()
         self.position_mlp = nn.Sequential(
-            nn.Linear(2, d_model),
+            nn.Linear(8, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
@@ -164,11 +164,14 @@ class GraphRefinementModel(nn.Module):
         target_stiffness: torch.Tensor,
         current_stiffness: torch.Tensor,
         residual_stiffness: torch.Tensor,
+        nodal_mechanics: torch.Tensor,
         timesteps: torch.Tensor,
         position_noise_levels: torch.Tensor,
         connectivity_noise_levels: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        hidden = self.position_mlp(positions) + self.role_embedding(roles)
+        hidden = self.position_mlp(
+            torch.cat([positions, nodal_mechanics], dim=-1)
+        ) + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
         mechanics_features = torch.cat(
             [

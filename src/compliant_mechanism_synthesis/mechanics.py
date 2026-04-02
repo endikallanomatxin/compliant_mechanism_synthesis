@@ -338,6 +338,53 @@ def load_case_deformations(
     return translations, mobile_response
 
 
+def stiffness_and_deformations(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: FrameFEMConfig | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    config = config or FrameFEMConfig()
+    stabilized, transforms = _stabilized_reduced_system(
+        positions,
+        roles,
+        adjacency,
+        config,
+    )
+    batch_size, num_nodes, _ = positions.shape
+    free_count = num_nodes - 4
+    mobile_base = 3 * free_count
+    load_cases = _mobile_load_cases(
+        positions,
+        device=stabilized.device,
+        dtype=stabilized.dtype,
+    )
+    rhs = load_cases.transpose(0, 1).unsqueeze(0).expand(batch_size, -1, -1)
+    reduced_displacements = torch.linalg.solve(stabilized, rhs)
+    response_matrix = reduced_displacements[:, mobile_base : mobile_base + 3, :]
+    response_matrix = 0.5 * (response_matrix + response_matrix.transpose(1, 2))
+    response_eye = torch.eye(3, device=stabilized.device, dtype=stabilized.dtype)
+    response_trace = response_matrix.diagonal(dim1=1, dim2=2).sum(dim=1)
+    stabilized_response = (
+        response_matrix
+        + (config.stiffness_regularization * (1.0 + response_trace / 3.0))[
+            :, None, None
+        ]
+        * response_eye[None, :, :]
+    )
+    stiffness_matrix = torch.linalg.solve(
+        stabilized_response,
+        response_eye[None, :, :].expand(batch_size, -1, -1),
+    )
+    stiffness_matrix = 0.5 * (stiffness_matrix + stiffness_matrix.transpose(1, 2))
+    full_displacements = transforms @ reduced_displacements
+    full_displacements = full_displacements.view(batch_size, num_nodes, 3, 3).permute(
+        0, 3, 1, 2
+    )
+    translations = full_displacements[..., :2]
+    return stiffness_matrix, translations, response_matrix
+
+
 def _graph_reachability(adjacency: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
     reach = seeds
     diagonal = torch.eye(

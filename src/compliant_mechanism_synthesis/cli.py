@@ -25,6 +25,7 @@ from compliant_mechanism_synthesis.mechanics import (
     GeometryRegularizationConfig,
     mechanical_terms,
     refine_connectivity,
+    stiffness_and_deformations,
     threshold_connectivity,
 )
 from compliant_mechanism_synthesis.model import GraphRefinementModel
@@ -296,6 +297,20 @@ def _mechanics_condition_matrices(
     )
 
 
+def _nodal_mechanics_features(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+) -> torch.Tensor:
+    with torch.no_grad():
+        _, deformations, _ = stiffness_and_deformations(positions, roles, adjacency)
+    batch_size = positions.shape[0]
+    features = deformations.permute(0, 2, 1, 3).reshape(
+        batch_size, positions.shape[1], 6
+    )
+    return features / FrameFEMConfig().workspace_size
+
+
 def _sample_supervised_denoising_batch(
     teacher_positions: torch.Tensor,
     roles: torch.Tensor,
@@ -447,11 +462,28 @@ def rollout_refinement(
         connectivity_noise_levels = connectivity_noise_scale * timestep
         if current_stiffness is None:
             with torch.no_grad():
-                current_stiffness = mechanical_terms(
+                current_stiffness, current_deformations, _ = stiffness_and_deformations(
                     current_positions,
                     roles,
                     current_adjacency,
-                )["stiffness_matrix"]
+                )
+        else:
+            current_deformations = None
+        if current_deformations is None:
+            current_nodal_mechanics = _nodal_mechanics_features(
+                current_positions,
+                roles,
+                current_adjacency,
+            )
+        else:
+            current_nodal_mechanics = (
+                current_deformations.permute(0, 2, 1, 3).reshape(
+                    current_positions.shape[0],
+                    current_positions.shape[1],
+                    6,
+                )
+                / FrameFEMConfig().workspace_size
+            )
         target_features, current_features, residual_features = (
             _mechanics_condition_matrices(
                 target_stiffness,
@@ -466,6 +498,7 @@ def rollout_refinement(
             target_features,
             current_features,
             residual_features,
+            current_nodal_mechanics,
             timestep,
             position_noise_levels,
             connectivity_noise_levels,
@@ -822,6 +855,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             with torch.no_grad():
                 noisy_terms = mechanical_terms(noisy_positions, roles, noisy_adjacency)
+                noisy_nodal_mechanics = _nodal_mechanics_features(
+                    noisy_positions,
+                    roles,
+                    noisy_adjacency,
+                )
             target_features, current_features, residual_features = (
                 _mechanics_condition_matrices(
                     raw_targets,
@@ -836,6 +874,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 target_features,
                 current_features,
                 residual_features,
+                noisy_nodal_mechanics,
                 torch.zeros((positions.shape[0],), device=device),
                 torch.full(
                     (positions.shape[0],),
