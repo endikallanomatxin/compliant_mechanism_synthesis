@@ -12,12 +12,15 @@
 
 ## Prototype Scope
 
-- Binary 2D topology grid with fixed bottom plate and movable top plate.
-- Patch-based transformer denoiser conditioned on target `k_x`, `k_y`, `k_theta`.
-- A single differentiable spring-network FEM evaluator in PyTorch is used throughout the project.
-- Occupancy values in `[0, 1]` are an internal relaxed representation; training uses the differentiable FEM directly on relaxed occupancies, while candidate selection and final reporting can still threshold at `0.5` when a hard binary design is needed.
-- Training starts from random noise and refines it over multiple learned rollout steps, optimized end-to-end with differentiable FEM property loss plus lightweight topology regularization.
-- Each target is trained from multiple noise initializations, aggregated with a softmin objective to encourage exploration instead of collapsing to one easy family of solutions.
-- Training also uses a monotonic-improvement penalty so later rollout steps are encouraged to improve mechanical error instead of deferring all progress to the end.
-- Training also uses a light diversity penalty across samples for the same target so the generator is less likely to collapse to one repeated geometry family.
-- Training logs and sample images are written to TensorBoard.
+- Designs are point-and-beam graphs in 2D, not pixel grids.
+- A design state consists of node positions, node roles, and a symmetric beam-activation matrix.
+- Roles are `fixed`, `mobile`, and `free`.
+- The mechanics model is a differentiable 2D Euler-Bernoulli frame FEM with axial plus bending stiffness.
+- The 2 fixed nodes are rigidly clamped.
+- The 2 mobile nodes are tied to a rigid body with generalized DOFs `Ux`, `Uy`, and `Theta`.
+- The learning model is a graph-based iterative refinement model.
+- Each refinement step predicts free-node displacement deltas and connectivity updates.
+- Connectivity updates must come only from dot products between per-node latent vectors.
+- Attention layers alternate between connectivity-conditioned and unconditioned self-attention.
+- Training starts from pure-noise graph states and optimizes objective, material, connectivity, and geometric regularization losses directly through the differentiable simulator.
+- Training logs and sample figures are written to TensorBoard.

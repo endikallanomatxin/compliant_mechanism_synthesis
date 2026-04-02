@@ -9,51 +9,91 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
-from compliant_mechanism_synthesis.data import generate_dataset, generate_design
-from compliant_mechanism_synthesis.mechanics import (
-    binarization_penalty,
-    mechanical_terms,
-    threshold_occupancy,
+from compliant_mechanism_synthesis.common import (
+    enforce_role_adjacency_constraints,
+    ROLE_FREE,
+    apply_free_node_update,
+    symmetric_matrix_unique_values,
+    symmetrize_adjacency,
+    unique_values_to_symmetric_matrix,
 )
-from compliant_mechanism_synthesis.model import ConditionedDenoiser
+from compliant_mechanism_synthesis.data import generate_noise_sample
+from compliant_mechanism_synthesis.mechanics import (
+    FrameFEMConfig,
+    GeometryRegularizationConfig,
+    mechanical_terms,
+    mechanical_response_fields,
+    refine_connectivity,
+    threshold_connectivity,
+)
+from compliant_mechanism_synthesis.model import GraphRefinementModel
+from compliant_mechanism_synthesis.viz import (
+    export_rollout_animation,
+    plot_graph_design,
+)
 
 
 @dataclass
 class TrainConfig:
-    grid_size: int = 24
-    patch_size: int = 2
-    d_model: int = 256
-    nhead: int = 4
-    num_layers: int = 6
-    dataset_size: int = 512
-    batch_size: int = 16
-    epochs: int = 50
-    learning_rate: float = 3e-4
+    num_nodes: int = 32
+    d_model: int = 128
+    nhead: int = 16
+    num_layers: int = 12
+    latent_dim: int = 128
+    batch_size: int = 128
+    train_steps: int = 20_000
+    learning_rate: float = 1e-4
     rollout_steps: int = 8
-    rollout_step_size: float = 0.5
-    rollout_noise_scale: float = 0.03
-    property_weight: float = 2.0
-    improvement_weight: float = 0.25
-    diversity_weight: float = 0.05
-    diversity_scale: float = 0.15
-    surface_weight: float = 0.02
-    connectivity_weight: float = 0.12
-    mass_weight: float = 0.15
-    binarization_weight: float = 0.1
-    train_samples_per_target: int = 4
-    train_softmin_temperature: float = 0.25
+    position_step_size: float = 0.2
+    connectivity_step_size: float = 0.1
+    rollout_position_noise: float = 0.01
+    rollout_connectivity_noise: float = 0.05
+    supervised_denoising_weight: float = 0.5
+    supervised_position_weight: float = 1.0
+    supervised_adjacency_weight: float = 1.0
+    supervised_position_noise: float = 0.02
+    supervised_connectivity_noise: float = 0.08
+    supervised_every_steps: int = 1
+    training_goal_blend_start: float = 0.0
+    training_goal_blend_end: float = 1.0
+    property_weight: float = 1.0
+    monotonic_improvement_weight: float = 0.25
+    material_weight: float = 1e4
+    sparsity_weight: float = 0.5
+    connectivity_weight: float = 0.25
+    fixed_mobile_connectivity_weight: float = 2.0
+    short_beam_weight: float = 0.20
+    long_beam_weight: float = 5.0
+    thin_diameter_weight: float = 0.20
+    thick_diameter_weight: float = 0.10
+    node_spacing_weight: float = 0.20
+    boundary_weight: float = 0.10
+    yield_stress_weight: float = 0.10
+    min_beam_length: float = 1e-3
+    max_beam_length: float = 3e-2
+    min_beam_diameter: float = 2e-4
+    max_beam_diameter: float = 4e-3
+    min_free_node_spacing: float = 5e-3
+    boundary_margin: float = 5e-3
+    animation_every_steps: int = 1_000
     log_every_steps: int = 5
-    canonical_eval_every_steps: int = 20
+    canonical_eval_every_steps: int = 100
+    sample_threshold: float = 0.5
+    device: str = "auto"
     name: str = "prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
     seed: int = 7
 
 
-def _device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _device(device_spec: str = "auto") -> torch.device:
+    if device_spec == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_spec)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA device requested but CUDA is not available")
+    return device
 
 
 def _seed_everything(seed: int) -> None:
@@ -64,26 +104,23 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _fixed_noise(
-    batch_size: int, grid_size: int, seed: int, device: torch.device
-) -> torch.Tensor:
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    noise = torch.rand((batch_size, 1, grid_size, grid_size), generator=generator)
-    return noise.to(device)
+def _progress(message: str) -> None:
+    print(message, flush=True)
 
 
-def _force_plates(grids: torch.Tensor) -> torch.Tensor:
-    grids = grids.clone()
-    grids[:, :, 0, :] = 1.0
-    grids[:, :, -1, :] = 1.0
-    return grids.clamp(0.0, 1.0)
+def _resolve_sample_seed(seed_override: int | None) -> int:
+    if seed_override is not None:
+        return seed_override
+    return random.SystemRandom().randrange(0, 2**31)
 
 
-def _write_samples(
-    writer: SummaryWriter, tag: str, grids: torch.Tensor, step: int
-) -> None:
-    writer.add_images(tag, grids[:8], global_step=step, dataformats="NCHW")
+def _load_train_config(config_dict: dict[str, object]) -> TrainConfig:
+    data = dict(config_dict)
+    if "training_goal_blend" in data:
+        blend = float(data.pop("training_goal_blend"))
+        data.setdefault("training_goal_blend_start", blend)
+        data.setdefault("training_goal_blend_end", blend)
+    return TrainConfig(**data)
 
 
 def _timestamped_run_dir(name: str) -> Path:
@@ -91,32 +128,119 @@ def _timestamped_run_dir(name: str) -> Path:
     return Path("runs") / f"{timestamp}-{name}"
 
 
-def _progress(message: str) -> None:
-    print(message, flush=True)
+def _pure_noise_batch(
+    batch_size: int,
+    num_nodes: int,
+    device: torch.device,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    positions = []
+    roles = []
+    adjacency = []
+    if seed is not None:
+        state = random.getstate()
+        torch_state = torch.random.get_rng_state()
+        random.seed(seed)
+        torch.manual_seed(seed)
+    for _ in range(batch_size):
+        x, r, a = generate_noise_sample(num_nodes)
+        positions.append(x)
+        roles.append(r)
+        adjacency.append(a)
+    if seed is not None:
+        random.setstate(state)
+        torch.random.set_rng_state(torch_state)
+    return (
+        torch.stack(positions, dim=0).to(device),
+        torch.stack(roles, dim=0).to(device),
+        torch.stack(adjacency, dim=0).to(device),
+    )
 
 
-def _canonical_target_specs(
-    target_pool: torch.Tensor,
-) -> list[tuple[str, tuple[float, float, float]]]:
-    mean = target_pool.mean(dim=0)
-    std = target_pool.std(dim=0, unbiased=False)
-    low = (mean - std).clamp(0.0, 1.0)
-    high = (mean + std).clamp(0.0, 1.0)
-
-    return [
+def _fixed_stiffness_target_specs(
+    device: torch.device,
+) -> list[tuple[str, torch.Tensor]]:
+    stiffness_scale = FrameFEMConfig().young_modulus
+    specs = [
         (
-            "low-kx_high-ky-ktheta",
-            (float(low[0]), float(high[1]), float(high[2])),
+            "01_flex_x",
+            [3.00e-4, 0.0, 0.0, 4.80e-4, 0.0, 1.80e-4],
         ),
         (
-            "high-kx_low-ky-high-ktheta",
-            (float(high[0]), float(low[1]), float(high[2])),
+            "02_flex_y",
+            [4.80e-4, 0.0, 0.0, 3.00e-4, 0.0, 1.80e-4],
         ),
         (
-            "high-kx-ky_low-ktheta",
-            (float(high[0]), float(high[1]), float(low[2])),
+            "03_flex_theta",
+            [4.40e-4, 0.0, 0.0, 4.40e-4, 0.0, 1.40e-4],
+        ),
+        (
+            "04_balanced",
+            [3.80e-4, 0.0, 0.0, 3.80e-4, 0.0, 1.95e-4],
+        ),
+        (
+            "05_couple_xy_pos",
+            [4.30e-4, 4.50e-5, -1.20e-5, 3.40e-4, 8.00e-6, 1.85e-4],
+        ),
+        (
+            "06_couple_xy_neg",
+            [3.40e-4, -4.50e-5, 1.20e-5, 4.30e-4, -8.00e-6, 1.85e-4],
         ),
     ]
+    return [
+        (
+            name,
+            unique_values_to_symmetric_matrix(
+                (
+                    stiffness_scale
+                    * torch.tensor(values, device=device, dtype=torch.float32)
+                ).unsqueeze(0),
+                size=3,
+            )[0],
+        )
+        for name, values in specs
+    ]
+
+
+def _sample_stiffness_targets(
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    library = torch.stack(
+        [matrix for _, matrix in _fixed_stiffness_target_specs(device)], dim=0
+    )
+    indices = torch.randint(library.shape[0], (batch_size,), device=device)
+    return library.index_select(0, indices)
+
+
+def _target_normalization(targets: torch.Tensor) -> dict[str, list[float]]:
+    features = symmetric_matrix_unique_values(targets)
+    mean = features.mean(dim=0)
+    std = features.var(dim=0, unbiased=False).clamp_min(1e-12).sqrt()
+    std = torch.maximum(std, features.new_tensor([1e-5, 1e-5, 2e-6, 1e-5, 2e-6, 2e-6]))
+    return {"mean": mean.tolist(), "std": std.tolist()}
+
+
+def _blend_training_targets(
+    start_stiffness: torch.Tensor,
+    goal_stiffness: torch.Tensor,
+    goal_blend: float,
+) -> torch.Tensor:
+    blend = float(min(max(goal_blend, 0.0), 1.0))
+    return (1.0 - blend) * start_stiffness + blend * goal_stiffness
+
+
+def _scheduled_goal_blend(
+    step: int,
+    train_steps: int,
+    blend_start: float,
+    blend_end: float,
+) -> float:
+    if train_steps <= 1:
+        return float(min(max(blend_end, 0.0), 1.0))
+    progress = (step - 1) / max(train_steps - 1, 1)
+    blend = blend_start + progress * (blend_end - blend_start)
+    return float(min(max(blend, 0.0), 1.0))
 
 
 def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
@@ -124,441 +248,808 @@ def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
     return weights / weights.sum()
 
 
-def _target_sampling_weights(
-    targets: torch.Tensor, bins_per_dim: int = 6
+def _visualization_threshold() -> float:
+    return 0.0
+
+
+def _format_matrix(matrix: torch.Tensor | list[list[float]]) -> str:
+    if isinstance(matrix, torch.Tensor):
+        matrix = matrix.detach().cpu().tolist()
+    rows = ["[" + ",".join(f"{value:.4e}" for value in row) + "]" for row in matrix]
+    return "[" + ";".join(rows) + "]"
+
+
+def _parse_target_stiffness(raw: str) -> list[float]:
+    values = [float(value.strip()) for value in raw.split(",") if value.strip()]
+    if len(values) != 9:
+        raise ValueError(
+            "target stiffness must contain exactly 9 comma-separated values"
+        )
+    return values
+
+
+def _normalize_matrix(
+    matrix: torch.Tensor,
+    normalization: dict[str, list[float]],
 ) -> torch.Tensor:
-    weights = torch.zeros(targets.shape[0], dtype=torch.float32)
-    quantiles = torch.linspace(0.0, 1.0, steps=bins_per_dim + 1)
-    for dim in range(targets.shape[1]):
-        values = targets[:, dim].contiguous()
-        edges = torch.quantile(values, quantiles)
-        inner_edges = edges[1:-1].contiguous()
-        bin_ids = torch.bucketize(values, inner_edges)
-        counts = torch.bincount(bin_ids, minlength=bins_per_dim).clamp_min(1)
-        weights = weights + counts[bin_ids].float().reciprocal()
-
-    weights = weights / weights.mean().clamp_min(1e-6)
-    return weights
+    flattened = symmetric_matrix_unique_values(matrix)
+    mean = matrix.new_tensor(normalization["mean"])
+    std = matrix.new_tensor(normalization["std"])
+    normalized = (flattened - mean) / std
+    return unique_values_to_symmetric_matrix(normalized, size=3)
 
 
-def _softmin_weights(losses: torch.Tensor, temperature: float) -> torch.Tensor:
-    scaled = -losses / max(temperature, 1e-6)
-    return torch.softmax(scaled, dim=1)
+def _normalize_residual_matrix(
+    residual: torch.Tensor,
+    normalization: dict[str, list[float]],
+) -> torch.Tensor:
+    flattened = symmetric_matrix_unique_values(residual)
+    std = residual.new_tensor(normalization["std"])
+    normalized = flattened / std
+    return unique_values_to_symmetric_matrix(normalized, size=3)
 
 
-def _monotonic_improvement_penalty(step_errors: list[torch.Tensor]) -> torch.Tensor:
-    penalties = []
-    for previous, current in zip(step_errors, step_errors[1:]):
-        penalties.append(F.relu(current - previous))
-    if not penalties:
-        return torch.zeros_like(step_errors[0])
-    return torch.stack(penalties, dim=0).mean(dim=0)
-
-
-def _diversity_penalty(grouped_probs: torch.Tensor, scale: float) -> torch.Tensor:
-    sample_count = grouped_probs.shape[1]
-    if sample_count < 2:
-        return torch.zeros(grouped_probs.shape[0], device=grouped_probs.device)
-
-    flattened = grouped_probs.reshape(grouped_probs.shape[0], sample_count, -1)
-    pair_penalties = []
-    for left in range(sample_count):
-        for right in range(left + 1, sample_count):
-            difference = (flattened[:, left] - flattened[:, right]).abs().mean(dim=1)
-            pair_penalties.append(torch.exp(-difference / max(scale, 1e-6)))
-
-    return torch.stack(pair_penalties, dim=0).mean(dim=0)
-
-
-def candidate_scores(
-    designs: torch.Tensor, target_props: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    terms = mechanical_terms(designs)
-    property_error = (terms["properties"] - target_props).square().mean(dim=1)
-    score = (
-        property_error
-        + 0.10 * terms["connectivity_penalty"]
-        + 0.02 * terms["occupancy_mass"]
-        + 0.005 * terms["surface"]
+def _mechanics_condition_matrices(
+    target_stiffness: torch.Tensor,
+    current_stiffness: torch.Tensor,
+    normalization: dict[str, list[float]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    residual_stiffness = target_stiffness - current_stiffness
+    return (
+        _normalize_matrix(target_stiffness, normalization),
+        _normalize_matrix(current_stiffness, normalization),
+        _normalize_residual_matrix(residual_stiffness, normalization),
     )
-    return score, property_error, terms
+
+
+def _nodal_mechanics_features(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+) -> torch.Tensor:
+    with torch.no_grad():
+        response_fields = mechanical_response_fields(positions, roles, adjacency)
+    return _nodal_mechanics_features_from_fields(positions, response_fields)
+
+
+def _nodal_mechanics_features_from_fields(
+    positions: torch.Tensor,
+    response_fields: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    batch_size = positions.shape[0]
+    deformation_features = (
+        response_fields["translations"]
+        .permute(0, 2, 1, 3)
+        .reshape(batch_size, positions.shape[1], 6)
+        / FrameFEMConfig().workspace_size
+    )
+    stress_feature = (
+        response_fields["nodal_stress"] / FrameFEMConfig().yield_stress
+    ).unsqueeze(-1)
+    return torch.cat([deformation_features, stress_feature], dim=-1)
+
+
+def _sample_supervised_denoising_batch(
+    teacher_positions: torch.Tensor,
+    roles: torch.Tensor,
+    teacher_adjacency: torch.Tensor,
+    position_noise_scale: float,
+    connectivity_noise_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _inject_rollout_noise(
+        teacher_positions,
+        roles,
+        teacher_adjacency,
+        torch.ones((teacher_positions.shape[0],), device=teacher_positions.device),
+        position_noise_scale=position_noise_scale,
+        connectivity_noise_scale=connectivity_noise_scale,
+    )
+
+
+def _supervised_reconstruction_losses(
+    predicted_positions: torch.Tensor,
+    target_positions: torch.Tensor,
+    roles: torch.Tensor,
+    predicted_adjacency: torch.Tensor,
+    target_adjacency: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    free_mask = (roles == ROLE_FREE).to(dtype=predicted_positions.dtype)
+    position_sq_error = (predicted_positions - target_positions).square().sum(dim=-1)
+    position_loss = (position_sq_error * free_mask).sum() / free_mask.sum().clamp_min(
+        1.0
+    )
+    adjacency_loss = F.mse_loss(predicted_adjacency, target_adjacency)
+    return position_loss, adjacency_loss
+
+
+def _matrix_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    normalization: dict[str, list[float]],
+) -> torch.Tensor:
+    pred_unique = symmetric_matrix_unique_values(predicted)
+    target_unique = symmetric_matrix_unique_values(target)
+    mean = predicted.new_tensor(normalization["mean"])
+    std = predicted.new_tensor(normalization["std"])
+    return F.mse_loss((pred_unique - mean) / std, (target_unique - mean) / std)
+
+
+def _stiffness_to_response(stiffness_matrix: torch.Tensor) -> torch.Tensor:
+    stabilized = 0.5 * (stiffness_matrix + stiffness_matrix.transpose(1, 2))
+    eye = torch.eye(3, device=stabilized.device, dtype=stabilized.dtype)
+    return torch.linalg.solve(stabilized, eye.unsqueeze(0).expand_as(stabilized))
+
+
+def _inject_rollout_noise(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    time_fraction: torch.Tensor,
+    position_noise_scale: float,
+    connectivity_noise_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if position_noise_scale <= 0.0 and connectivity_noise_scale <= 0.0:
+        return positions, adjacency
+
+    free_mask = (roles == ROLE_FREE).unsqueeze(-1).to(dtype=positions.dtype)
+    if position_noise_scale > 0.0:
+        position_noise = torch.randn_like(positions) * (
+            position_noise_scale * time_fraction[:, None, None]
+        )
+        positions = (positions + free_mask * position_noise).clamp(0.0, 1.0)
+
+    if connectivity_noise_scale > 0.0:
+        adjacency_noise = torch.randn_like(adjacency) * (
+            connectivity_noise_scale * time_fraction[:, None, None]
+        )
+        adjacency = enforce_role_adjacency_constraints(
+            (adjacency + adjacency_noise).clamp(0.0, 1.0),
+            roles,
+        )
+    return positions, adjacency
+
+
+def _monotonic_improvement_loss(step_errors: list[torch.Tensor]) -> torch.Tensor:
+    if len(step_errors) < 2:
+        return torch.zeros((), device=step_errors[0].device)
+    penalties = [
+        (current - previous).clamp_min(0.0)
+        for previous, current in zip(step_errors[:-1], step_errors[1:])
+    ]
+    return torch.stack(penalties, dim=0).mean()
+
+
+def _geometry_regularization_config(
+    config: TrainConfig,
+) -> GeometryRegularizationConfig:
+    return GeometryRegularizationConfig(
+        min_length=config.min_beam_length,
+        max_length=config.max_beam_length,
+        min_diameter=config.min_beam_diameter,
+        max_diameter=config.max_beam_diameter,
+        min_free_node_spacing=config.min_free_node_spacing,
+        boundary_margin=config.boundary_margin,
+    )
+
+
+def _log_matrix(
+    writer: SummaryWriter,
+    prefix: str,
+    matrix: torch.Tensor,
+    step: int,
+) -> None:
+    names = [
+        ["ux_ux", "ux_uy", "ux_theta"],
+        ["uy_ux", "uy_uy", "uy_theta"],
+        ["theta_ux", "theta_uy", "theta_theta"],
+    ]
+    for row_idx in range(3):
+        for col_idx in range(3):
+            writer.add_scalar(
+                f"{prefix}/{names[row_idx][col_idx]}",
+                matrix[row_idx, col_idx].item(),
+                step,
+            )
+
+
+def rollout_refinement(
+    model: GraphRefinementModel,
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    target_stiffness: torch.Tensor,
+    target_normalization: dict[str, list[float]],
+    steps: int,
+    position_step_size: float,
+    connectivity_step_size: float,
+    base_time: torch.Tensor,
+    position_noise_scale: float = 0.0,
+    connectivity_noise_scale: float = 0.0,
+    geometry_config: GeometryRegularizationConfig | None = None,
+    initial_stiffness: torch.Tensor | None = None,
+) -> list[dict[str, torch.Tensor]]:
+    current_positions = positions
+    current_adjacency = adjacency
+    states: list[dict[str, torch.Tensor]] = []
+    current_stiffness = initial_stiffness
+
+    for step_idx in range(steps):
+        time_fraction = 1.0 - step_idx / max(steps - 1, 1)
+        timestep = base_time * time_fraction
+        position_noise_levels = position_noise_scale * timestep
+        connectivity_noise_levels = connectivity_noise_scale * timestep
+        if current_stiffness is None:
+            with torch.no_grad():
+                current_response_fields = mechanical_response_fields(
+                    current_positions,
+                    roles,
+                    current_adjacency,
+                )
+            current_stiffness = current_response_fields["stiffness_matrix"]
+            current_nodal_mechanics = _nodal_mechanics_features_from_fields(
+                current_positions,
+                current_response_fields,
+            )
+        else:
+            current_nodal_mechanics = _nodal_mechanics_features(
+                current_positions,
+                roles,
+                current_adjacency,
+            )
+        target_features, current_features, residual_features = (
+            _mechanics_condition_matrices(
+                target_stiffness,
+                current_stiffness,
+                target_normalization,
+            )
+        )
+        outputs = model(
+            current_positions,
+            roles,
+            current_adjacency,
+            target_features,
+            current_features,
+            residual_features,
+            current_nodal_mechanics,
+            timestep,
+            position_noise_levels,
+            connectivity_noise_levels,
+        )
+        refined_positions = apply_free_node_update(
+            current_positions,
+            outputs["displacements"],
+            roles,
+            position_step_size,
+        )
+        refined_adjacency = refine_connectivity(
+            current_adjacency,
+            refined_positions,
+            roles,
+            outputs["delta_scores"],
+            connectivity_step_size,
+        )
+        current_positions, current_adjacency = _inject_rollout_noise(
+            refined_positions,
+            roles,
+            refined_adjacency,
+            base_time * time_fraction,
+            position_noise_scale,
+            connectivity_noise_scale,
+        )
+        state = {
+            "positions": current_positions,
+            "roles": roles,
+            "adjacency": current_adjacency,
+            "refined_positions": refined_positions,
+            "refined_adjacency": refined_adjacency,
+            "displacements": outputs["displacements"],
+            "node_latents": outputs["node_latents"],
+            "delta_scores": outputs["delta_scores"],
+        }
+        if geometry_config is not None:
+            step_terms = mechanical_terms(
+                current_positions,
+                roles,
+                current_adjacency,
+                geometry_config=geometry_config,
+            )
+            state["terms"] = step_terms
+            current_stiffness = step_terms["stiffness_matrix"].detach()
+        else:
+            current_stiffness = None
+        states.append(state)
+    return states
 
 
 def _log_canonical_evaluation(
     writer: SummaryWriter,
-    model: ConditionedDenoiser,
+    model: GraphRefinementModel,
     config: TrainConfig,
     step: int,
     device: torch.device,
-    canonical_specs: list[tuple[str, tuple[float, float, float]]],
+    canonical_specs: list[tuple[str, torch.Tensor]],
+    target_normalization: dict[str, list[float]],
+    animation_output_dir: Path | None = None,
 ) -> None:
-    targets = torch.tensor(
-        [values for _, values in canonical_specs], dtype=torch.float32, device=device
+    geometry_config = _geometry_regularization_config(config)
+    positions, roles, adjacency = _pure_noise_batch(
+        len(canonical_specs),
+        config.num_nodes,
+        device,
+        seed=config.seed + 101,
     )
-    noise = _fixed_noise(
-        len(canonical_specs), config.grid_size, config.seed + 101, device
+    raw_targets = torch.stack([values for _, values in canonical_specs], dim=0).to(
+        device
     )
-    rollout = rollout_model(
+    target_responses = _stiffness_to_response(raw_targets)
+    base_time = torch.ones((len(canonical_specs),), device=device)
+    rollout = rollout_refinement(
         model,
-        targets,
-        noise,
+        positions,
+        roles,
+        adjacency,
+        raw_targets,
+        target_normalization,
         steps=config.rollout_steps,
-        step_size=config.rollout_step_size,
+        position_step_size=config.position_step_size,
+        connectivity_step_size=config.connectivity_step_size,
+        base_time=base_time,
+        position_noise_scale=0.0,
+        connectivity_noise_scale=0.0,
     )
-    probs = rollout[-1]
-    design = binarize_design(probs)
-    search_scores, property_error, terms = candidate_scores(design, targets)
-
-    step_errors = []
-    for probs_step in rollout:
-        step_terms = mechanical_terms(probs_step)
-        step_errors.append(
-            ((step_terms["properties"] - targets).square().mean(dim=1)).cpu()
-        )
+    final_state = rollout[-1]
+    final_terms = mechanical_terms(
+        final_state["positions"],
+        roles,
+        final_state["adjacency"],
+        geometry_config=geometry_config,
+    )
 
     for idx, (name, target_values) in enumerate(canonical_specs):
-        design_image = design[idx : idx + 1].cpu()
-        achieved = terms["properties"][idx]
-        error = property_error[idx].item()
-        writer.add_images(
-            f"canonical/{name}/design",
-            design_image,
-            global_step=step,
-            dataformats="NCHW",
+        figure = plot_graph_design(
+            final_state["positions"][idx],
+            roles[idx],
+            final_state["adjacency"][idx],
+            threshold=_visualization_threshold(),
+            title=name,
         )
-        writer.add_scalar(f"canonical/{name}/target_kx", target_values[0], step)
-        writer.add_scalar(f"canonical/{name}/target_ky", target_values[1], step)
-        writer.add_scalar(f"canonical/{name}/target_ktheta", target_values[2], step)
-        writer.add_scalar(f"canonical/{name}/achieved_kx", achieved[0].item(), step)
-        writer.add_scalar(f"canonical/{name}/achieved_ky", achieved[1].item(), step)
-        writer.add_scalar(f"canonical/{name}/achieved_ktheta", achieved[2].item(), step)
-        writer.add_scalar(f"canonical/{name}/property_error", error, step)
-        writer.add_scalar(f"canonical/{name}/score", search_scores[idx].item(), step)
-        for rollout_idx, errors in enumerate(step_errors, start=1):
+        writer.add_figure(f"canonical/00_designs/{name}", figure, global_step=step)
+        _log_matrix(
+            writer,
+            f"canonical/10_target_stiffness/{name}",
+            target_values,
+            step,
+        )
+        _log_matrix(
+            writer,
+            f"canonical/20_achieved_stiffness/{name}",
+            final_terms["stiffness_matrix"][idx],
+            step,
+        )
+        _log_matrix(
+            writer,
+            f"canonical/25_achieved_response/{name}",
+            final_terms["response_matrix"][idx],
+            step,
+        )
+        for rollout_idx, state in enumerate(rollout, start=1):
+            step_terms = mechanical_terms(
+                state["positions"][idx : idx + 1],
+                roles[idx : idx + 1],
+                state["adjacency"][idx : idx + 1],
+                geometry_config=geometry_config,
+            )
+            step_error = _matrix_loss(
+                step_terms["stiffness_matrix"],
+                raw_targets[idx : idx + 1],
+                target_normalization,
+            )
             writer.add_scalar(
-                f"canonical/{name}/property_error_step_{rollout_idx}",
-                errors[idx].item(),
+                f"canonical/30_property_error/{name}/step_{rollout_idx}",
+                step_error.item(),
                 step,
             )
+        plt = figure
+        plt.clf()
 
-    _progress(
-        "train:canonical_eval "
-        f"step={step} {canonical_specs[0][0]}={property_error[0].item():.4f} "
-        f"{canonical_specs[1][0]}={property_error[1].item():.4f} "
-        f"{canonical_specs[2][0]}={property_error[2].item():.4f}"
-    )
+    if animation_output_dir is not None and canonical_specs:
+        name, _ = canonical_specs[0]
+        animation_rollout = []
+        for state in rollout:
+            animation_rollout.append(
+                {
+                    key: value[0]
+                    for key, value in state.items()
+                    if isinstance(value, torch.Tensor)
+                }
+            )
+        animation_path = export_rollout_animation(
+            animation_output_dir / f"step_{step:05d}_{name}.gif",
+            positions[0],
+            roles[0],
+            adjacency[0],
+            animation_rollout,
+            target_responses[0],
+            threshold=_visualization_threshold(),
+            frame_config=FrameFEMConfig(),
+            title=name,
+        )
+        _progress(f"train:animation path={animation_path}")
 
 
 def train(config: TrainConfig) -> tuple[Path, Path]:
     _seed_everything(config.seed)
-    device = _device()
+    device = _device(config.device)
+    geometry_config = _geometry_regularization_config(config)
+    train_steps = max(config.train_steps, 1)
     _progress(
-        "train:start "
-        f"device={device} epochs={config.epochs} dataset_size={config.dataset_size} "
-        f"batch_size={config.batch_size} rollout_steps={config.rollout_steps} "
-        f"samples_per_target={config.train_samples_per_target}"
+        f"train:start device={device} train_steps={train_steps} batch_size={config.batch_size} num_nodes={config.num_nodes}"
     )
 
-    designs = generate_dataset(config.dataset_size, config.grid_size, config.seed)
-    targets = mechanical_terms(threshold_occupancy(designs))["properties"]
-    canonical_reference_size = max(128, config.dataset_size)
-    canonical_reference_designs = generate_dataset(
-        canonical_reference_size, config.grid_size, config.seed + 1
+    fixed_targets = torch.stack(
+        [matrix for _, matrix in _fixed_stiffness_target_specs(device)], dim=0
     )
-    canonical_reference_targets = mechanical_terms(
-        threshold_occupancy(canonical_reference_designs)
-    )["properties"]
-    canonical_specs = _canonical_target_specs(canonical_reference_targets)
-    dataset = TensorDataset(targets)
-    sampling_weights = _target_sampling_weights(targets)
-    sampler = WeightedRandomSampler(
-        weights=sampling_weights,
-        num_samples=len(targets),
-        replacement=True,
-    )
-    loader = DataLoader(dataset, batch_size=config.batch_size, sampler=sampler)
+    target_normalization = _target_normalization(fixed_targets)
+    canonical_specs = _fixed_stiffness_target_specs(device)[:3]
     _progress(
-        "train:canonical_stats "
-        f"mu=({canonical_reference_targets[:, 0].mean().item():.3f},"
-        f"{canonical_reference_targets[:, 1].mean().item():.3f},"
-        f"{canonical_reference_targets[:, 2].mean().item():.3f}) "
-        f"sigma=({canonical_reference_targets[:, 0].std(unbiased=False).item():.3f},"
-        f"{canonical_reference_targets[:, 1].std(unbiased=False).item():.3f},"
-        f"{canonical_reference_targets[:, 2].std(unbiased=False).item():.3f})"
-    )
-    _progress(
-        "train:canonical_targets "
+        "train:canonical_stiffness_targets "
         + " ".join(
-            f"{name}=({values[0]:.3f},{values[1]:.3f},{values[2]:.3f})"
-            for name, values in canonical_specs
+            f"{name}={_format_matrix(values)}" for name, values in canonical_specs
         )
     )
 
-    model = ConditionedDenoiser(
-        grid_size=config.grid_size,
-        patch_size=config.patch_size,
+    model = GraphRefinementModel(
         d_model=config.d_model,
         nhead=config.nhead,
         num_layers=config.num_layers,
+        latent_dim=config.latent_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-
-    log_dir = _timestamped_run_dir(config.name)
+    writer = SummaryWriter(log_dir=str(_timestamped_run_dir(config.name)))
+    log_dir = Path(writer.log_dir)
     checkpoint_path = Path(config.checkpoint_path)
-    log_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-    writer = SummaryWriter(log_dir=str(log_dir))
     global_step = 0
+    running_totals = {
+        "total": 0.0,
+        "property": 0.0,
+        "monotonic": 0.0,
+        "supervised": 0.0,
+        "supervised_position": 0.0,
+        "supervised_adjacency": 0.0,
+        "material": 0.0,
+        "sparsity": 0.0,
+        "connectivity": 0.0,
+        "fixed_mobile_connectivity": 0.0,
+        "short_beam": 0.0,
+        "long_beam": 0.0,
+        "thin_diameter": 0.0,
+        "thick_diameter": 0.0,
+        "node_spacing": 0.0,
+        "boundary": 0.0,
+        "yield_stress": 0.0,
+    }
+    step_weights = _step_weights(config.rollout_steps, device)
 
-    for epoch in range(config.epochs):
-        model.train()
-        _progress(f"train:epoch_start epoch={epoch + 1}/{config.epochs}")
-        epoch_totals = {
-            "total": 0.0,
-            "property": 0.0,
-            "surface": 0.0,
-            "connectivity": 0.0,
-            "mass": 0.0,
-            "binarization": 0.0,
-            "improvement": 0.0,
-            "diversity": 0.0,
-            "binary_property_error": 0.0,
-            "best_binary_property_error": 0.0,
-            "candidate_spread": 0.0,
-        }
+    model.train()
+    for step in range(1, train_steps + 1):
+        current_seed = config.seed + step + 1000
+        positions, roles, adjacency = _pure_noise_batch(
+            config.batch_size,
+            config.num_nodes,
+            device,
+            seed=current_seed,
+        )
+        goal_targets = _sample_stiffness_targets(config.batch_size, device)
+        with torch.no_grad():
+            start_terms = mechanical_terms(positions, roles, adjacency)
+        goal_blend = _scheduled_goal_blend(
+            step,
+            train_steps,
+            blend_start=config.training_goal_blend_start,
+            blend_end=config.training_goal_blend_end,
+        )
+        raw_targets = _blend_training_targets(
+            start_terms["stiffness_matrix"],
+            goal_targets,
+            goal_blend=goal_blend,
+        )
+        base_time = torch.rand((positions.shape[0],), device=device)
 
-        for batch_idx, (target_props,) in enumerate(loader, start=1):
-            target_props = target_props.to(device)
-            expanded_targets = target_props.repeat_interleave(
-                config.train_samples_per_target, dim=0
+        rollout = rollout_refinement(
+            model,
+            positions,
+            roles,
+            adjacency,
+            raw_targets,
+            target_normalization,
+            steps=config.rollout_steps,
+            position_step_size=config.position_step_size,
+            connectivity_step_size=config.connectivity_step_size,
+            base_time=base_time,
+            position_noise_scale=config.rollout_position_noise,
+            connectivity_noise_scale=config.rollout_connectivity_noise,
+            geometry_config=geometry_config,
+            initial_stiffness=start_terms["stiffness_matrix"],
+        )
+        property_loss = torch.zeros((), device=device)
+        material_loss = torch.zeros((), device=device)
+        sparsity_loss = torch.zeros((), device=device)
+        connectivity_loss = torch.zeros((), device=device)
+        fixed_mobile_connectivity_loss = torch.zeros((), device=device)
+        short_beam_loss = torch.zeros((), device=device)
+        long_beam_loss = torch.zeros((), device=device)
+        thin_diameter_loss = torch.zeros((), device=device)
+        thick_diameter_loss = torch.zeros((), device=device)
+        node_spacing_loss = torch.zeros((), device=device)
+        boundary_loss = torch.zeros((), device=device)
+        yield_stress_loss = torch.zeros((), device=device)
+        step_errors: list[torch.Tensor] = []
+        for step_idx, state in enumerate(rollout):
+            step_terms = state["terms"]
+            step_error = _matrix_loss(
+                step_terms["stiffness_matrix"],
+                raw_targets,
+                target_normalization,
             )
-            noise = torch.rand(
-                (
-                    expanded_targets.shape[0],
-                    1,
-                    config.grid_size,
-                    config.grid_size,
-                ),
-                device=device,
+            step_errors.append(step_error)
+            property_loss = property_loss + step_weights[step_idx] * step_error
+            material_loss = (
+                material_loss + step_weights[step_idx] * step_terms["material"].mean()
             )
-            rollout = rollout_model(
-                model,
-                expanded_targets,
-                noise,
-                steps=config.rollout_steps,
-                step_size=config.rollout_step_size,
-                noise_scale=config.rollout_noise_scale,
+            sparsity_loss = (
+                sparsity_loss + step_weights[step_idx] * step_terms["sparsity"].mean()
             )
-            final_probs = rollout[-1]
-            final_terms = mechanical_terms(final_probs)
-            binary_predictions = _force_plates(threshold_occupancy(final_probs))
-            _, binary_property_error, _ = candidate_scores(
-                binary_predictions, expanded_targets
+            connectivity_loss = (
+                connectivity_loss
+                + step_weights[step_idx] * step_terms["connectivity_penalty"].mean()
             )
+            fixed_mobile_connectivity_loss = (
+                fixed_mobile_connectivity_loss
+                + step_weights[step_idx]
+                * step_terms["fixed_mobile_connectivity_penalty"].mean()
+            )
+            short_beam_loss = (
+                short_beam_loss
+                + step_weights[step_idx] * step_terms["short_beam_penalty"].mean()
+            )
+            long_beam_loss = (
+                long_beam_loss
+                + step_weights[step_idx] * step_terms["long_beam_penalty"].mean()
+            )
+            thin_diameter_loss = (
+                thin_diameter_loss
+                + step_weights[step_idx] * step_terms["thin_diameter_penalty"].mean()
+            )
+            thick_diameter_loss = (
+                thick_diameter_loss
+                + step_weights[step_idx] * step_terms["thick_diameter_penalty"].mean()
+            )
+            node_spacing_loss = (
+                node_spacing_loss
+                + step_weights[step_idx] * step_terms["node_spacing_penalty"].mean()
+            )
+            boundary_loss = (
+                boundary_loss
+                + step_weights[step_idx] * step_terms["boundary_penalty"].mean()
+            )
+            yield_stress_loss = (
+                yield_stress_loss
+                + step_weights[step_idx] * step_terms["yield_stress_penalty"].mean()
+            )
+        monotonic_loss = _monotonic_improvement_loss(step_errors)
 
-            step_weights = _step_weights(config.rollout_steps, device)
-            per_candidate_property = torch.zeros(
-                expanded_targets.shape[0], device=device
-            )
-            per_step_errors: list[torch.Tensor] = []
-            for step_idx, probs in enumerate(rollout):
-                step_terms = mechanical_terms(probs)
-                step_error = (
-                    (step_terms["properties"] - expanded_targets).square().mean(dim=1)
-                )
-                per_step_errors.append(step_error)
-                per_candidate_property = (
-                    per_candidate_property + step_weights[step_idx] * step_error
-                )
-
-            improvement_penalty = _monotonic_improvement_penalty(per_step_errors)
-
-            per_candidate_total = (
-                config.property_weight * per_candidate_property
-                + config.improvement_weight * improvement_penalty
-                + config.surface_weight * final_terms["surface"]
-                + config.connectivity_weight * final_terms["connectivity_penalty"]
-                + config.mass_weight * final_terms["occupancy_mass"]
-                + config.binarization_weight * binarization_penalty(final_probs)
-            )
-            per_target_total = per_candidate_total.view(
-                target_props.shape[0], config.train_samples_per_target
-            )
-            soft_weights = _softmin_weights(
-                per_target_total, config.train_softmin_temperature
-            )
-            total = (soft_weights * per_target_total).sum(dim=1).mean()
-
-            per_target_property = per_candidate_property.view(
-                target_props.shape[0], config.train_samples_per_target
-            )
-            per_target_surface = final_terms["surface"].view(
-                target_props.shape[0], config.train_samples_per_target
-            )
-            per_target_connectivity = final_terms["connectivity_penalty"].view(
-                target_props.shape[0], config.train_samples_per_target
-            )
-            per_target_mass = final_terms["occupancy_mass"].view(
-                target_props.shape[0], config.train_samples_per_target
-            )
-            per_target_binarization = binarization_penalty(final_probs).view(
-                target_props.shape[0], config.train_samples_per_target
-            )
-            grouped_final_probs = final_probs.view(
-                target_props.shape[0],
-                config.train_samples_per_target,
-                1,
-                config.grid_size,
-                config.grid_size,
-            )
-            per_target_binary_property = binary_property_error.view(
-                target_props.shape[0], config.train_samples_per_target
-            )
-            diversity_penalty = _diversity_penalty(
-                grouped_final_probs, config.diversity_scale
-            )
-
-            property_loss = (soft_weights * per_target_property).sum(dim=1).mean()
-            per_target_improvement = improvement_penalty.view(
-                target_props.shape[0], config.train_samples_per_target
-            )
-            surface = (soft_weights * per_target_surface).sum(dim=1).mean()
-            connectivity = (soft_weights * per_target_connectivity).sum(dim=1).mean()
-            mass = (soft_weights * per_target_mass).sum(dim=1).mean()
-            binarization = (soft_weights * per_target_binarization).sum(dim=1).mean()
-            improvement = (soft_weights * per_target_improvement).sum(dim=1).mean()
-            diversity = diversity_penalty.mean()
-            binary_property_error_mean = (
-                (soft_weights * per_target_binary_property).sum(dim=1).mean()
-            )
-            best_binary_property_error = per_target_binary_property.min(
-                dim=1
-            ).values.mean()
-            candidate_spread = per_target_total.std(dim=1).mean()
-
-            total = total + config.diversity_weight * diversity_penalty.mean()
-
-            optimizer.zero_grad(set_to_none=True)
-            total.backward()
-            optimizer.step()
-
-            epoch_totals["total"] += total.item()
-            epoch_totals["property"] += property_loss.item()
-            epoch_totals["surface"] += surface.item()
-            epoch_totals["connectivity"] += connectivity.item()
-            epoch_totals["mass"] += mass.item()
-            epoch_totals["binarization"] += binarization.item()
-            epoch_totals["improvement"] += improvement.item()
-            epoch_totals["diversity"] += diversity.item()
-            epoch_totals["binary_property_error"] += binary_property_error_mean.item()
-            epoch_totals["best_binary_property_error"] += (
-                best_binary_property_error.item()
-            )
-            epoch_totals["candidate_spread"] += candidate_spread.item()
-
-            writer.add_scalar("train/total_loss", total.item(), global_step)
-            writer.add_scalar("train/property_loss", property_loss.item(), global_step)
-            writer.add_scalar("train/surface_loss", surface.item(), global_step)
-            writer.add_scalar(
-                "train/connectivity_penalty", connectivity.item(), global_step
-            )
-            writer.add_scalar("train/occupancy_mass", mass.item(), global_step)
-            writer.add_scalar(
-                "train/binarization_penalty", binarization.item(), global_step
-            )
-            writer.add_scalar(
-                "train/improvement_penalty", improvement.item(), global_step
-            )
-            writer.add_scalar("train/diversity_penalty", diversity.item(), global_step)
-            writer.add_scalar(
-                "train/binary_property_error",
-                binary_property_error_mean.item(),
-                global_step,
-            )
-            writer.add_scalar(
-                "train/best_binary_property_error",
-                best_binary_property_error.item(),
-                global_step,
-            )
-            writer.add_scalar(
-                "train/candidate_spread", candidate_spread.item(), global_step
-            )
-            global_step += 1
-
-            if (
-                config.canonical_eval_every_steps > 0
-                and global_step % config.canonical_eval_every_steps == 0
-            ):
-                _log_canonical_evaluation(
-                    writer, model, config, global_step, device, canonical_specs
-                )
-
-            if config.log_every_steps > 0 and (
-                batch_idx % config.log_every_steps == 0 or batch_idx == len(loader)
-            ):
-                _progress(
-                    "train:step "
-                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx}/{len(loader)} "
-                    f"global_step={global_step} total={total.item():.4f} "
-                    f"prop={property_loss.item():.4f} bin_prop={binary_property_error_mean.item():.4f} "
-                    f"best_bin={best_binary_property_error.item():.4f} improve={improvement.item():.4f} "
-                    f"div={diversity.item():.4f} spread={candidate_spread.item():.4f}"
-                )
-
-        num_batches = max(len(loader), 1)
-        for name, value in epoch_totals.items():
-            writer.add_scalar(f"epoch/{name}", value / num_batches, epoch)
-
-        _progress(
-            "train:epoch_end "
-            f"epoch={epoch + 1}/{config.epochs} "
-            f"total={epoch_totals['total'] / num_batches:.4f} "
-            f"prop={epoch_totals['property'] / num_batches:.4f} "
-            f"bin_prop={epoch_totals['binary_property_error'] / num_batches:.4f} "
-            f"improve={epoch_totals['improvement'] / num_batches:.4f} "
-            f"div={epoch_totals['diversity'] / num_batches:.4f} "
-            f"best_bin={epoch_totals['best_binary_property_error'] / num_batches:.4f} "
-            f"spread={epoch_totals['candidate_spread'] / num_batches:.4f}"
+        final_state = rollout[-1]
+        free_loss = (
+            config.property_weight * property_loss
+            + config.monotonic_improvement_weight * monotonic_loss
+            + config.material_weight * material_loss
+            + config.sparsity_weight * sparsity_loss
+            + config.connectivity_weight * connectivity_loss
+            + config.fixed_mobile_connectivity_weight * fixed_mobile_connectivity_loss
+            + config.short_beam_weight * short_beam_loss
+            + config.long_beam_weight * long_beam_loss
+            + config.thin_diameter_weight * thin_diameter_loss
+            + config.thick_diameter_weight * thick_diameter_loss
+            + config.node_spacing_weight * node_spacing_loss
+            + config.boundary_weight * boundary_loss
+            + config.yield_stress_weight * yield_stress_loss
         )
 
-        model.eval()
-        with torch.no_grad():
-            preview_targets = targets[:8].to(device)
-            preview_noise = _fixed_noise(
-                preview_targets.shape[0], config.grid_size, config.seed + 202, device
+        supervised_position_loss = torch.zeros((), device=device)
+        supervised_adjacency_loss = torch.zeros((), device=device)
+        supervised_loss = torch.zeros((), device=device)
+        if (
+            config.supervised_denoising_weight > 0.0
+            and step % max(config.supervised_every_steps, 1) == 0
+        ):
+            teacher_positions = final_state["refined_positions"].detach()
+            teacher_adjacency = final_state["refined_adjacency"].detach()
+            noisy_positions, noisy_adjacency = _sample_supervised_denoising_batch(
+                teacher_positions,
+                roles,
+                teacher_adjacency,
+                position_noise_scale=config.supervised_position_noise,
+                connectivity_noise_scale=config.supervised_connectivity_noise,
             )
-            preview_probs = sample_from_model(
-                model,
-                preview_targets,
-                preview_noise,
-                steps=config.rollout_steps,
-                step_size=config.rollout_step_size,
+            with torch.no_grad():
+                noisy_terms = mechanical_terms(noisy_positions, roles, noisy_adjacency)
+                noisy_nodal_mechanics = _nodal_mechanics_features_from_fields(
+                    noisy_positions,
+                    noisy_terms,
+                )
+            target_features, current_features, residual_features = (
+                _mechanics_condition_matrices(
+                    raw_targets,
+                    noisy_terms["stiffness_matrix"],
+                    target_normalization,
+                )
             )
-            preview_binary = binarize_design(preview_probs)
-            preview_terms = mechanical_terms(preview_binary)
-            property_error = F.mse_loss(preview_terms["properties"], preview_targets)
-            _write_samples(writer, "samples/generated", preview_binary.cpu(), epoch)
-            writer.add_scalar("samples/property_error", property_error.item(), epoch)
+            denoising_outputs = model(
+                noisy_positions,
+                roles,
+                noisy_adjacency,
+                target_features,
+                current_features,
+                residual_features,
+                noisy_nodal_mechanics,
+                torch.zeros((positions.shape[0],), device=device),
+                torch.full(
+                    (positions.shape[0],),
+                    config.supervised_position_noise,
+                    device=device,
+                ),
+                torch.full(
+                    (positions.shape[0],),
+                    config.supervised_connectivity_noise,
+                    device=device,
+                ),
+            )
+            predicted_positions = apply_free_node_update(
+                noisy_positions,
+                denoising_outputs["displacements"],
+                roles,
+                config.position_step_size,
+            )
+            predicted_adjacency = denoising_outputs["predicted_adjacency"]
+            supervised_position_loss, supervised_adjacency_loss = (
+                _supervised_reconstruction_losses(
+                    predicted_positions,
+                    teacher_positions,
+                    roles,
+                    predicted_adjacency,
+                    teacher_adjacency,
+                )
+            )
+            supervised_loss = config.supervised_denoising_weight * (
+                config.supervised_position_weight * supervised_position_loss
+                + config.supervised_adjacency_weight * supervised_adjacency_loss
+            )
+
+        total = free_loss + supervised_loss
+        optimizer.zero_grad(set_to_none=True)
+        total.backward()
+        optimizer.step()
+
+        running_totals["total"] += total.item()
+        running_totals["property"] += property_loss.item()
+        running_totals["monotonic"] += monotonic_loss.item()
+        running_totals["supervised"] += supervised_loss.item()
+        running_totals["supervised_position"] += supervised_position_loss.item()
+        running_totals["supervised_adjacency"] += supervised_adjacency_loss.item()
+        running_totals["material"] += material_loss.item()
+        running_totals["sparsity"] += sparsity_loss.item()
+        running_totals["connectivity"] += connectivity_loss.item()
+        running_totals["fixed_mobile_connectivity"] += (
+            fixed_mobile_connectivity_loss.item()
+        )
+        running_totals["short_beam"] += short_beam_loss.item()
+        running_totals["long_beam"] += long_beam_loss.item()
+        running_totals["thin_diameter"] += thin_diameter_loss.item()
+        running_totals["thick_diameter"] += thick_diameter_loss.item()
+        running_totals["node_spacing"] += node_spacing_loss.item()
+        running_totals["boundary"] += boundary_loss.item()
+        running_totals["yield_stress"] += yield_stress_loss.item()
+
+        if config.log_every_steps > 0 and step % config.log_every_steps == 0:
+            writer.add_scalar("train/total_loss", total.item(), global_step)
+            writer.add_scalar("train/goal_blend", goal_blend, global_step)
+            writer.add_scalar("train/property_loss", property_loss.item(), global_step)
             writer.add_scalar(
-                "samples/kx_mean",
-                preview_terms["properties"][:, 0].mean().item(),
-                epoch,
+                "train/monotonic_improvement_loss", monotonic_loss.item(), global_step
             )
             writer.add_scalar(
-                "samples/ky_mean",
-                preview_terms["properties"][:, 1].mean().item(),
-                epoch,
+                "train/supervised_loss", supervised_loss.item(), global_step
             )
             writer.add_scalar(
-                "samples/ktheta_mean",
-                preview_terms["properties"][:, 2].mean().item(),
-                epoch,
+                "train/supervised_position_loss",
+                supervised_position_loss.item(),
+                global_step,
             )
+            writer.add_scalar(
+                "train/supervised_adjacency_loss",
+                supervised_adjacency_loss.item(),
+                global_step,
+            )
+            writer.add_scalar("train/material_loss", material_loss.item(), global_step)
+            writer.add_scalar("train/sparsity_loss", sparsity_loss.item(), global_step)
+            writer.add_scalar(
+                "train/connectivity_penalty", connectivity_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/fixed_mobile_connectivity_penalty",
+                fixed_mobile_connectivity_loss.item(),
+                global_step,
+            )
+            writer.add_scalar(
+                "train/short_beam_penalty", short_beam_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/long_beam_penalty", long_beam_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/thin_diameter_penalty", thin_diameter_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/thick_diameter_penalty", thick_diameter_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/node_spacing_penalty", node_spacing_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/boundary_penalty", boundary_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/yield_stress_penalty",
+                yield_stress_loss.item(),
+                global_step,
+            )
+        global_step += 1
+
+        if config.log_every_steps > 0 and (
+            step % config.log_every_steps == 0 or step == train_steps
+        ):
+            window = (
+                config.log_every_steps
+                if step % config.log_every_steps == 0
+                else step % config.log_every_steps
+            )
+            if window == 0:
+                window = config.log_every_steps
+            _progress(
+                f"train:step {step}/{train_steps} total={total.item():.4f} prop={property_loss.item():.4f} sup={supervised_loss.item():.4f} conn={connectivity_loss.item():.4f} material={material_loss.item():.4f}"
+            )
+            for key, value in running_totals.items():
+                writer.add_scalar(f"window/{key}", value / window, global_step)
+                running_totals[key] = 0.0
+
+        if (
+            config.canonical_eval_every_steps > 0
+            and global_step % config.canonical_eval_every_steps == 0
+        ):
+            model.eval()
+            with torch.no_grad():
+                _log_canonical_evaluation(
+                    writer,
+                    model,
+                    config,
+                    global_step,
+                    device,
+                    canonical_specs,
+                    target_normalization,
+                    (
+                        log_dir / "animations"
+                        if config.animation_every_steps > 0
+                        and global_step % config.animation_every_steps == 0
+                        else None
+                    ),
+                )
+            model.train()
 
     payload = {
         "state_dict": model.state_dict(),
         "config": asdict(config),
+        "target_normalization": target_normalization,
     }
     torch.save(payload, checkpoint_path)
     writer.close()
@@ -566,378 +1057,414 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     return checkpoint_path, log_dir
 
 
-def rollout_model(
-    model: ConditionedDenoiser,
-    target_props: torch.Tensor,
-    initial_noise: torch.Tensor,
-    steps: int,
-    step_size: float,
-    noise_scale: float = 0.0,
-) -> list[torch.Tensor]:
-    current_logits = torch.logit(initial_noise.clamp(1e-4, 1.0 - 1e-4))
-    states: list[torch.Tensor] = []
+def refine_sample_state(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    raw_target_stiffness: torch.Tensor,
+    target_normalization: dict[str, list[float]],
+    config: TrainConfig,
+    steps: int = 12,
+    lr: float = 0.15,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    geometry_config = _geometry_regularization_config(config)
+    free_mask = (roles == ROLE_FREE).unsqueeze(-1).to(dtype=positions.dtype)
+    position_param = torch.nn.Parameter(positions.clone())
+    adjacency_param = torch.nn.Parameter(adjacency.clone())
+    optimizer = torch.optim.Adam([position_param, adjacency_param], lr=lr)
 
-    for step_idx in range(steps):
-        current_probs = _force_plates(torch.sigmoid(current_logits))
-        timestep = torch.full(
-            (initial_noise.shape[0],),
-            (step_idx + 1) / steps,
-            device=initial_noise.device,
+    for _ in range(steps):
+        current_positions = positions + free_mask * (position_param - positions)
+        current_positions = current_positions.clamp(0.0, 1.0)
+        current_adjacency = enforce_role_adjacency_constraints(
+            adjacency_param.clamp(0.0, 1.0),
+            roles,
         )
-        delta_logits = model(current_probs, target_props, timestep)
-        if noise_scale > 0.0:
-            step_noise_scale = noise_scale * (1.0 - step_idx / max(steps - 1, 1))
-            delta_logits = delta_logits + step_noise_scale * torch.randn_like(
-                delta_logits
-            )
-        current_logits = current_logits + step_size * delta_logits
-        states.append(_force_plates(torch.sigmoid(current_logits)))
+        terms = mechanical_terms(
+            current_positions,
+            roles,
+            current_adjacency,
+            geometry_config=geometry_config,
+        )
+        property_loss = _matrix_loss(
+            terms["stiffness_matrix"],
+            raw_target_stiffness,
+            target_normalization,
+        )
+        loss = (
+            config.property_weight * property_loss
+            + config.material_weight * terms["material"].mean()
+            + config.sparsity_weight * terms["sparsity"].mean()
+            + config.connectivity_weight * terms["connectivity_penalty"].mean()
+            + config.fixed_mobile_connectivity_weight
+            * terms["fixed_mobile_connectivity_penalty"].mean()
+            + config.short_beam_weight * terms["short_beam_penalty"].mean()
+            + config.long_beam_weight * terms["long_beam_penalty"].mean()
+            + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
+            + config.thick_diameter_weight * terms["thick_diameter_penalty"].mean()
+            + config.node_spacing_weight * terms["node_spacing_penalty"].mean()
+            + config.boundary_weight * terms["boundary_penalty"].mean()
+            + config.yield_stress_weight * terms["yield_stress_penalty"].mean()
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
 
-    return states
-
-
-def sample_from_model(
-    model: ConditionedDenoiser,
-    target_props: torch.Tensor,
-    initial_noise: torch.Tensor,
-    steps: int,
-    step_size: float = 1.0,
-) -> torch.Tensor:
-    return rollout_model(
-        model,
-        target_props,
-        initial_noise,
-        steps=steps,
-        step_size=step_size,
-    )[-1]
-
-
-def binarize_design(probs: torch.Tensor) -> torch.Tensor:
-    return _force_plates(threshold_occupancy(probs))
-
-
-def candidate_score(design: torch.Tensor, target_props: torch.Tensor) -> float:
-    score, _, _ = candidate_scores(design, target_props)
-    return score.mean().item()
-
-
-def search_elite_batch(
-    model: ConditionedDenoiser,
-    target_props: torch.Tensor,
-    grid_size: int,
-    model_candidates: int,
-    random_candidates: int,
-    steps: int,
-    step_size: float,
-) -> dict[str, torch.Tensor | list[str]]:
-    if model_candidates <= 0 and random_candidates <= 0:
-        raise ValueError("at least one candidate source must be enabled")
-
-    device = target_props.device
-    was_training = model.training
-    model.eval()
-    elite_designs: list[torch.Tensor] = []
-    elite_reference_probs: list[torch.Tensor] = []
-    elite_sources: list[str] = []
-
-    with torch.no_grad():
-        for index in range(target_props.shape[0]):
-            target = target_props[index : index + 1]
-            candidate_designs: list[torch.Tensor] = []
-            candidate_references: list[torch.Tensor] = []
-            candidate_sources: list[str] = []
-            candidate_scores_list: list[float] = []
-
-            if model_candidates > 0:
-                noises = torch.rand(
-                    (model_candidates, 1, grid_size, grid_size), device=device
-                )
-                repeated_target = target.repeat(model_candidates, 1)
-                model_probs = sample_from_model(
-                    model,
-                    repeated_target,
-                    noises,
-                    steps=steps,
-                    step_size=step_size,
-                )
-                model_designs = binarize_design(model_probs)
-                scores, _, _ = candidate_scores(model_designs, repeated_target)
-                for candidate_idx in range(model_candidates):
-                    candidate_designs.append(
-                        model_designs[candidate_idx : candidate_idx + 1]
-                    )
-                    candidate_references.append(
-                        model_probs[candidate_idx : candidate_idx + 1]
-                    )
-                    candidate_sources.append("model")
-                    candidate_scores_list.append(scores[candidate_idx].item())
-
-            if random_candidates > 0:
-                random_probs = torch.stack(
-                    [generate_design(grid_size) for _ in range(random_candidates)],
-                    dim=0,
-                ).unsqueeze(1)
-                random_probs = _force_plates(random_probs.to(device))
-                random_designs = binarize_design(random_probs)
-                repeated_target = target.repeat(random_candidates, 1)
-                scores, _, _ = candidate_scores(random_designs, repeated_target)
-                for candidate_idx in range(random_candidates):
-                    candidate_designs.append(
-                        random_designs[candidate_idx : candidate_idx + 1]
-                    )
-                    candidate_references.append(
-                        random_probs[candidate_idx : candidate_idx + 1]
-                    )
-                    candidate_sources.append("random")
-                    candidate_scores_list.append(scores[candidate_idx].item())
-
-            best_index = min(
-                range(len(candidate_scores_list)),
-                key=lambda idx: candidate_scores_list[idx],
-            )
-            elite_designs.append(candidate_designs[best_index])
-            elite_reference_probs.append(candidate_references[best_index])
-            elite_sources.append(candidate_sources[best_index])
-
-    if was_training:
-        model.train()
-
-    stacked_designs = torch.cat(elite_designs, dim=0)
-    stacked_reference_probs = torch.cat(elite_reference_probs, dim=0)
-    scores, property_error, terms = candidate_scores(stacked_designs, target_props)
-    return {
-        "designs": stacked_designs,
-        "reference_probs": stacked_reference_probs,
-        "scores": scores,
-        "property_error": property_error,
-        "terms": terms,
-        "sources": elite_sources,
-    }
-
-
-def _proposal_coordinates(
-    design: torch.Tensor, reference_probs: torch.Tensor, proposal_count: int
-) -> list[tuple[int, int]]:
-    height = design.shape[-2]
-    width = design.shape[-1]
-    uncertainty = (reference_probs[0, 0, 1:-1, :] - 0.5).abs().flatten().cpu()
-    order = torch.argsort(uncertainty)
-
-    coords: list[tuple[int, int]] = []
-    seen: set[tuple[int, int]] = set()
-    for flat_index in order.tolist():
-        row = flat_index // width + 1
-        col = flat_index % width
-        coord = (row, col)
-        if coord in seen:
-            continue
-        seen.add(coord)
-        coords.append(coord)
-        if len(coords) >= proposal_count:
-            return coords
-
-    random_order = torch.randperm((height - 2) * width)
-    for flat_index in random_order.tolist():
-        row = flat_index // width + 1
-        col = flat_index % width
-        coord = (row, col)
-        if coord in seen:
-            continue
-        seen.add(coord)
-        coords.append(coord)
-        if len(coords) >= proposal_count:
-            break
-    return coords
-
-
-def local_search_refine(
-    initial_design: torch.Tensor,
-    target_props: torch.Tensor,
-    reference_probs: torch.Tensor,
-    iterations: int,
-    proposal_count: int,
-    log_every: int = 0,
-) -> torch.Tensor:
-    current = initial_design.clone()
-    current_score = candidate_score(current, target_props)
-
-    for iteration in range(iterations):
-        best_candidate = None
-        best_score = current_score
-        for row, col in _proposal_coordinates(current, reference_probs, proposal_count):
-            candidate = current.clone()
-            candidate[0, 0, row, col] = 1.0 - candidate[0, 0, row, col]
-            candidate = _force_plates(candidate)
-            score = candidate_score(candidate, target_props)
-            if score < best_score - 1e-6:
-                best_score = score
-                best_candidate = candidate
-
-        if best_candidate is None:
-            if log_every > 0:
-                _progress(
-                    "sample:local_search_stop "
-                    f"iteration={iteration + 1}/{iterations} score={current_score:.4f}"
-                )
-            break
-
-        current = best_candidate
-        current_score = best_score
-
-        if log_every > 0 and (
-            (iteration + 1) % log_every == 0 or iteration + 1 == iterations
-        ):
-            _progress(
-                "sample:local_search "
-                f"iteration={iteration + 1}/{iterations} score={current_score:.4f}"
-            )
-
-    return current
+    refined_positions = (
+        (positions + free_mask * (position_param - positions)).detach().clamp(0.0, 1.0)
+    )
+    refined_adjacency = enforce_role_adjacency_constraints(
+        adjacency_param.detach().clamp(0.0, 1.0),
+        roles,
+    )
+    return refined_positions, refined_adjacency
 
 
 def sample(
     checkpoint_path: str,
-    target_props: list[float],
-    steps: int,
+    target_stiffness: list[float],
     name: str,
     output_path: str,
-    model_candidates: int,
-    random_candidates: int,
-    search_iterations: int,
-    proposal_count: int,
-    log_every_steps: int,
+    steps: int,
+    sample_threshold: float,
+    device_override: str | None = None,
+    seed_override: int | None = None,
 ) -> dict[str, object]:
-    device = _device()
-    _progress(
-        "sample:start "
-        f"target={target_props} steps={steps} model_candidates={model_candidates} "
-        f"random_candidates={random_candidates} search_iterations={search_iterations}"
-    )
+    device = _device(device_override or "auto")
     payload = torch.load(checkpoint_path, map_location=device)
-    config = TrainConfig(**payload["config"])
-    _seed_everything(config.seed)
+    config = _load_train_config(payload["config"])
+    if device_override is not None:
+        config.device = device_override
+    geometry_config = _geometry_regularization_config(config)
+    target_normalization = payload["target_normalization"]
+    sample_seed = _resolve_sample_seed(seed_override)
+    _seed_everything(sample_seed)
 
-    model = ConditionedDenoiser(
-        grid_size=config.grid_size,
-        patch_size=config.patch_size,
+    model = GraphRefinementModel(
         d_model=config.d_model,
         nhead=config.nhead,
         num_layers=config.num_layers,
+        latent_dim=config.latent_dim,
     ).to(device)
     model.load_state_dict(payload["state_dict"])
     model.eval()
 
-    target = torch.tensor([target_props], dtype=torch.float32, device=device)
+    positions, roles, adjacency = _pure_noise_batch(
+        1,
+        config.num_nodes,
+        device,
+        seed=sample_seed + 500,
+    )
+    raw_targets = torch.tensor(
+        target_stiffness, dtype=torch.float32, device=device
+    ).reshape(1, 3, 3)
+    raw_targets = 0.5 * (raw_targets + raw_targets.transpose(1, 2))
+    target_responses = _stiffness_to_response(raw_targets)
+    base_time = torch.ones((1,), device=device)
     with torch.no_grad():
-        elite_search = search_elite_batch(
-            model=model,
-            target_props=target,
-            grid_size=config.grid_size,
-            model_candidates=model_candidates,
-            random_candidates=random_candidates,
+        rollout = rollout_refinement(
+            model,
+            positions,
+            roles,
+            adjacency,
+            raw_targets,
+            target_normalization,
             steps=steps,
-            step_size=config.rollout_step_size,
+            position_step_size=config.position_step_size,
+            connectivity_step_size=config.connectivity_step_size,
+            base_time=base_time,
+            position_noise_scale=0.0,
+            connectivity_noise_scale=0.0,
         )
-    _progress(
-        "sample:elite "
-        f"source={elite_search['sources'][0]} score={elite_search['scores'][0].item():.4f}"
+    final_state = rollout[-1]
+    refined_positions, refined_adjacency = refine_sample_state(
+        final_state["positions"],
+        roles,
+        final_state["adjacency"],
+        raw_targets,
+        target_normalization,
+        config,
+    )
+    terms = mechanical_terms(
+        refined_positions,
+        roles,
+        refined_adjacency,
+        geometry_config=geometry_config,
+    )
+    thresholded_adjacency = threshold_connectivity(
+        refined_adjacency, roles, threshold=sample_threshold
     )
 
-    design = local_search_refine(
-        elite_search["designs"],
-        target,
-        elite_search["reference_probs"],
-        iterations=search_iterations,
-        proposal_count=proposal_count,
-        log_every=log_every_steps,
+    log_dir = _timestamped_run_dir(name)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir))
+    figure = plot_graph_design(
+        refined_positions[0],
+        roles[0],
+        refined_adjacency[0],
+        threshold=_visualization_threshold(),
+        title=name,
     )
-    with torch.no_grad():
-        terms = mechanical_terms(design)
-
-    log_path = _timestamped_run_dir(name)
-    log_path.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=str(log_path))
-    _write_samples(writer, "sample/final_design", design.cpu(), 0)
-    _write_samples(
-        writer, "sample/best_candidate_probs", elite_search["reference_probs"].cpu(), 0
+    writer.add_figure("sample/00_design/final_graph", figure, global_step=0)
+    _log_matrix(writer, "sample/10_target_stiffness", raw_targets[0], 0)
+    _log_matrix(writer, "sample/20_achieved_stiffness", terms["stiffness_matrix"][0], 0)
+    _log_matrix(writer, "sample/30_achieved_response", terms["response_matrix"][0], 0)
+    writer.add_scalar("sample/40_sparsity_loss", terms["sparsity"][0].item(), 0)
+    writer.add_scalar(
+        "sample/40_short_beam_penalty", terms["short_beam_penalty"][0].item(), 0
     )
-    writer.add_scalar("sample/elite_score", elite_search["scores"][0].item(), 0)
-    writer.add_scalar("sample/target_kx", target[0, 0].item(), 0)
-    writer.add_scalar("sample/target_ky", target[0, 1].item(), 0)
-    writer.add_scalar("sample/target_ktheta", target[0, 2].item(), 0)
-    writer.add_scalar("sample/achieved_kx", terms["properties"][0, 0].item(), 0)
-    writer.add_scalar("sample/achieved_ky", terms["properties"][0, 1].item(), 0)
-    writer.add_scalar("sample/achieved_ktheta", terms["properties"][0, 2].item(), 0)
+    writer.add_scalar(
+        "sample/40_long_beam_penalty", terms["long_beam_penalty"][0].item(), 0
+    )
+    writer.add_scalar(
+        "sample/40_thin_diameter_penalty", terms["thin_diameter_penalty"][0].item(), 0
+    )
+    writer.add_scalar(
+        "sample/40_thick_diameter_penalty", terms["thick_diameter_penalty"][0].item(), 0
+    )
+    writer.add_scalar(
+        "sample/40_node_spacing_penalty", terms["node_spacing_penalty"][0].item(), 0
+    )
+    writer.add_scalar(
+        "sample/40_boundary_penalty", terms["boundary_penalty"][0].item(), 0
+    )
+    writer.add_scalar(
+        "sample/40_yield_stress_penalty",
+        terms["yield_stress_penalty"][0].item(),
+        0,
+    )
+    animation_rollout = []
+    for state in rollout:
+        animation_rollout.append(
+            {
+                key: value[0]
+                for key, value in state.items()
+                if isinstance(value, torch.Tensor)
+            }
+        )
+    animation_path = export_rollout_animation(
+        log_dir / "sample_rollout.gif",
+        positions[0],
+        roles[0],
+        adjacency[0],
+        animation_rollout,
+        target_responses[0],
+        threshold=_visualization_threshold(),
+        frame_config=FrameFEMConfig(),
+        title=name,
+        final_positions=refined_positions[0],
+        final_adjacency=refined_adjacency[0],
+    )
     writer.close()
 
     result = {
-        "design": design.cpu(),
-        "properties": terms["properties"].cpu(),
-        "surface": terms["surface"].cpu(),
-        "connectivity_penalty": terms["connectivity_penalty"].cpu(),
-        "source": elite_search["sources"][0],
-        "log_dir": str(log_path),
+        "animation_path": str(animation_path),
+        "seed": sample_seed,
+        "positions": refined_positions.cpu(),
+        "roles": roles.cpu(),
+        "adjacency": refined_adjacency.cpu(),
+        "thresholded_adjacency": thresholded_adjacency.cpu(),
+        "response_matrix": terms["response_matrix"].cpu(),
+        "stiffness_matrix": terms["stiffness_matrix"].cpu(),
+        "sparsity": terms["sparsity"].cpu(),
+        "fixed_mobile_connectivity_penalty": terms[
+            "fixed_mobile_connectivity_penalty"
+        ].cpu(),
+        "nodal_stress": terms["nodal_stress"].cpu(),
+        "short_beam_penalty": terms["short_beam_penalty"].cpu(),
+        "long_beam_penalty": terms["long_beam_penalty"].cpu(),
+        "thin_diameter_penalty": terms["thin_diameter_penalty"].cpu(),
+        "thick_diameter_penalty": terms["thick_diameter_penalty"].cpu(),
+        "node_spacing_penalty": terms["node_spacing_penalty"].cpu(),
+        "boundary_penalty": terms["boundary_penalty"].cpu(),
+        "yield_stress_penalty": terms["yield_stress_penalty"].cpu(),
+        "log_dir": str(log_dir),
     }
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(result, output)
     _progress(
         "sample:done "
-        f"source={result['source']} kx={terms['properties'][0, 0].item():.3f} "
-        f"ky={terms['properties'][0, 1].item():.3f} "
-        f"ktheta={terms['properties'][0, 2].item():.3f} log_dir={log_path}"
+        f"seed={sample_seed} response={_format_matrix(terms['response_matrix'][0])} animation={animation_path} log_dir={log_dir}"
     )
     return result
 
 
 def _train_parser() -> argparse.ArgumentParser:
+    defaults = TrainConfig()
     parser = argparse.ArgumentParser(
-        description="Train the first compliant mechanism prototype"
+        description="Train the point-and-beam compliant mechanism prototype"
     )
-    parser.add_argument("--grid-size", type=int, default=24)
-    parser.add_argument("--patch-size", type=int, default=4)
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--num-layers", type=int, default=6)
-    parser.add_argument("--dataset-size", type=int, default=512)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--rollout-steps", type=int, default=8)
-    parser.add_argument("--rollout-step-size", type=float, default=0.5)
-    parser.add_argument("--rollout-noise-scale", type=float, default=0.03)
-    parser.add_argument("--property-weight", type=float, default=2.0)
-    parser.add_argument("--improvement-weight", type=float, default=0.25)
-    parser.add_argument("--diversity-weight", type=float, default=0.05)
-    parser.add_argument("--diversity-scale", type=float, default=0.15)
-    parser.add_argument("--surface-weight", type=float, default=0.02)
-    parser.add_argument("--connectivity-weight", type=float, default=0.12)
-    parser.add_argument("--mass-weight", type=float, default=0.15)
-    parser.add_argument("--binarization-weight", type=float, default=0.1)
-    parser.add_argument("--train-samples-per-target", type=int, default=4)
-    parser.add_argument("--train-softmin-temperature", type=float, default=0.25)
-    parser.add_argument("--log-every-steps", type=int, default=5)
-    parser.add_argument("--canonical-eval-every-steps", type=int, default=20)
-    parser.add_argument("--name", default="prototype")
-    parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--num-nodes", type=int, default=defaults.num_nodes)
+    parser.add_argument("--d-model", type=int, default=defaults.d_model)
+    parser.add_argument("--nhead", type=int, default=defaults.nhead)
+    parser.add_argument("--num-layers", type=int, default=defaults.num_layers)
+    parser.add_argument("--latent-dim", type=int, default=defaults.latent_dim)
+    parser.add_argument("--train-steps", type=int, default=defaults.train_steps)
+    parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
+    parser.add_argument("--rollout-steps", type=int, default=defaults.rollout_steps)
+    parser.add_argument(
+        "--position-step-size", type=float, default=defaults.position_step_size
+    )
+    parser.add_argument(
+        "--connectivity-step-size",
+        type=float,
+        default=defaults.connectivity_step_size,
+    )
+    parser.add_argument(
+        "--rollout-position-noise",
+        type=float,
+        default=defaults.rollout_position_noise,
+    )
+    parser.add_argument(
+        "--rollout-connectivity-noise",
+        type=float,
+        default=defaults.rollout_connectivity_noise,
+    )
+    parser.add_argument(
+        "--supervised-denoising-weight",
+        type=float,
+        default=defaults.supervised_denoising_weight,
+    )
+    parser.add_argument(
+        "--supervised-position-weight",
+        type=float,
+        default=defaults.supervised_position_weight,
+    )
+    parser.add_argument(
+        "--supervised-adjacency-weight",
+        type=float,
+        default=defaults.supervised_adjacency_weight,
+    )
+    parser.add_argument(
+        "--supervised-position-noise",
+        type=float,
+        default=defaults.supervised_position_noise,
+    )
+    parser.add_argument(
+        "--supervised-connectivity-noise",
+        type=float,
+        default=defaults.supervised_connectivity_noise,
+    )
+    parser.add_argument(
+        "--supervised-every-steps",
+        type=int,
+        default=defaults.supervised_every_steps,
+    )
+    parser.add_argument(
+        "--training-goal-blend-start",
+        type=float,
+        default=defaults.training_goal_blend_start,
+    )
+    parser.add_argument(
+        "--training-goal-blend-end",
+        type=float,
+        default=defaults.training_goal_blend_end,
+    )
+    parser.add_argument(
+        "--property-weight", type=float, default=defaults.property_weight
+    )
+    parser.add_argument(
+        "--monotonic-improvement-weight",
+        type=float,
+        default=defaults.monotonic_improvement_weight,
+    )
+    parser.add_argument(
+        "--material-weight", type=float, default=defaults.material_weight
+    )
+    parser.add_argument(
+        "--sparsity-weight", type=float, default=defaults.sparsity_weight
+    )
+    parser.add_argument(
+        "--connectivity-weight", type=float, default=defaults.connectivity_weight
+    )
+    parser.add_argument(
+        "--fixed-mobile-connectivity-weight",
+        type=float,
+        default=defaults.fixed_mobile_connectivity_weight,
+    )
+    parser.add_argument(
+        "--short-beam-weight", type=float, default=defaults.short_beam_weight
+    )
+    parser.add_argument(
+        "--long-beam-weight", type=float, default=defaults.long_beam_weight
+    )
+    parser.add_argument(
+        "--thin-diameter-weight", type=float, default=defaults.thin_diameter_weight
+    )
+    parser.add_argument(
+        "--thick-diameter-weight", type=float, default=defaults.thick_diameter_weight
+    )
+    parser.add_argument(
+        "--node-spacing-weight", type=float, default=defaults.node_spacing_weight
+    )
+    parser.add_argument(
+        "--boundary-weight", type=float, default=defaults.boundary_weight
+    )
+    parser.add_argument(
+        "--yield-stress-weight",
+        type=float,
+        default=defaults.yield_stress_weight,
+    )
+    parser.add_argument(
+        "--min-beam-length", type=float, default=defaults.min_beam_length
+    )
+    parser.add_argument(
+        "--max-beam-length", type=float, default=defaults.max_beam_length
+    )
+    parser.add_argument(
+        "--min-beam-diameter", type=float, default=defaults.min_beam_diameter
+    )
+    parser.add_argument(
+        "--max-beam-diameter", type=float, default=defaults.max_beam_diameter
+    )
+    parser.add_argument(
+        "--min-free-node-spacing",
+        type=float,
+        default=defaults.min_free_node_spacing,
+    )
+    parser.add_argument(
+        "--boundary-margin", type=float, default=defaults.boundary_margin
+    )
+    parser.add_argument(
+        "--animation-every-steps",
+        type=int,
+        default=defaults.animation_every_steps,
+    )
+    parser.add_argument("--log-every-steps", type=int, default=defaults.log_every_steps)
+    parser.add_argument(
+        "--canonical-eval-every-steps",
+        type=int,
+        default=defaults.canonical_eval_every_steps,
+    )
+    parser.add_argument(
+        "--sample-threshold", type=float, default=defaults.sample_threshold
+    )
+    parser.add_argument("--device", default=defaults.device)
+    parser.add_argument("--name", default=defaults.name)
+    parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
+    parser.add_argument("--seed", type=int, default=defaults.seed)
     return parser
 
 
 def _sample_parser() -> argparse.ArgumentParser:
+    defaults = TrainConfig()
     parser = argparse.ArgumentParser(
-        description="Sample a design from a trained prototype"
+        description="Sample a point-and-beam design from a trained prototype"
     )
-    parser.add_argument("--checkpoint-path", default="artifacts/prototype.pt")
-    parser.add_argument("--target-kx", type=float, required=True)
-    parser.add_argument("--target-ky", type=float, required=True)
-    parser.add_argument("--target-ktheta", type=float, required=True)
-    parser.add_argument("--steps", type=int, default=12)
-    parser.add_argument("--model-candidates", type=int, default=3)
-    parser.add_argument("--random-candidates", type=int, default=10)
-    parser.add_argument("--search-iterations", type=int, default=10)
-    parser.add_argument("--proposal-count", type=int, default=12)
-    parser.add_argument("--log-every-steps", type=int, default=2)
+    parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
+    parser.add_argument(
+        "--target-stiffness",
+        required=True,
+        help="Nine comma-separated row-major values for the 3x3 target stiffness matrix",
+    )
+    parser.add_argument("--steps", type=int, default=6)
+    parser.add_argument(
+        "--sample-threshold", type=float, default=defaults.sample_threshold
+    )
+    parser.add_argument("--device", default=defaults.device)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--name", default="sample")
     parser.add_argument("--output-path", default="artifacts/sample.pt")
     return parser
@@ -954,19 +1481,16 @@ def sample_main() -> None:
     args = _sample_parser().parse_args()
     result = sample(
         checkpoint_path=args.checkpoint_path,
-        target_props=[args.target_kx, args.target_ky, args.target_ktheta],
-        steps=args.steps,
+        target_stiffness=_parse_target_stiffness(args.target_stiffness),
         name=args.name,
         output_path=args.output_path,
-        model_candidates=args.model_candidates,
-        random_candidates=args.random_candidates,
-        search_iterations=args.search_iterations,
-        proposal_count=args.proposal_count,
-        log_every_steps=args.log_every_steps,
+        steps=args.steps,
+        sample_threshold=args.sample_threshold,
+        device_override=args.device,
+        seed_override=args.seed,
     )
+    print(f"seed={result['seed']}")
     print(f"log_dir={result['log_dir']}")
-    properties = result["properties"][0].tolist()
-    print(
-        "achieved_properties="
-        f"kx:{properties[0]:.3f},ky:{properties[1]:.3f},ktheta:{properties[2]:.3f}"
-    )
+    print(f"animation_path={result['animation_path']}")
+    print(f"achieved_response={_format_matrix(result['response_matrix'][0])}")
+    print(f"achieved_stiffness={_format_matrix(result['stiffness_matrix'][0])}")
