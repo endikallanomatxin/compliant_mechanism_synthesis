@@ -51,7 +51,7 @@ def apply_free_node_update(
 ) -> torch.Tensor:
     _, _, free = role_masks(roles)
     free_mask = free.unsqueeze(-1).to(dtype=positions.dtype)
-    return positions + step_size * delta * free_mask
+    return positions + step_size * torch.tanh(delta) * free_mask
 
 
 def distance_affinity(

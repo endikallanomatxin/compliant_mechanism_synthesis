@@ -86,6 +86,7 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["thin_diameter_penalty"].shape == (1,)
     assert terms["thick_diameter_penalty"].shape == (1,)
     assert terms["node_spacing_penalty"].shape == (1,)
+    assert terms["centroid_penalty"].shape == (1,)
     assert terms["spread_penalty"].shape == (1,)
     assert terms["soft_domain_penalty"].shape == (1,)
     assert terms["yield_stress_penalty"].shape == (1,)
@@ -230,6 +231,34 @@ def test_geometric_regularization_penalizes_insufficient_free_node_spread() -> N
     )
 
     assert penalties["spread_penalty"][0] > 0.0
+
+
+def test_geometric_regularization_penalizes_free_node_centroid_drift() -> None:
+    positions = torch.tensor(
+        [
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [0.78, 0.80],
+                [0.82, 0.79],
+                [0.80, 0.83],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    roles = torch.tensor([[0, 0, 1, 1, 2, 2, 2]], dtype=torch.long)
+    adjacency = torch.zeros((1, 7, 7), dtype=torch.float32)
+
+    penalties = geometric_regularization_terms(
+        positions,
+        roles,
+        adjacency,
+        GeometryRegularizationConfig(min_free_node_spacing=1e-3),
+    )
+
+    assert penalties["centroid_penalty"][0] > 0.0
 
 
 def test_soft_domain_penalty_detects_far_escaped_free_nodes() -> None:

@@ -66,8 +66,10 @@ def test_apply_free_node_update_does_not_clamp_free_nodes() -> None:
     updated = apply_free_node_update(positions, delta, roles, step_size=0.2)
 
     assert torch.allclose(updated[:, :4], positions[:, :4])
-    assert updated[0, 4, 0] > 1.0
-    assert updated[0, 4, 1] < 0.0
+    assert updated[0, 4, 0] > 0.95
+    assert updated[0, 4, 0] < 1.15
+    assert updated[0, 4, 1] < 0.05
+    assert updated[0, 4, 1] > -0.15
 
 
 def test_monotonic_improvement_loss_penalizes_regressions_only() -> None:

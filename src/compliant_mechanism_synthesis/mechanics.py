@@ -650,6 +650,7 @@ def geometric_regularization_terms(
     )
     free_count = free_mask.to(dtype=positions.dtype).sum(dim=1).clamp_min(1.0)
     free_centroid = centered_free_positions.sum(dim=1) / free_count.unsqueeze(-1)
+    centroid_penalty = free_centroid.square().sum(dim=1)
     centered_free_offsets = (
         bounded_centered_positions - free_centroid.unsqueeze(1)
     ) * free_mask.unsqueeze(-1).to(dtype=positions.dtype)
@@ -668,6 +669,7 @@ def geometric_regularization_terms(
         "thin_diameter_penalty": thin,
         "thick_diameter_penalty": thick,
         "node_spacing_penalty": spacing_penalty,
+        "centroid_penalty": centroid_penalty,
         "spread_penalty": spread_penalty,
         "soft_domain_penalty": soft_domain_penalty,
     }
@@ -696,6 +698,7 @@ def mechanical_terms(
             "thin_diameter_penalty": zeros,
             "thick_diameter_penalty": zeros,
             "node_spacing_penalty": zeros,
+            "centroid_penalty": zeros,
             "spread_penalty": zeros,
             "soft_domain_penalty": zeros,
         }
