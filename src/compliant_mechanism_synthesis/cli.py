@@ -42,13 +42,19 @@ class TrainConfig:
     num_layers: int = 8
     latent_dim: int = 128
     batch_size: int = 64
-    train_steps: int = 2000
+    train_steps: int = 2_000
     learning_rate: float = 1e-4
     rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 0.1
     rollout_position_noise: float = 0.01
     rollout_connectivity_noise: float = 0.05
+    supervised_denoising_weight: float = 0.5
+    supervised_position_weight: float = 1.0
+    supervised_adjacency_weight: float = 1.0
+    supervised_position_noise: float = 0.02
+    supervised_connectivity_noise: float = 0.08
+    supervised_every_steps: int = 1
     property_weight: float = 2.0
     monotonic_improvement_weight: float = 0.25
     material_weight: float = 1e4
@@ -144,27 +150,27 @@ def _fixed_stiffness_target_specs(
     specs = [
         (
             "01_flex_x",
-            [1.45e-4, 0.0, 0.0, 2.65e-4, 0.0, 1.035e-4],
+            [3.00e-4, 0.0, 0.0, 4.80e-4, 0.0, 1.80e-4],
         ),
         (
             "02_flex_y",
-            [2.65e-4, 0.0, 0.0, 1.45e-4, 0.0, 1.035e-4],
+            [4.80e-4, 0.0, 0.0, 3.00e-4, 0.0, 1.80e-4],
         ),
         (
             "03_flex_theta",
-            [2.35e-4, 0.0, 0.0, 2.35e-4, 0.0, 1.005e-4],
+            [4.40e-4, 0.0, 0.0, 4.40e-4, 0.0, 1.40e-4],
         ),
         (
             "04_balanced",
-            [2.05e-4, 0.0, 0.0, 2.05e-4, 0.0, 1.045e-4],
+            [3.80e-4, 0.0, 0.0, 3.80e-4, 0.0, 1.95e-4],
         ),
         (
             "05_couple_xy_pos",
-            [2.25e-4, 2.50e-5, -3.00e-6, 1.90e-4, 2.00e-6, 1.040e-4],
+            [4.30e-4, 4.50e-5, -1.20e-5, 3.40e-4, 8.00e-6, 1.85e-4],
         ),
         (
             "06_couple_xy_neg",
-            [1.90e-4, -2.50e-5, 3.00e-6, 2.25e-4, -2.00e-6, 1.040e-4],
+            [3.40e-4, -4.50e-5, 1.20e-5, 4.30e-4, -8.00e-6, 1.85e-4],
         ),
     ]
     return [
@@ -219,15 +225,71 @@ def _parse_target_stiffness(raw: str) -> list[float]:
     return values
 
 
-def _normalize_target_matrix(
-    raw_targets: torch.Tensor,
+def _normalize_matrix(
+    matrix: torch.Tensor,
     normalization: dict[str, list[float]],
 ) -> torch.Tensor:
-    flattened = symmetric_matrix_unique_values(raw_targets)
-    mean = raw_targets.new_tensor(normalization["mean"])
-    std = raw_targets.new_tensor(normalization["std"])
+    flattened = symmetric_matrix_unique_values(matrix)
+    mean = matrix.new_tensor(normalization["mean"])
+    std = matrix.new_tensor(normalization["std"])
     normalized = (flattened - mean) / std
     return unique_values_to_symmetric_matrix(normalized, size=3)
+
+
+def _normalize_residual_matrix(
+    residual: torch.Tensor,
+    normalization: dict[str, list[float]],
+) -> torch.Tensor:
+    flattened = symmetric_matrix_unique_values(residual)
+    std = residual.new_tensor(normalization["std"])
+    normalized = flattened / std
+    return unique_values_to_symmetric_matrix(normalized, size=3)
+
+
+def _mechanics_condition_matrices(
+    target_stiffness: torch.Tensor,
+    current_stiffness: torch.Tensor,
+    normalization: dict[str, list[float]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    residual_stiffness = target_stiffness - current_stiffness
+    return (
+        _normalize_matrix(target_stiffness, normalization),
+        _normalize_matrix(current_stiffness, normalization),
+        _normalize_residual_matrix(residual_stiffness, normalization),
+    )
+
+
+def _sample_supervised_denoising_batch(
+    teacher_positions: torch.Tensor,
+    roles: torch.Tensor,
+    teacher_adjacency: torch.Tensor,
+    position_noise_scale: float,
+    connectivity_noise_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _inject_rollout_noise(
+        teacher_positions,
+        roles,
+        teacher_adjacency,
+        torch.ones((teacher_positions.shape[0],), device=teacher_positions.device),
+        position_noise_scale=position_noise_scale,
+        connectivity_noise_scale=connectivity_noise_scale,
+    )
+
+
+def _supervised_reconstruction_losses(
+    predicted_positions: torch.Tensor,
+    target_positions: torch.Tensor,
+    roles: torch.Tensor,
+    predicted_adjacency: torch.Tensor,
+    target_adjacency: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    free_mask = (roles == ROLE_FREE).to(dtype=predicted_positions.dtype)
+    position_sq_error = (predicted_positions - target_positions).square().sum(dim=-1)
+    position_loss = (position_sq_error * free_mask).sum() / free_mask.sum().clamp_min(
+        1.0
+    )
+    adjacency_loss = F.mse_loss(predicted_adjacency, target_adjacency)
+    return position_loss, adjacency_loss
 
 
 def _matrix_loss(
@@ -325,7 +387,8 @@ def rollout_refinement(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
-    targets: torch.Tensor,
+    target_stiffness: torch.Tensor,
+    target_normalization: dict[str, list[float]],
     steps: int,
     position_step_size: float,
     connectivity_step_size: float,
@@ -340,7 +403,27 @@ def rollout_refinement(
     for step_idx in range(steps):
         time_fraction = 1.0 - step_idx / max(steps - 1, 1)
         timestep = base_time * time_fraction
-        outputs = model(current_positions, roles, current_adjacency, targets, timestep)
+        position_noise_levels = position_noise_scale * timestep
+        connectivity_noise_levels = connectivity_noise_scale * timestep
+        current_terms = mechanical_terms(current_positions, roles, current_adjacency)
+        target_features, current_features, residual_features = (
+            _mechanics_condition_matrices(
+                target_stiffness,
+                current_terms["stiffness_matrix"],
+                target_normalization,
+            )
+        )
+        outputs = model(
+            current_positions,
+            roles,
+            current_adjacency,
+            target_features,
+            current_features,
+            residual_features,
+            timestep,
+            position_noise_levels,
+            connectivity_noise_levels,
+        )
         refined_positions = apply_free_node_update(
             current_positions,
             outputs["displacements"],
@@ -397,7 +480,6 @@ def _log_canonical_evaluation(
     raw_targets = torch.stack([values for _, values in canonical_specs], dim=0).to(
         device
     )
-    targets = _normalize_target_matrix(raw_targets, target_normalization)
     target_responses = _stiffness_to_response(raw_targets)
     base_time = torch.ones((len(canonical_specs),), device=device)
     rollout = rollout_refinement(
@@ -405,7 +487,8 @@ def _log_canonical_evaluation(
         positions,
         roles,
         adjacency,
-        targets,
+        raw_targets,
+        target_normalization,
         steps=config.rollout_steps,
         position_step_size=config.position_step_size,
         connectivity_step_size=config.connectivity_step_size,
@@ -534,6 +617,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "total": 0.0,
         "property": 0.0,
         "monotonic": 0.0,
+        "supervised": 0.0,
+        "supervised_position": 0.0,
+        "supervised_adjacency": 0.0,
         "material": 0.0,
         "sparsity": 0.0,
         "connectivity": 0.0,
@@ -556,7 +642,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             seed=current_seed,
         )
         raw_targets = _sample_stiffness_targets(config.batch_size, device)
-        target_features = _normalize_target_matrix(raw_targets, target_normalization)
         base_time = torch.rand((positions.shape[0],), device=device)
 
         rollout = rollout_refinement(
@@ -564,7 +649,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             positions,
             roles,
             adjacency,
-            target_features,
+            raw_targets,
+            target_normalization,
             steps=config.rollout_steps,
             position_step_size=config.position_step_size,
             connectivity_step_size=config.connectivity_step_size,
@@ -660,9 +746,79 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         total.backward()
         optimizer.step()
 
+        supervised_position_loss = torch.zeros((), device=device)
+        supervised_adjacency_loss = torch.zeros((), device=device)
+        supervised_loss = torch.zeros((), device=device)
+        if (
+            config.supervised_denoising_weight > 0.0
+            and step % max(config.supervised_every_steps, 1) == 0
+        ):
+            teacher_positions = final_state["refined_positions"].detach()
+            teacher_adjacency = final_state["refined_adjacency"].detach()
+            noisy_positions, noisy_adjacency = _sample_supervised_denoising_batch(
+                teacher_positions,
+                roles,
+                teacher_adjacency,
+                position_noise_scale=config.supervised_position_noise,
+                connectivity_noise_scale=config.supervised_connectivity_noise,
+            )
+            noisy_terms = mechanical_terms(noisy_positions, roles, noisy_adjacency)
+            target_features, current_features, residual_features = (
+                _mechanics_condition_matrices(
+                    raw_targets,
+                    noisy_terms["stiffness_matrix"],
+                    target_normalization,
+                )
+            )
+            denoising_outputs = model(
+                noisy_positions,
+                roles,
+                noisy_adjacency,
+                target_features,
+                current_features,
+                residual_features,
+                torch.zeros((positions.shape[0],), device=device),
+                torch.full(
+                    (positions.shape[0],),
+                    config.supervised_position_noise,
+                    device=device,
+                ),
+                torch.full(
+                    (positions.shape[0],),
+                    config.supervised_connectivity_noise,
+                    device=device,
+                ),
+            )
+            predicted_positions = apply_free_node_update(
+                noisy_positions,
+                denoising_outputs["displacements"],
+                roles,
+                config.position_step_size,
+            )
+            predicted_adjacency = denoising_outputs["predicted_adjacency"]
+            supervised_position_loss, supervised_adjacency_loss = (
+                _supervised_reconstruction_losses(
+                    predicted_positions,
+                    teacher_positions,
+                    roles,
+                    predicted_adjacency,
+                    teacher_adjacency,
+                )
+            )
+            supervised_loss = config.supervised_denoising_weight * (
+                config.supervised_position_weight * supervised_position_loss
+                + config.supervised_adjacency_weight * supervised_adjacency_loss
+            )
+            optimizer.zero_grad(set_to_none=True)
+            supervised_loss.backward()
+            optimizer.step()
+
         running_totals["total"] += total.item()
         running_totals["property"] += property_loss.item()
         running_totals["monotonic"] += monotonic_loss.item()
+        running_totals["supervised"] += supervised_loss.item()
+        running_totals["supervised_position"] += supervised_position_loss.item()
+        running_totals["supervised_adjacency"] += supervised_adjacency_loss.item()
         running_totals["material"] += material_loss.item()
         running_totals["sparsity"] += sparsity_loss.item()
         running_totals["connectivity"] += connectivity_loss.item()
@@ -680,6 +836,17 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         writer.add_scalar("train/property_loss", property_loss.item(), global_step)
         writer.add_scalar(
             "train/monotonic_improvement_loss", monotonic_loss.item(), global_step
+        )
+        writer.add_scalar("train/supervised_loss", supervised_loss.item(), global_step)
+        writer.add_scalar(
+            "train/supervised_position_loss",
+            supervised_position_loss.item(),
+            global_step,
+        )
+        writer.add_scalar(
+            "train/supervised_adjacency_loss",
+            supervised_adjacency_loss.item(),
+            global_step,
         )
         writer.add_scalar("train/material_loss", material_loss.item(), global_step)
         writer.add_scalar("train/sparsity_loss", sparsity_loss.item(), global_step)
@@ -718,7 +885,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             if window == 0:
                 window = config.log_every_steps
             _progress(
-                f"train:step {step}/{train_steps} total={total.item():.4f} prop={property_loss.item():.4f} conn={connectivity_loss.item():.4f} material={material_loss.item():.4f}"
+                f"train:step {step}/{train_steps} total={total.item():.4f} prop={property_loss.item():.4f} sup={supervised_loss.item():.4f} conn={connectivity_loss.item():.4f} material={material_loss.item():.4f}"
             )
             for key, value in running_totals.items():
                 writer.add_scalar(f"window/{key}", value / window, global_step)
@@ -859,7 +1026,6 @@ def sample(
         target_stiffness, dtype=torch.float32, device=device
     ).reshape(1, 3, 3)
     raw_targets = 0.5 * (raw_targets + raw_targets.transpose(1, 2))
-    targets = _normalize_target_matrix(raw_targets, target_normalization)
     target_responses = _stiffness_to_response(raw_targets)
     base_time = torch.ones((1,), device=device)
     with torch.no_grad():
@@ -868,7 +1034,8 @@ def sample(
             positions,
             roles,
             adjacency,
-            targets,
+            raw_targets,
+            target_normalization,
             steps=steps,
             position_step_size=config.position_step_size,
             connectivity_step_size=config.connectivity_step_size,
@@ -1014,6 +1181,36 @@ def _train_parser() -> argparse.ArgumentParser:
         "--rollout-connectivity-noise",
         type=float,
         default=defaults.rollout_connectivity_noise,
+    )
+    parser.add_argument(
+        "--supervised-denoising-weight",
+        type=float,
+        default=defaults.supervised_denoising_weight,
+    )
+    parser.add_argument(
+        "--supervised-position-weight",
+        type=float,
+        default=defaults.supervised_position_weight,
+    )
+    parser.add_argument(
+        "--supervised-adjacency-weight",
+        type=float,
+        default=defaults.supervised_adjacency_weight,
+    )
+    parser.add_argument(
+        "--supervised-position-noise",
+        type=float,
+        default=defaults.supervised_position_noise,
+    )
+    parser.add_argument(
+        "--supervised-connectivity-noise",
+        type=float,
+        default=defaults.supervised_connectivity_noise,
+    )
+    parser.add_argument(
+        "--supervised-every-steps",
+        type=int,
+        default=defaults.supervised_every_steps,
     )
     parser.add_argument(
         "--property-weight", type=float, default=defaults.property_weight

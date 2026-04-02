@@ -5,12 +5,16 @@ import torch
 from compliant_mechanism_synthesis.cli import (
     _fixed_stiffness_target_specs,
     _inject_rollout_noise,
+    _mechanics_condition_matrices,
     _matrix_loss,
     _monotonic_improvement_loss,
+    _normalize_residual_matrix,
     _pure_noise_batch,
     _resolve_sample_seed,
     _sample_stiffness_targets,
     _stiffness_to_response,
+    _supervised_reconstruction_losses,
+    _sample_supervised_denoising_batch,
     _target_normalization,
 )
 from compliant_mechanism_synthesis.common import (
@@ -102,6 +106,63 @@ def test_stiffness_to_response_inverts_each_target_matrix() -> None:
     eye = torch.eye(3).expand_as(stiffness)
 
     assert torch.allclose(stiffness @ response, eye, atol=1e-5)
+
+
+def test_supervised_denoising_batch_preserves_fixed_and_mobile_positions() -> None:
+    positions = torch.rand(2, 8, 2)
+    roles = torch.tensor(
+        [[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_MOBILE] + [ROLE_FREE] * 4] * 2,
+        dtype=torch.long,
+    )
+    adjacency = torch.rand(2, 8, 8)
+    adjacency = 0.5 * (adjacency + adjacency.transpose(1, 2))
+    noisy_positions, noisy_adjacency = _sample_supervised_denoising_batch(
+        positions,
+        roles,
+        adjacency,
+        position_noise_scale=0.05,
+        connectivity_noise_scale=0.10,
+    )
+
+    assert torch.allclose(noisy_positions[:, :4], positions[:, :4])
+    assert noisy_adjacency.shape == adjacency.shape
+
+
+def test_supervised_reconstruction_losses_vanish_on_exact_match() -> None:
+    positions = torch.rand(2, 8, 2)
+    roles = torch.tensor(
+        [[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_MOBILE] + [ROLE_FREE] * 4] * 2,
+        dtype=torch.long,
+    )
+    adjacency = torch.rand(2, 8, 8)
+    adjacency = 0.5 * (adjacency + adjacency.transpose(1, 2))
+    position_loss, adjacency_loss = _supervised_reconstruction_losses(
+        positions,
+        positions,
+        roles,
+        adjacency,
+        adjacency,
+    )
+
+    assert torch.isclose(position_loss, torch.tensor(0.0))
+    assert torch.isclose(adjacency_loss, torch.tensor(0.0))
+
+
+def test_mechanics_condition_residual_matches_difference() -> None:
+    targets = torch.stack(
+        [
+            matrix
+            for _, matrix in _fixed_stiffness_target_specs(torch.device("cpu"))[:2]
+        ],
+        dim=0,
+    )
+    current = 0.5 * targets
+    normalization = _target_normalization(targets)
+    _, _, residual = _mechanics_condition_matrices(targets, current, normalization)
+    expected = _normalize_residual_matrix(targets - current, normalization)
+
+    assert residual.shape == targets.shape
+    assert torch.allclose(residual, expected, atol=1e-6)
 
 
 def test_pure_noise_batch_is_reproducible_with_explicit_seed() -> None:

@@ -11,6 +11,7 @@ from compliant_mechanism_synthesis.common import (
     max_length_gate,
     NUM_ROLES,
     enforce_role_adjacency_constraints,
+    symmetric_matrix_unique_values,
     symmetrize_adjacency,
 )
 
@@ -118,13 +119,18 @@ class GraphRefinementModel(nn.Module):
             nn.Linear(d_model, d_model),
         )
         self.role_embedding = nn.Embedding(NUM_ROLES, d_model)
-        self.target_mlp = nn.Sequential(
-            nn.Linear(9, d_model),
+        self.mechanics_condition_mlp = nn.Sequential(
+            nn.Linear(18, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
         self.time_mlp = nn.Sequential(
             nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.noise_condition_mlp = nn.Sequential(
+            nn.Linear(3, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
@@ -155,20 +161,35 @@ class GraphRefinementModel(nn.Module):
         positions: torch.Tensor,
         roles: torch.Tensor,
         adjacency: torch.Tensor,
-        targets: torch.Tensor,
+        target_stiffness: torch.Tensor,
+        current_stiffness: torch.Tensor,
+        residual_stiffness: torch.Tensor,
         timesteps: torch.Tensor,
+        position_noise_levels: torch.Tensor,
+        connectivity_noise_levels: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         hidden = self.position_mlp(positions) + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
-        hidden = (
-            hidden + self.target_mlp(targets.reshape(targets.shape[0], -1))[:, None, :]
+        mechanics_features = torch.cat(
+            [
+                symmetric_matrix_unique_values(target_stiffness),
+                symmetric_matrix_unique_values(current_stiffness),
+                symmetric_matrix_unique_values(residual_stiffness),
+            ],
+            dim=1,
         )
+        hidden = hidden + self.mechanics_condition_mlp(mechanics_features)[:, None, :]
         hidden = (
             hidden
             + self.time_mlp(sinusoidal_embedding(timesteps, hidden.shape[-1]))[
                 :, None, :
             ]
         )
+        noise_features = torch.stack(
+            [timesteps, position_noise_levels, connectivity_noise_levels],
+            dim=1,
+        )
+        hidden = hidden + self.noise_condition_mlp(noise_features)[:, None, :]
 
         current_adjacency = enforce_role_adjacency_constraints(adjacency, roles)
         for layer in self.layers:

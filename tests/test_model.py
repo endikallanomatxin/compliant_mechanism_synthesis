@@ -26,16 +26,51 @@ def _dummy_inputs(batch_size: int = 2, num_nodes: int = 8) -> tuple[torch.Tensor
     adjacency = torch.rand(batch_size, num_nodes, num_nodes)
     adjacency = 0.5 * (adjacency + adjacency.transpose(1, 2))
     adjacency = adjacency - torch.diag_embed(torch.diagonal(adjacency, dim1=1, dim2=2))
-    targets = torch.rand(batch_size, 3, 3)
-    targets = 0.5 * (targets + targets.transpose(1, 2))
+    target_stiffness = torch.rand(batch_size, 3, 3)
+    target_stiffness = 0.5 * (target_stiffness + target_stiffness.transpose(1, 2))
+    current_stiffness = torch.rand(batch_size, 3, 3)
+    current_stiffness = 0.5 * (current_stiffness + current_stiffness.transpose(1, 2))
+    residual_stiffness = target_stiffness - current_stiffness
     timesteps = torch.rand(batch_size)
-    return positions, roles, adjacency, targets, timesteps
+    position_noise_levels = torch.rand(batch_size)
+    connectivity_noise_levels = torch.rand(batch_size)
+    return (
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    )
 
 
 def test_model_output_shapes() -> None:
-    positions, roles, adjacency, targets, timesteps = _dummy_inputs()
+    (
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    ) = _dummy_inputs()
     model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
-    outputs = model(positions, roles, adjacency, targets, timesteps)
+    outputs = model(
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    )
     assert outputs["displacements"].shape == positions.shape
     assert outputs["node_latents"].shape == (2, 8, 32)
     assert outputs["delta_scores"].shape == adjacency.shape
@@ -43,9 +78,29 @@ def test_model_output_shapes() -> None:
 
 
 def test_connectivity_update_is_symmetric_and_zero_diagonal() -> None:
-    positions, roles, adjacency, targets, timesteps = _dummy_inputs()
+    (
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    ) = _dummy_inputs()
     model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
-    outputs = model(positions, roles, adjacency, targets, timesteps)
+    outputs = model(
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    )
     scores = outputs["delta_scores"]
     predicted = outputs["predicted_adjacency"]
     assert torch.allclose(scores, scores.transpose(1, 2), atol=1e-6)
@@ -55,9 +110,29 @@ def test_connectivity_update_is_symmetric_and_zero_diagonal() -> None:
 
 
 def test_connectivity_delta_comes_from_node_latent_dot_products() -> None:
-    positions, roles, adjacency, targets, timesteps = _dummy_inputs()
+    (
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    ) = _dummy_inputs()
     model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
-    outputs = model(positions, roles, adjacency, targets, timesteps)
+    outputs = model(
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    )
     expected = torch.matmul(
         outputs["node_latents"], outputs["node_latents"].transpose(1, 2)
     ) / math.sqrt(outputs["node_latents"].shape[-1])
@@ -76,3 +151,83 @@ def test_attention_layers_cycle_distance_connectivity_free() -> None:
         "connectivity",
         "free",
     ]
+
+
+def test_model_conditioning_depends_on_current_stiffness() -> None:
+    (
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    ) = _dummy_inputs(batch_size=1)
+    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
+    outputs_a = model(
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    )
+    shifted_current = current_stiffness + 0.25 * torch.eye(3).unsqueeze(0)
+    shifted_residual = target_stiffness - shifted_current
+    outputs_b = model(
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        shifted_current,
+        shifted_residual,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    )
+
+    assert not torch.allclose(outputs_a["displacements"], outputs_b["displacements"])
+
+
+def test_model_conditioning_depends_on_noise_levels() -> None:
+    (
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    ) = _dummy_inputs(batch_size=1)
+    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
+    outputs_a = model(
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels,
+        connectivity_noise_levels,
+    )
+    outputs_b = model(
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        current_stiffness,
+        residual_stiffness,
+        timesteps,
+        position_noise_levels + 0.25,
+        connectivity_noise_levels + 0.25,
+    )
+
+    assert not torch.allclose(outputs_a["displacements"], outputs_b["displacements"])
