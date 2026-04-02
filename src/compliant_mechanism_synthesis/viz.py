@@ -26,12 +26,6 @@ LOAD_CASES = [
     ("M", "tab:brown"),
 ]
 
-LOAD_CASE_DISPLAY_SCALE = {
-    "Fx": 1.0,
-    "Fy": 1.0,
-    "M": 16.0,
-}
-
 
 def _setup_axis(
     ax: plt.Axes,
@@ -237,16 +231,17 @@ def _draw_mobile_pair_overlay(
 
 
 def _display_scale(
-    deformations: torch.Tensor,
+    deformation: torch.Tensor,
     frame_config: FrameFEMConfig,
 ) -> float:
-    max_norm = (
-        torch.linalg.vector_norm(deformations.detach().cpu(), dim=-1).max().item()
+    norms = (
+        torch.linalg.vector_norm(deformation.detach().cpu(), dim=-1)
         / frame_config.workspace_size
     )
-    if max_norm <= 1e-8:
+    reference = torch.quantile(norms, 0.95).item()
+    if reference <= 1e-8:
         return 1.0
-    return min(max(0.16 / max_norm, 0.016), 5.0)
+    return min(0.16 / reference, 2.0)
 
 
 def _draw_load_case_panel(
@@ -261,9 +256,8 @@ def _draw_load_case_panel(
     color: str,
     threshold: float,
     frame_config: FrameFEMConfig,
-    scale: float,
 ) -> None:
-    case_scale = scale * LOAD_CASE_DISPLAY_SCALE.get(load_name, 1.0)
+    case_scale = _display_scale(deformation, frame_config)
     normalized_deformation = deformation / frame_config.workspace_size
     deformed_positions = positions + case_scale * normalized_deformation
     achieved_mobile_pair = _mobile_pair_positions(deformed_positions, roles)
@@ -353,7 +347,6 @@ def _render_rollout_frame(
     )
     deformations = deformations[0].detach().cpu()
     achieved = achieved[0].detach().cpu()
-    scale = _display_scale(deformations, frame_config)
 
     fig, axes = plt.subplots(2, 2, figsize=(10, 8))
     fig.subplots_adjust(
@@ -390,7 +383,6 @@ def _render_rollout_frame(
             color,
             threshold,
             frame_config,
-            scale,
         )
     fig.canvas.draw()
     image = Image.fromarray(np.asarray(fig.canvas.buffer_rgba())[..., :3])
