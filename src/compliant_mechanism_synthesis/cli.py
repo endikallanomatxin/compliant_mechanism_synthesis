@@ -75,9 +75,9 @@ class TrainConfig:
     max_beam_diameter: float = 2e-3
     min_free_node_spacing: float = 5e-3
     boundary_margin: float = 5e-3
-    animation_every_steps: int = 100
+    animation_every_steps: int = 200
     log_every_steps: int = 5
-    canonical_eval_every_steps: int = 20
+    canonical_eval_every_steps: int = 40
     sample_threshold: float = 0.5
     device: str = "auto"
     name: str = "prototype"
@@ -893,47 +893,54 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["node_spacing"] += node_spacing_loss.item()
         running_totals["boundary"] += boundary_loss.item()
 
-        writer.add_scalar("train/total_loss", total.item(), global_step)
-        writer.add_scalar("train/goal_blend", goal_blend, global_step)
-        writer.add_scalar("train/property_loss", property_loss.item(), global_step)
-        writer.add_scalar(
-            "train/monotonic_improvement_loss", monotonic_loss.item(), global_step
-        )
-        writer.add_scalar("train/supervised_loss", supervised_loss.item(), global_step)
-        writer.add_scalar(
-            "train/supervised_position_loss",
-            supervised_position_loss.item(),
-            global_step,
-        )
-        writer.add_scalar(
-            "train/supervised_adjacency_loss",
-            supervised_adjacency_loss.item(),
-            global_step,
-        )
-        writer.add_scalar("train/material_loss", material_loss.item(), global_step)
-        writer.add_scalar("train/sparsity_loss", sparsity_loss.item(), global_step)
-        writer.add_scalar(
-            "train/connectivity_penalty", connectivity_loss.item(), global_step
-        )
-        writer.add_scalar(
-            "train/fixed_mobile_connectivity_penalty",
-            fixed_mobile_connectivity_loss.item(),
-            global_step,
-        )
-        writer.add_scalar(
-            "train/short_beam_penalty", short_beam_loss.item(), global_step
-        )
-        writer.add_scalar("train/long_beam_penalty", long_beam_loss.item(), global_step)
-        writer.add_scalar(
-            "train/thin_diameter_penalty", thin_diameter_loss.item(), global_step
-        )
-        writer.add_scalar(
-            "train/thick_diameter_penalty", thick_diameter_loss.item(), global_step
-        )
-        writer.add_scalar(
-            "train/node_spacing_penalty", node_spacing_loss.item(), global_step
-        )
-        writer.add_scalar("train/boundary_penalty", boundary_loss.item(), global_step)
+        if config.log_every_steps > 0 and step % config.log_every_steps == 0:
+            writer.add_scalar("train/total_loss", total.item(), global_step)
+            writer.add_scalar("train/goal_blend", goal_blend, global_step)
+            writer.add_scalar("train/property_loss", property_loss.item(), global_step)
+            writer.add_scalar(
+                "train/monotonic_improvement_loss", monotonic_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/supervised_loss", supervised_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/supervised_position_loss",
+                supervised_position_loss.item(),
+                global_step,
+            )
+            writer.add_scalar(
+                "train/supervised_adjacency_loss",
+                supervised_adjacency_loss.item(),
+                global_step,
+            )
+            writer.add_scalar("train/material_loss", material_loss.item(), global_step)
+            writer.add_scalar("train/sparsity_loss", sparsity_loss.item(), global_step)
+            writer.add_scalar(
+                "train/connectivity_penalty", connectivity_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/fixed_mobile_connectivity_penalty",
+                fixed_mobile_connectivity_loss.item(),
+                global_step,
+            )
+            writer.add_scalar(
+                "train/short_beam_penalty", short_beam_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/long_beam_penalty", long_beam_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/thin_diameter_penalty", thin_diameter_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/thick_diameter_penalty", thick_diameter_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/node_spacing_penalty", node_spacing_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/boundary_penalty", boundary_loss.item(), global_step
+            )
         global_step += 1
 
         if config.log_every_steps > 0 and (
