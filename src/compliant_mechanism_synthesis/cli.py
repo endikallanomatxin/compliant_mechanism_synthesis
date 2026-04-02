@@ -64,14 +64,15 @@ class TrainConfig:
     property_weight: float = 1.0
     monotonic_improvement_weight: float = 0.25
     material_weight: float = 0.1
-    sparsity_weight: float = 0.5
+    sparsity_weight: float = 0.2
     connectivity_weight: float = 0.25
     fixed_mobile_connectivity_weight: float = 2.0
-    short_beam_weight: float = 8.0
-    long_beam_weight: float = 8.0
+    short_beam_weight: float = 1.0
+    long_beam_weight: float = 2.0
     thin_diameter_weight: float = 0.20
     thick_diameter_weight: float = 0.10
     node_spacing_weight: float = 0.20
+    spread_weight: float = 0.5
     soft_domain_weight: float = 10.0
     yield_stress_weight: float = 0.10
     min_beam_length: float = 5e-3
@@ -686,6 +687,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "thin_diameter": 0.0,
         "thick_diameter": 0.0,
         "node_spacing": 0.0,
+        "spread": 0.0,
         "soft_domain": 0.0,
         "yield_stress": 0.0,
     }
@@ -741,6 +743,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         thin_diameter_loss = torch.zeros((), device=device)
         thick_diameter_loss = torch.zeros((), device=device)
         node_spacing_loss = torch.zeros((), device=device)
+        spread_loss = torch.zeros((), device=device)
         soft_domain_loss = torch.zeros((), device=device)
         yield_stress_loss = torch.zeros((), device=device)
         step_errors: list[torch.Tensor] = []
@@ -788,6 +791,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 node_spacing_loss
                 + step_weights[step_idx] * step_terms["node_spacing_penalty"].mean()
             )
+            spread_loss = (
+                spread_loss
+                + step_weights[step_idx] * step_terms["spread_penalty"].mean()
+            )
             soft_domain_loss = (
                 soft_domain_loss
                 + step_weights[step_idx] * step_terms["soft_domain_penalty"].mean()
@@ -811,6 +818,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             + config.thin_diameter_weight * thin_diameter_loss
             + config.thick_diameter_weight * thick_diameter_loss
             + config.node_spacing_weight * node_spacing_loss
+            + config.spread_weight * spread_loss
             + config.soft_domain_weight * soft_domain_loss
             + config.yield_stress_weight * yield_stress_loss
         )
@@ -906,6 +914,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["thin_diameter"] += thin_diameter_loss.item()
         running_totals["thick_diameter"] += thick_diameter_loss.item()
         running_totals["node_spacing"] += node_spacing_loss.item()
+        running_totals["spread"] += spread_loss.item()
         running_totals["soft_domain"] += soft_domain_loss.item()
         running_totals["yield_stress"] += yield_stress_loss.item()
 
@@ -953,6 +962,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             writer.add_scalar(
                 "train/node_spacing_penalty", node_spacing_loss.item(), global_step
+            )
+            writer.add_scalar(
+                "train/spread_penalty", spread_loss.item(), global_step
             )
             writer.add_scalar(
                 "train/soft_domain_penalty", soft_domain_loss.item(), global_step
@@ -1056,6 +1068,7 @@ def refine_sample_state(
             + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
             + config.thick_diameter_weight * terms["thick_diameter_penalty"].mean()
             + config.node_spacing_weight * terms["node_spacing_penalty"].mean()
+            + config.spread_weight * terms["spread_penalty"].mean()
             + config.soft_domain_weight * terms["soft_domain_penalty"].mean()
             + config.yield_stress_weight * terms["yield_stress_penalty"].mean()
         )
@@ -1173,6 +1186,7 @@ def sample(
     writer.add_scalar(
         "sample/40_node_spacing_penalty", terms["node_spacing_penalty"][0].item(), 0
     )
+    writer.add_scalar("sample/40_spread_penalty", terms["spread_penalty"][0].item(), 0)
     writer.add_scalar(
         "sample/40_soft_domain_penalty", terms["soft_domain_penalty"][0].item(), 0
     )
@@ -1224,6 +1238,7 @@ def sample(
         "thin_diameter_penalty": terms["thin_diameter_penalty"].cpu(),
         "thick_diameter_penalty": terms["thick_diameter_penalty"].cpu(),
         "node_spacing_penalty": terms["node_spacing_penalty"].cpu(),
+        "spread_penalty": terms["spread_penalty"].cpu(),
         "soft_domain_penalty": terms["soft_domain_penalty"].cpu(),
         "yield_stress_penalty": terms["yield_stress_penalty"].cpu(),
         "log_dir": str(log_dir),
@@ -1347,6 +1362,7 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--node-spacing-weight", type=float, default=defaults.node_spacing_weight
     )
+    parser.add_argument("--spread-weight", type=float, default=defaults.spread_weight)
     parser.add_argument(
         "--soft-domain-weight", type=float, default=defaults.soft_domain_weight
     )

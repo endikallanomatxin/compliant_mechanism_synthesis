@@ -43,6 +43,7 @@ class GeometryRegularizationConfig:
     min_diameter: float = 2e-4
     max_diameter: float = 2e-3
     min_free_node_spacing: float = 5e-3
+    min_centered_free_std: float = 0.22
 
 
 def characteristic_scales(
@@ -643,6 +644,19 @@ def geometric_regularization_terms(
     )
 
     centered_positions = center_positions(positions)
+    centered_free_positions = centered_positions * free_mask.unsqueeze(-1).to(
+        dtype=positions.dtype
+    )
+    free_count = free_mask.to(dtype=positions.dtype).sum(dim=1).clamp_min(1.0)
+    free_centroid = centered_free_positions.sum(dim=1) / free_count.unsqueeze(-1)
+    centered_free_offsets = (
+        centered_positions - free_centroid.unsqueeze(1)
+    ) * free_mask.unsqueeze(-1).to(dtype=positions.dtype)
+    centered_free_variance = centered_free_offsets.square().sum(dim=1) / free_count.unsqueeze(-1)
+    min_variance = geometry_config.min_centered_free_std**2
+    spread_penalty = (
+        min_variance - centered_free_variance
+    ).clamp_min(0.0).square().sum(dim=1)
     soft_domain_violation = (centered_positions.abs() - 1.0).clamp_min(0.0)
     soft_domain_penalty = (
         soft_domain_violation.square().sum(dim=-1) * free_mask.to(dtype=positions.dtype)
@@ -653,6 +667,7 @@ def geometric_regularization_terms(
         "thin_diameter_penalty": thin,
         "thick_diameter_penalty": thick,
         "node_spacing_penalty": spacing_penalty,
+        "spread_penalty": spread_penalty,
         "soft_domain_penalty": soft_domain_penalty,
     }
 
@@ -680,6 +695,7 @@ def mechanical_terms(
             "thin_diameter_penalty": zeros,
             "thick_diameter_penalty": zeros,
             "node_spacing_penalty": zeros,
+            "spread_penalty": zeros,
             "soft_domain_penalty": zeros,
         }
     else:
