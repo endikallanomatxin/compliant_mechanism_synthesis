@@ -59,7 +59,7 @@ class TrainConfig:
     supervised_position_noise: float = 0.02
     supervised_connectivity_noise: float = 0.08
     supervised_every_steps: int = 1
-    training_goal_blend_start: float = 0.05
+    training_goal_blend_start: float = 0.08
     training_goal_blend_end: float = 1.0
     property_weight: float = 1.0
     monotonic_improvement_weight: float = 0.1
@@ -71,16 +71,16 @@ class TrainConfig:
     long_beam_weight: float = 0.3
     thin_diameter_weight: float = 0.05
     thick_diameter_weight: float = 0.05
-    node_spacing_weight: float = 0.1
+    node_spacing_weight: float = 0.3
     centroid_weight: float = 0.2
     spread_weight: float = 0.12
     soft_domain_weight: float = 30.0
     yield_stress_weight: float = 0.05
     min_beam_length: float = 5e-3
-    max_beam_length: float = 3e-2
+    max_beam_length: float = 4e-2
     min_beam_diameter: float = 2e-4
     max_beam_diameter: float = 3e-3
-    min_free_node_spacing: float = 6e-3
+    min_free_node_spacing: float = 1.2e-2
     animation_every_steps: int = 1_000
     log_every_steps: int = 5
     canonical_eval_every_steps: int = 100
@@ -168,27 +168,27 @@ def _fixed_stiffness_target_specs(
     specs = [
         (
             "01_flex_x",
-            [5.2, 0.0, 0.0, 8.3, 0.0, 3.5],
+            [5.8, 0.0, 0.0, 9.3, 0.0, 3.9],
         ),
         (
             "02_flex_y",
-            [8.3, 0.0, 0.0, 5.2, 0.0, 3.5],
+            [9.3, 0.0, 0.0, 5.8, 0.0, 3.9],
         ),
         (
             "03_flex_theta",
-            [7.6, 0.0, 0.0, 7.6, 0.0, 2.6],
+            [8.4, 0.0, 0.0, 8.4, 0.0, 2.9],
         ),
         (
             "04_balanced",
-            [6.4, 0.0, 0.0, 6.4, 0.0, 3.7],
+            [7.1, 0.0, 0.0, 7.1, 0.0, 4.1],
         ),
         (
             "05_couple_xy_pos",
-            [7.3, 0.7, -0.35, 5.7, 0.25, 3.6],
+            [8.1, 0.8, -0.4, 6.3, 0.28, 4.0],
         ),
         (
             "06_couple_xy_neg",
-            [5.7, -0.7, 0.35, 7.3, -0.25, 3.6],
+            [6.3, -0.8, 0.4, 8.1, -0.28, 4.0],
         ),
     ]
     return [
@@ -573,7 +573,7 @@ def _log_canonical_evaluation(
         geometry_config=geometry_config,
     )
 
-    for idx, (name, target_values) in enumerate(canonical_specs):
+    for idx, (name, _) in enumerate(canonical_specs):
         figure = plot_graph_design(
             final_state["positions"][idx],
             roles[idx],
@@ -584,19 +584,13 @@ def _log_canonical_evaluation(
         writer.add_figure(f"canonical/00_designs/{name}", figure, global_step=step)
         _log_matrix(
             writer,
-            f"canonical/10_target_stiffness/{name}",
-            target_values,
-            step,
-        )
-        _log_matrix(
-            writer,
-            f"canonical/20_achieved_stiffness/{name}",
+            f"canonical/10_achieved_stiffness/{name}",
             final_terms["stiffness_matrix"][idx],
             step,
         )
         _log_matrix(
             writer,
-            f"canonical/25_achieved_response/{name}",
+            f"canonical/20_achieved_response/{name}",
             final_terms["response_matrix"][idx],
             step,
         )
@@ -654,13 +648,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     )
 
     canonical_specs = _fixed_stiffness_target_specs(device)[:3]
-    _progress(
-        "train:canonical_stiffness_targets "
-        + " ".join(
-            f"{name}={_format_matrix(values)}" for name, values in canonical_specs
-        )
-    )
-
     model = GraphRefinementModel(
         d_model=config.d_model,
         nhead=config.nhead,
