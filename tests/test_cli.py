@@ -13,6 +13,7 @@ from compliant_mechanism_synthesis.cli import (
     _pure_noise_batch,
     _resolve_sample_seed,
     _sample_stiffness_targets,
+    _scheduled_goal_blend,
     _stiffness_to_response,
     _supervised_reconstruction_losses,
     _sample_supervised_denoising_batch,
@@ -188,6 +189,24 @@ def test_blend_training_targets_preserves_positive_definiteness() -> None:
     eigenvalues = torch.linalg.eigvalsh(blended)
 
     assert torch.all(eigenvalues > 0.0)
+
+
+def test_scheduled_goal_blend_interpolates_linearly_over_training() -> None:
+    assert torch.isclose(
+        torch.tensor(_scheduled_goal_blend(1, 5, 0.0, 1.0)), torch.tensor(0.0)
+    )
+    assert torch.isclose(
+        torch.tensor(_scheduled_goal_blend(3, 5, 0.0, 1.0)), torch.tensor(0.5)
+    )
+    assert torch.isclose(
+        torch.tensor(_scheduled_goal_blend(5, 5, 0.0, 1.0)), torch.tensor(1.0)
+    )
+
+
+def test_scheduled_goal_blend_clamps_extremes() -> None:
+    assert torch.isclose(
+        torch.tensor(_scheduled_goal_blend(1, 1, -1.0, 2.0)), torch.tensor(1.0)
+    )
 
 
 def test_pure_noise_batch_is_reproducible_with_explicit_seed() -> None:

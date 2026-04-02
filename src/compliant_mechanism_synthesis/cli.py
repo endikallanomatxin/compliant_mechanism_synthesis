@@ -55,7 +55,8 @@ class TrainConfig:
     supervised_position_noise: float = 0.02
     supervised_connectivity_noise: float = 0.08
     supervised_every_steps: int = 1
-    training_goal_blend: float = 0.5
+    training_goal_blend_start: float = 0.0
+    training_goal_blend_end: float = 1.0
     property_weight: float = 2.0
     monotonic_improvement_weight: float = 0.25
     material_weight: float = 1e4
@@ -212,6 +213,19 @@ def _blend_training_targets(
 ) -> torch.Tensor:
     blend = float(min(max(goal_blend, 0.0), 1.0))
     return (1.0 - blend) * start_stiffness + blend * goal_stiffness
+
+
+def _scheduled_goal_blend(
+    step: int,
+    train_steps: int,
+    blend_start: float,
+    blend_end: float,
+) -> float:
+    if train_steps <= 1:
+        return float(min(max(blend_end, 0.0), 1.0))
+    progress = (step - 1) / max(train_steps - 1, 1)
+    blend = blend_start + progress * (blend_end - blend_start)
+    return float(min(max(blend, 0.0), 1.0))
 
 
 def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
@@ -653,10 +667,16 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         )
         goal_targets = _sample_stiffness_targets(config.batch_size, device)
         start_terms = mechanical_terms(positions, roles, adjacency)
+        goal_blend = _scheduled_goal_blend(
+            step,
+            train_steps,
+            blend_start=config.training_goal_blend_start,
+            blend_end=config.training_goal_blend_end,
+        )
         raw_targets = _blend_training_targets(
             start_terms["stiffness_matrix"],
             goal_targets,
-            goal_blend=config.training_goal_blend,
+            goal_blend=goal_blend,
         )
         base_time = torch.rand((positions.shape[0],), device=device)
 
@@ -849,6 +869,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_totals["boundary"] += boundary_loss.item()
 
         writer.add_scalar("train/total_loss", total.item(), global_step)
+        writer.add_scalar("train/goal_blend", goal_blend, global_step)
         writer.add_scalar("train/property_loss", property_loss.item(), global_step)
         writer.add_scalar(
             "train/monotonic_improvement_loss", monotonic_loss.item(), global_step
@@ -1229,9 +1250,14 @@ def _train_parser() -> argparse.ArgumentParser:
         default=defaults.supervised_every_steps,
     )
     parser.add_argument(
-        "--training-goal-blend",
+        "--training-goal-blend-start",
         type=float,
-        default=defaults.training_goal_blend,
+        default=defaults.training_goal_blend_start,
+    )
+    parser.add_argument(
+        "--training-goal-blend-end",
+        type=float,
+        default=defaults.training_goal_blend_end,
     )
     parser.add_argument(
         "--property-weight", type=float, default=defaults.property_weight
