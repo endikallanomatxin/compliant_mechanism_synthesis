@@ -59,14 +59,14 @@ class TrainConfig:
     supervised_position_noise: float = 0.02
     supervised_connectivity_noise: float = 0.08
     supervised_every_steps: int = 1
-    training_goal_blend_start: float = 0.1
+    training_goal_blend_start: float = 0.05
     training_goal_blend_end: float = 1.0
     property_weight: float = 1.0
     monotonic_improvement_weight: float = 0.1
     material_weight: float = 0.01
     sparsity_weight: float = 0.03
-    connectivity_weight: float = 0.08
-    fixed_mobile_connectivity_weight: float = 0.4
+    connectivity_weight: float = 0.2
+    fixed_mobile_connectivity_weight: float = 1.0
     short_beam_weight: float = 0.15
     long_beam_weight: float = 0.3
     thin_diameter_weight: float = 0.05
@@ -167,27 +167,27 @@ def _fixed_stiffness_target_specs(
     specs = [
         (
             "01_flex_x",
-            [6.3, 0.0, 0.0, 10.1, 0.0, 4.2],
+            [5.2, 0.0, 0.0, 8.3, 0.0, 3.5],
         ),
         (
             "02_flex_y",
-            [10.1, 0.0, 0.0, 6.3, 0.0, 4.2],
+            [8.3, 0.0, 0.0, 5.2, 0.0, 3.5],
         ),
         (
             "03_flex_theta",
-            [9.2, 0.0, 0.0, 9.2, 0.0, 3.2],
+            [7.6, 0.0, 0.0, 7.6, 0.0, 2.6],
         ),
         (
             "04_balanced",
-            [7.8, 0.0, 0.0, 7.8, 0.0, 4.5],
+            [6.4, 0.0, 0.0, 6.4, 0.0, 3.7],
         ),
         (
             "05_couple_xy_pos",
-            [8.9, 0.9, -0.45, 6.9, 0.3, 4.4],
+            [7.3, 0.7, -0.35, 5.7, 0.25, 3.6],
         ),
         (
             "06_couple_xy_neg",
-            [6.9, -0.9, 0.45, 8.9, -0.3, 4.4],
+            [5.7, -0.7, 0.35, 7.3, -0.25, 3.6],
         ),
     ]
     return [
