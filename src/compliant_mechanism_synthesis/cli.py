@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -46,7 +47,9 @@ class TrainConfig:
     node_effect_dim: int = 64
     batch_size: int = 128
     train_steps: int = 20_000
-    learning_rate: float = 2e-5
+    learning_rate: float = 6e-5
+    learning_rate_warmup_steps: int = 200
+    learning_rate_min_scale: float = 0.1
     rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 0.1
@@ -121,6 +124,27 @@ def _resolve_sample_seed(seed_override: int | None) -> int:
     if seed_override is not None:
         return seed_override
     return random.SystemRandom().randrange(0, 2**31)
+
+
+def _scheduled_learning_rate(
+    step: int,
+    total_steps: int,
+    base_learning_rate: float,
+    warmup_steps: int,
+    min_scale: float,
+) -> float:
+    total_steps = max(total_steps, 1)
+    warmup_steps = max(min(warmup_steps, total_steps), 0)
+    min_scale = float(min(max(min_scale, 0.0), 1.0))
+    if warmup_steps > 0 and step <= warmup_steps:
+        return base_learning_rate * (step / warmup_steps)
+    if step >= total_steps:
+        return base_learning_rate * min_scale
+    anneal_span = max(total_steps - warmup_steps, 1)
+    anneal_progress = (step - warmup_steps) / anneal_span
+    cosine = 0.5 * (1.0 + math.cos(math.pi * anneal_progress))
+    scale = min_scale + (1.0 - min_scale) * cosine
+    return base_learning_rate * scale
 
 
 def _load_train_config(config_dict: dict[str, object]) -> TrainConfig:
@@ -749,6 +773,15 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
     model.train()
     for step in range(1, train_steps + 1):
+        scheduled_lr = _scheduled_learning_rate(
+            step=step,
+            total_steps=train_steps,
+            base_learning_rate=config.learning_rate,
+            warmup_steps=config.learning_rate_warmup_steps,
+            min_scale=config.learning_rate_min_scale,
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = scheduled_lr
         property_loss = torch.zeros((), device=device)
         supervised_position_loss = torch.zeros((), device=device)
         supervised_adjacency_loss = torch.zeros((), device=device)
@@ -959,6 +992,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
         if config.log_every_steps > 0 and step % config.log_every_steps == 0:
             writer.add_scalar("train/total_loss", total.item(), global_step)
+            writer.add_scalar("train/learning_rate", scheduled_lr, global_step)
             writer.add_text("train/phase", phase, global_step)
             writer.add_scalar("train/repertoire_size", len(repertoire), global_step)
             if phase == "supervised":
@@ -1313,6 +1347,16 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-steps", type=int, default=defaults.train_steps)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
+    parser.add_argument(
+        "--learning-rate-warmup-steps",
+        type=int,
+        default=defaults.learning_rate_warmup_steps,
+    )
+    parser.add_argument(
+        "--learning-rate-min-scale",
+        type=float,
+        default=defaults.learning_rate_min_scale,
+    )
     parser.add_argument("--rollout-steps", type=int, default=defaults.rollout_steps)
     parser.add_argument(
         "--position-step-size", type=float, default=defaults.position_step_size

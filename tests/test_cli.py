@@ -13,6 +13,7 @@ from compliant_mechanism_synthesis.cli import (
     _pure_noise_batch,
     _resolve_sample_seed,
     _sample_target_stiffnesses,
+    _scheduled_learning_rate,
     _scheduled_supervised_priority,
     _scheduled_training_phase,
     _stiffness_to_response,
@@ -200,6 +201,28 @@ def test_scheduled_supervised_priority_decays_linearly_to_one() -> None:
     assert _scheduled_supervised_priority(1, 1000, 200, 1) == 200
     assert _scheduled_supervised_priority(1000, 1000, 200, 1) == 1
     assert _scheduled_supervised_priority(1500, 1000, 200, 1) == 1
+
+
+def test_scheduled_learning_rate_warms_up_linearly() -> None:
+    base_lr = 5e-5
+
+    assert torch.isclose(
+        torch.tensor(_scheduled_learning_rate(1, 100, base_lr, 10, 0.1)),
+        torch.tensor(base_lr / 10.0),
+    )
+    assert torch.isclose(
+        torch.tensor(_scheduled_learning_rate(10, 100, base_lr, 10, 0.1)),
+        torch.tensor(base_lr),
+    )
+
+
+def test_scheduled_learning_rate_cosine_anneals_to_min_scale() -> None:
+    base_lr = 5e-5
+    lr_mid = _scheduled_learning_rate(55, 100, base_lr, 10, 0.1)
+    lr_final = _scheduled_learning_rate(100, 100, base_lr, 10, 0.1)
+
+    assert base_lr * 0.1 < lr_mid < base_lr
+    assert torch.isclose(torch.tensor(lr_final), torch.tensor(base_lr * 0.1))
 
 
 def test_scheduled_training_phase_starts_with_long_supervised_blocks() -> None:

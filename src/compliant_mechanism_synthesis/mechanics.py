@@ -649,7 +649,12 @@ def geometric_regularization_terms(
         physical_positions[:, edge_j] - physical_positions[:, edge_i], dim=-1
     ).clamp_min(1e-4)
     diameters = 2.0 * frame_config.r_max * activations
-    diameter_scale = 2.0 * frame_config.r_max
+    diameter_reference = 0.5 * (
+        geometry_config.min_diameter + geometry_config.max_diameter
+    )
+    d_hat = diameters / max(diameter_reference, 1e-12)
+    d_hat_min = geometry_config.min_diameter / max(diameter_reference, 1e-12)
+    d_hat_max = geometry_config.max_diameter / max(diameter_reference, 1e-12)
     normalizer = activations.sum(dim=1).clamp_min(1e-6)
 
     short = (activations * (geometry_config.min_length - lengths).clamp_min(0.0)).sum(
@@ -658,14 +663,11 @@ def geometric_regularization_terms(
     long = (activations * (lengths - geometry_config.max_length).clamp_min(0.0)).sum(
         dim=1
     ) / (normalizer * scales.length)
+    # Penalize subfabricable intermediate widths more than nearly absent bars.
     thin = (
-        activations
-        * (geometry_config.min_diameter - diameters).clamp_min(0.0).square()
-    ).sum(dim=1) / (normalizer * geometry_config.min_diameter**2)
-    thick = (
-        activations
-        * (diameters - geometry_config.max_diameter).clamp_min(0.0).square()
-    ).sum(dim=1) / (normalizer * diameter_scale**2)
+        (d_hat_min - d_hat).clamp_min(0.0).square() * d_hat.square()
+    ).sum(dim=1) / (normalizer * max(d_hat_min**2, 1e-12))
+    thick = ((d_hat - d_hat_max).clamp_min(0.0).square()).sum(dim=1) / normalizer
 
     free_mask = roles == ROLE_FREE
     free_positions = physical_positions

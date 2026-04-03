@@ -20,11 +20,11 @@ ROLE_STYLE = {
     ROLE_FREE: {"label": "free", "color": "tab:green", "marker": "o"},
 }
 
-LOAD_CASES = [
-    ("Fx", "tab:red"),
-    ("Fy", "tab:purple"),
-    ("M", "tab:brown"),
-]
+LOAD_CASES = ["Fx", "Fy", "M"]
+UNDEFORMED_EDGE_COLOR = "0.45"
+DEFORMED_EDGE_COLOR = "0.10"
+TARGET_MOBILE_COLOR = "tab:red"
+ACHIEVED_MOBILE_COLOR = ROLE_STYLE[ROLE_MOBILE]["color"]
 
 
 def _setup_axis(
@@ -39,7 +39,11 @@ def _setup_axis(
 
 
 def _draw_rigid_pair(
-    ax: plt.Axes, positions: torch.Tensor, roles: torch.Tensor
+    ax: plt.Axes,
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    *,
+    linestyle: str = "-",
 ) -> None:
     for role in (ROLE_FIXED, ROLE_MOBILE):
         indices = torch.where(roles == role)[0]
@@ -52,7 +56,7 @@ def _draw_rigid_pair(
             pair[:, 1].numpy(),
             color=style["color"],
             linewidth=2.4,
-            alpha=0.75,
+            linestyle=linestyle,
             solid_capstyle="round",
             zorder=2,
         )
@@ -68,7 +72,8 @@ def _draw_graph(
     title: str | None = None,
     legend: bool = False,
     edge_color: str = "black",
-    edge_alpha_scale: float = 1.0,
+    edge_linestyle: str = "-",
+    fill_nodes: bool = True,
     x_limits: tuple[float, float] = (-0.15, 1.15),
     y_limits: tuple[float, float] = (-0.15, 1.15),
 ) -> None:
@@ -95,12 +100,12 @@ def _draw_graph(
                 [positions[i, 0].item(), positions[j, 0].item()],
                 [positions[i, 1].item(), positions[j, 1].item()],
                 color=edge_color,
-                alpha=min(activation * edge_alpha_scale, 1.0),
+                linestyle=edge_linestyle,
                 linewidth=linewidth,
                 zorder=1,
             )
 
-    _draw_rigid_pair(ax, positions, roles)
+    _draw_rigid_pair(ax, positions, roles, linestyle=edge_linestyle)
 
     for role, style in ROLE_STYLE.items():
         mask = roles == role
@@ -109,11 +114,11 @@ def _draw_graph(
                 positions[mask, 0].numpy(),
                 positions[mask, 1].numpy(),
                 label=style["label"],
-                color=style["color"],
+                facecolors=style["color"] if fill_nodes else "white",
+                edgecolors=style["color"],
                 marker=style["marker"],
                 s=55,
-                edgecolors="white",
-                linewidths=0.6,
+                linewidths=1.0,
                 zorder=3,
             )
 
@@ -200,7 +205,6 @@ def _draw_mobile_pair_overlay(
         color=color,
         linestyle=linestyle,
         linewidth=4.0,
-        alpha=0.95,
         solid_capstyle="round",
         zorder=5,
     )
@@ -243,7 +247,7 @@ def _display_scale(
     reference = torch.quantile(norms, 0.95).item()
     if reference <= 1e-8:
         return 1.0
-    return min(max(0.16 / reference, 1.0), 5_000.0)
+    return min(max(0.08 / reference, 1.0), 2_000.0)
 
 
 def _draw_load_case_panel(
@@ -255,7 +259,6 @@ def _draw_load_case_panel(
     achieved_response: torch.Tensor,
     target_response: torch.Tensor,
     load_name: str,
-    color: str,
     threshold: float,
     frame_config: FrameFEMConfig,
 ) -> None:
@@ -282,8 +285,9 @@ def _draw_load_case_panel(
         frame_config=frame_config,
         title=f"{load_name} eval",
         legend=False,
-        edge_color="0.75",
-        edge_alpha_scale=0.45,
+        edge_color=UNDEFORMED_EDGE_COLOR,
+        edge_linestyle="--",
+        fill_nodes=False,
     )
     _draw_graph(
         ax,
@@ -293,14 +297,15 @@ def _draw_load_case_panel(
         threshold=threshold,
         frame_config=frame_config,
         legend=False,
-        edge_color=color,
-        edge_alpha_scale=0.85,
+        edge_color=DEFORMED_EDGE_COLOR,
+        edge_linestyle="-",
+        fill_nodes=True,
     )
     if target_pair is not None:
         _draw_mobile_pair_overlay(
             ax,
             target_pair,
-            color="tab:pink",
+            color=TARGET_MOBILE_COLOR,
             linestyle="--",
             label="target mobile",
             marker="x",
@@ -308,7 +313,7 @@ def _draw_load_case_panel(
     _draw_mobile_pair_overlay(
         ax,
         achieved_mobile_pair,
-        color=color,
+        color=ACHIEVED_MOBILE_COLOR,
         linestyle="-",
         label="achieved mobile",
         marker="^",
@@ -373,7 +378,7 @@ def _render_rollout_frame(
         title=main_title,
         legend=True,
     )
-    for idx, ((load_name, color), ax) in enumerate(
+    for idx, (load_name, ax) in enumerate(
         zip(LOAD_CASES, [axes[0, 1], axes[1, 0], axes[1, 1]])
     ):
         _draw_load_case_panel(
@@ -385,7 +390,6 @@ def _render_rollout_frame(
             achieved[:, idx],
             target_response[:, idx],
             load_name,
-            color,
             threshold,
             frame_config,
         )

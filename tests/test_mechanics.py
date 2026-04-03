@@ -219,6 +219,52 @@ def test_thin_diameter_penalty_is_zero_for_absent_or_fabricable_bars() -> None:
     assert torch.isclose(fabricable["thin_diameter_penalty"][0], torch.tensor(0.0))
 
 
+def test_thin_diameter_penalty_targets_intermediate_subfabricable_bars() -> None:
+    positions = torch.tensor(
+        [[[0.0, 0.0], [0.2, 0.0], [0.4, 0.0]]], dtype=torch.float32
+    )
+    roles = torch.tensor([[0, 1, 2]], dtype=torch.long)
+    config = GeometryRegularizationConfig(min_diameter=8e-4, max_diameter=2e-3)
+    frame = FrameFEMConfig(workspace_size=0.2, r_max=1e-3)
+
+    nearly_absent = geometric_regularization_terms(
+        positions,
+        roles,
+        torch.tensor(
+            [[[0.0, 0.02, 0.0], [0.02, 0.0, 0.0], [0.0, 0.0, 0.0]]],
+            dtype=torch.float32,
+        ),
+        config,
+        frame_config=frame,
+    )
+    intermediate = geometric_regularization_terms(
+        positions,
+        roles,
+        torch.tensor(
+            [[[0.0, 0.25, 0.0], [0.25, 0.0, 0.0], [0.0, 0.0, 0.0]]],
+            dtype=torch.float32,
+        ),
+        config,
+        frame_config=frame,
+    )
+    fabricable = geometric_regularization_terms(
+        positions,
+        roles,
+        torch.tensor(
+            [[[0.0, 0.5, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]]],
+            dtype=torch.float32,
+        ),
+        config,
+        frame_config=frame,
+    )
+
+    assert nearly_absent["thin_diameter_penalty"][0] > 0.0
+    assert intermediate["thin_diameter_penalty"][0] > nearly_absent[
+        "thin_diameter_penalty"
+    ][0]
+    assert torch.isclose(fabricable["thin_diameter_penalty"][0], torch.tensor(0.0))
+
+
 def test_geometric_regularization_penalizes_node_clustering_and_soft_domain_escape() -> (
     None
 ):
