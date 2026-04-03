@@ -42,34 +42,49 @@ from compliant_mechanism_synthesis.viz import (
 
 @dataclass
 class TrainConfig:
+    # Graph / model size.
     num_nodes: int = 64
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 12
     node_effect_dim: int = 64
+
+    # Optimization.
     batch_size: int = 128
     gradient_accumulation_steps: int = 4
     train_steps: int = 20_000
     learning_rate: float = 4e-5
     learning_rate_warmup_steps: int = 100
     learning_rate_min_scale: float = 0.1
+
+    # Rollout refinement.
     rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 0.1
-    rollout_position_noise: float = 0.1
-    rollout_connectivity_noise: float = 0.1
-    supervised_denoising_weight: float = 0.1
+    # Position noise is in normalized workspace units, where 1.0 is the full domain width.
+    rollout_position_noise: float = 0.01
+    # Connectivity noise is in continuous edge-activation units.
+    rollout_connectivity_noise: float = 0.04
+
+    # Supervised denoising.
+    supervised_denoising_weight: float = 0.4
     supervised_position_weight: float = 1.0
     supervised_adjacency_weight: float = 1.0
-    supervised_position_noise: float = 0.15
-    supervised_connectivity_noise: float = 0.2
+    # Position noise is in normalized workspace units.
+    supervised_position_noise: float = 0.02
+    # Connectivity noise is in continuous edge-activation units.
+    supervised_connectivity_noise: float = 0.06
     supervised_every_steps: int = 1
     supervised_priority_start: int = 3
     supervised_priority_end: int = 1
     supervised_priority_duration: int = 2_000
+
+    # Target repertoire / canonical evaluation.
     repertoire_bootstrap_cases: int = 512
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
+
+    # Loss weights.
     property_weight: float = 1.0
     stress_weight: float = 0.3
     monotonic_improvement_weight: float = 0.2
@@ -87,16 +102,22 @@ class TrainConfig:
     centroid_weight: float = 0.0
     spread_weight: float = 0.0
     soft_domain_weight: float = 0.0
+
+    # Geometric scales in meters.
     min_beam_length: float = 5e-3
     max_beam_length: float = 4e-2
     min_beam_diameter: float = 2e-4
     max_beam_diameter: float = 3e-3
     min_free_node_spacing: float = 1.2e-2
+
+    # Logging / visualization.
     display_animation_scale: float = 4.0
-    animation_every_steps: int = 500
+    animation_every_steps: int = 1000
     log_every_steps: int = 1
     canonical_eval_every_steps: int = 200
     sample_threshold: float = 0.5
+
+    # Runtime.
     device: str = "auto"
     name: str = "prototype"
     checkpoint_path: str = "artifacts/prototype.pt"
