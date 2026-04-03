@@ -61,8 +61,6 @@ class TrainConfig:
     supervised_priority_start: int = 20
     supervised_priority_end: int = 1
     supervised_priority_duration: int = 1_000
-    training_goal_blend_start: float = 1.0
-    training_goal_blend_end: float = 1.0
     repertoire_bootstrap_cases: int = 512
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
@@ -126,12 +124,7 @@ def _resolve_sample_seed(seed_override: int | None) -> int:
 
 
 def _load_train_config(config_dict: dict[str, object]) -> TrainConfig:
-    data = dict(config_dict)
-    if "training_goal_blend" in data:
-        blend = float(data.pop("training_goal_blend"))
-        data.setdefault("training_goal_blend_start", blend)
-        data.setdefault("training_goal_blend_end", blend)
-    return TrainConfig(**data)
+    return TrainConfig(**dict(config_dict))
 
 
 def _timestamped_run_dir(name: str) -> Path:
@@ -222,28 +215,6 @@ def _observe_cases(
         terms["stiffness_matrix"],
         source_code=source_code,
     )
-
-
-def _blend_training_targets(
-    start_stiffness: torch.Tensor,
-    goal_stiffness: torch.Tensor,
-    goal_blend: float,
-) -> torch.Tensor:
-    blend = float(min(max(goal_blend, 0.0), 1.0))
-    return (1.0 - blend) * start_stiffness + blend * goal_stiffness
-
-
-def _scheduled_goal_blend(
-    step: int,
-    train_steps: int,
-    blend_start: float,
-    blend_end: float,
-) -> float:
-    if train_steps <= 1:
-        return float(min(max(blend_end, 0.0), 1.0))
-    progress = (step - 1) / max(train_steps - 1, 1)
-    blend = blend_start + progress * (blend_end - blend_start)
-    return float(min(max(blend, 0.0), 1.0))
 
 
 def _scheduled_supervised_priority(
@@ -784,7 +755,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         supervised_loss = torch.zeros((), device=device)
         structural_integrity_loss = torch.zeros((), device=device)
         monotonic_loss = torch.zeros((), device=device)
-        goal_blend = 1.0
         phase = _scheduled_training_phase(
             step,
             config.supervised_priority_start,
@@ -827,19 +797,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 device,
                 repertoire,
             )
-            with torch.no_grad():
-                start_terms = mechanical_terms(positions, roles, adjacency)
-            goal_blend = _scheduled_goal_blend(
-                step,
-                train_steps,
-                blend_start=config.training_goal_blend_start,
-                blend_end=config.training_goal_blend_end,
-            )
-            raw_targets = _blend_training_targets(
-                start_terms["stiffness_matrix"],
-                goal_targets,
-                goal_blend=goal_blend,
-            )
+            raw_targets = goal_targets
             base_time = torch.rand((positions.shape[0],), device=device)
             rollout = rollout_refinement(
                 model,
@@ -854,7 +812,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 position_noise_scale=config.rollout_position_noise,
                 connectivity_noise_scale=config.rollout_connectivity_noise,
                 geometry_config=geometry_config,
-                initial_stiffness=start_terms["stiffness_matrix"],
+                initial_stiffness=None,
             )
             material_loss = torch.zeros((), device=device)
             sparsity_loss = torch.zeros((), device=device)
@@ -994,7 +952,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             writer.add_scalar("train/total_loss", total.item(), global_step)
             writer.add_text("train/phase", phase, global_step)
             writer.add_scalar("train/repertoire_size", len(repertoire), global_step)
-            writer.add_scalar("train/goal_blend", goal_blend, global_step)
             if phase == "supervised":
                 writer.add_scalar(
                     "train/supervised_loss", supervised_loss.item(), global_step
@@ -1408,16 +1365,6 @@ def _train_parser() -> argparse.ArgumentParser:
         "--supervised-priority-duration",
         type=int,
         default=defaults.supervised_priority_duration,
-    )
-    parser.add_argument(
-        "--training-goal-blend-start",
-        type=float,
-        default=defaults.training_goal_blend_start,
-    )
-    parser.add_argument(
-        "--training-goal-blend-end",
-        type=float,
-        default=defaults.training_goal_blend_end,
     )
     parser.add_argument(
         "--property-weight", type=float, default=defaults.property_weight

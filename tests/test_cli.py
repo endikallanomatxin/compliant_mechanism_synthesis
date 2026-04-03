@@ -5,7 +5,6 @@ import random
 import torch
 
 from compliant_mechanism_synthesis.cli import (
-    _blend_training_targets,
     _bootstrap_repertoire,
     _inject_rollout_noise,
     _mechanics_condition_matrices,
@@ -14,7 +13,6 @@ from compliant_mechanism_synthesis.cli import (
     _pure_noise_batch,
     _resolve_sample_seed,
     _sample_target_stiffnesses,
-    _scheduled_goal_blend,
     _scheduled_supervised_priority,
     _scheduled_training_phase,
     _stiffness_to_response,
@@ -173,46 +171,6 @@ def test_mechanics_condition_residual_matches_difference() -> None:
 
     assert residual.shape == targets.shape
     assert torch.allclose(residual, expected, atol=1e-6)
-
-
-def test_blend_training_targets_interpolates_start_and_goal() -> None:
-    start = torch.eye(3).unsqueeze(0)
-    goal = 3.0 * torch.eye(3).unsqueeze(0)
-
-    blended = _blend_training_targets(start, goal, goal_blend=0.5)
-
-    assert torch.allclose(blended, 2.0 * torch.eye(3).unsqueeze(0))
-
-
-def test_blend_training_targets_preserves_positive_definiteness() -> None:
-    repertoire = _bootstrap_repertoire(
-        TrainConfig(batch_size=8, repertoire_bootstrap_cases=8, repertoire_max_cases=16),
-        torch.device("cpu"),
-    )
-    specs = repertoire.stiffness[:2]
-    start = 0.5 * specs
-    blended = _blend_training_targets(start, specs, goal_blend=0.5)
-    eigenvalues = torch.linalg.eigvalsh(blended)
-
-    assert torch.all(eigenvalues > 0.0)
-
-
-def test_scheduled_goal_blend_interpolates_linearly_over_training() -> None:
-    assert torch.isclose(
-        torch.tensor(_scheduled_goal_blend(1, 5, 0.0, 1.0)), torch.tensor(0.0)
-    )
-    assert torch.isclose(
-        torch.tensor(_scheduled_goal_blend(3, 5, 0.0, 1.0)), torch.tensor(0.5)
-    )
-    assert torch.isclose(
-        torch.tensor(_scheduled_goal_blend(5, 5, 0.0, 1.0)), torch.tensor(1.0)
-    )
-
-
-def test_scheduled_goal_blend_clamps_extremes() -> None:
-    assert torch.isclose(
-        torch.tensor(_scheduled_goal_blend(1, 1, -1.0, 2.0)), torch.tensor(1.0)
-    )
 
 
 def test_scheduled_supervised_priority_decays_linearly_to_one() -> None:
