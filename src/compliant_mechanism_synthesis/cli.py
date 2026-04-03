@@ -68,7 +68,7 @@ class TrainConfig:
     canonical_case_count: int = 6
     property_weight: float = 1.0
     structural_integrity_weight: float = 1.0
-    monotonic_improvement_weight: float = 0.0
+    monotonic_improvement_weight: float = 0.05
     material_weight: float = 0.0
     sparsity_weight: float = 0.0
     connectivity_weight: float = 0.0
@@ -769,6 +769,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "total": 0.0,
         "property": 0.0,
         "structural_integrity": 0.0,
+        "monotonic": 0.0,
         "supervised": 0.0,
         "supervised_position": 0.0,
         "supervised_adjacency": 0.0,
@@ -782,6 +783,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         supervised_adjacency_loss = torch.zeros((), device=device)
         supervised_loss = torch.zeros((), device=device)
         structural_integrity_loss = torch.zeros((), device=device)
+        monotonic_loss = torch.zeros((), device=device)
         goal_blend = 1.0
         phase = _scheduled_training_phase(
             step,
@@ -945,6 +947,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     + step_weights[step_idx] * step_terms["soft_domain_penalty"].mean()
                 )
             monotonic_loss = _monotonic_improvement_loss(step_errors)
+            monotonic_loss = _monotonic_improvement_loss(step_errors)
             total = (
                 config.property_weight * property_loss
                 + config.structural_integrity_weight * structural_integrity_loss
@@ -985,6 +988,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         else:
             running_totals["property"] += property_loss.item()
             running_totals["structural_integrity"] += structural_integrity_loss.item()
+            running_totals["monotonic"] += monotonic_loss.item()
 
         if config.log_every_steps > 0 and step % config.log_every_steps == 0:
             writer.add_scalar("train/total_loss", total.item(), global_step)
@@ -1010,6 +1014,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     "train/property_loss", property_loss.item(), global_step
                 )
                 writer.add_scalar(
+                    "train/monotonic_improvement_loss",
+                    monotonic_loss.item(),
+                    global_step,
+                )
+                writer.add_scalar(
                     "train/structural_integrity_penalty",
                     structural_integrity_loss.item(),
                     global_step,
@@ -1032,7 +1041,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             active_window_keys = (
                 ("total", "supervised", "supervised_position", "supervised_adjacency")
                 if phase == "supervised"
-                else ("total", "property", "structural_integrity")
+                else ("total", "property", "structural_integrity", "monotonic")
             )
             for key in active_window_keys:
                 value = running_totals[key]
