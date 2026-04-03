@@ -46,7 +46,7 @@ class TrainConfig:
     latent_dim: int = 128
     batch_size: int = 128
     train_steps: int = 20_000
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-5
     rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 0.1
@@ -65,8 +65,8 @@ class TrainConfig:
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
     property_weight: float = 1.0
-    structural_integrity_weight: float = 1.0
-    monotonic_improvement_weight: float = 0.05
+    structural_integrity_weight: float = 1.2
+    monotonic_improvement_weight: float = 0.15
     material_weight: float = 0.0
     sparsity_weight: float = 0.0
     connectivity_weight: float = 0.0
@@ -828,84 +828,102 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             centroid_loss = torch.zeros((), device=device)
             spread_loss = torch.zeros((), device=device)
             soft_domain_loss = torch.zeros((), device=device)
-            step_errors: list[torch.Tensor] = []
+            step_objectives: list[torch.Tensor] = []
             for step_idx, state in enumerate(rollout):
                 step_terms = state["terms"]
                 step_error = _matrix_loss(
                     step_terms["stiffness_matrix"],
                     raw_targets,
                 )
-                step_errors.append(step_error)
                 property_loss = property_loss + step_weights[step_idx] * step_error
+                step_structural_integrity = step_terms[
+                    "structural_integrity_penalty"
+                ].mean()
                 structural_integrity_loss = (
                     structural_integrity_loss
-                    + step_weights[step_idx]
-                    * step_terms["structural_integrity_penalty"].mean()
+                    + step_weights[step_idx] * step_structural_integrity
                 )
+                step_material = step_terms["normalized_material"].mean()
                 material_loss = (
-                    material_loss
-                    + step_weights[step_idx] * step_terms["normalized_material"].mean()
+                    material_loss + step_weights[step_idx] * step_material
                 )
+                step_sparsity = step_terms["sparsity"].mean()
                 sparsity_loss = (
-                    sparsity_loss
-                    + step_weights[step_idx] * step_terms["sparsity"].mean()
+                    sparsity_loss + step_weights[step_idx] * step_sparsity
                 )
+                step_connectivity = step_terms["connectivity_penalty"].mean()
                 connectivity_loss = (
-                    connectivity_loss
-                    + step_weights[step_idx]
-                    * step_terms["connectivity_penalty"].mean()
+                    connectivity_loss + step_weights[step_idx] * step_connectivity
                 )
+                step_fixed_mobile_connectivity = step_terms[
+                    "fixed_mobile_connectivity_penalty"
+                ].mean()
                 fixed_mobile_connectivity_loss = (
                     fixed_mobile_connectivity_loss
-                    + step_weights[step_idx]
-                    * step_terms["fixed_mobile_connectivity_penalty"].mean()
+                    + step_weights[step_idx] * step_fixed_mobile_connectivity
                 )
+                step_short_beam = step_terms["short_beam_penalty"].mean()
                 short_beam_loss = (
-                    short_beam_loss
-                    + step_weights[step_idx] * step_terms["short_beam_penalty"].mean()
+                    short_beam_loss + step_weights[step_idx] * step_short_beam
                 )
+                step_long_beam = step_terms["long_beam_penalty"].mean()
                 long_beam_loss = (
-                    long_beam_loss
-                    + step_weights[step_idx] * step_terms["long_beam_penalty"].mean()
+                    long_beam_loss + step_weights[step_idx] * step_long_beam
                 )
+                step_thin_diameter = step_terms["thin_diameter_penalty"].mean()
                 thin_diameter_loss = (
                     thin_diameter_loss
-                    + step_weights[step_idx]
-                    * step_terms["thin_diameter_penalty"].mean()
+                    + step_weights[step_idx] * step_thin_diameter
                 )
+                step_thick_diameter = step_terms["thick_diameter_penalty"].mean()
                 thick_diameter_loss = (
                     thick_diameter_loss
-                    + step_weights[step_idx]
-                    * step_terms["thick_diameter_penalty"].mean()
+                    + step_weights[step_idx] * step_thick_diameter
                 )
+                step_node_spacing = step_terms["node_spacing_penalty"].mean()
                 node_spacing_loss = (
-                    node_spacing_loss
-                    + step_weights[step_idx] * step_terms["node_spacing_penalty"].mean()
+                    node_spacing_loss + step_weights[step_idx] * step_node_spacing
                 )
+                step_free_repulsion = step_terms["free_repulsion_penalty"].mean()
                 free_repulsion_loss = (
                     free_repulsion_loss
-                    + step_weights[step_idx]
-                    * step_terms["free_repulsion_penalty"].mean()
+                    + step_weights[step_idx] * step_free_repulsion
                 )
+                step_rigid_attachment = step_terms["rigid_attachment_penalty"].mean()
                 rigid_attachment_loss = (
                     rigid_attachment_loss
-                    + step_weights[step_idx]
-                    * step_terms["rigid_attachment_penalty"].mean()
+                    + step_weights[step_idx] * step_rigid_attachment
                 )
+                step_centroid = step_terms["centroid_penalty"].mean()
                 centroid_loss = (
-                    centroid_loss
-                    + step_weights[step_idx] * step_terms["centroid_penalty"].mean()
+                    centroid_loss + step_weights[step_idx] * step_centroid
                 )
-                spread_loss = (
-                    spread_loss
-                    + step_weights[step_idx] * step_terms["spread_penalty"].mean()
-                )
+                step_spread = step_terms["spread_penalty"].mean()
+                spread_loss = spread_loss + step_weights[step_idx] * step_spread
+                step_soft_domain = step_terms["soft_domain_penalty"].mean()
                 soft_domain_loss = (
-                    soft_domain_loss
-                    + step_weights[step_idx] * step_terms["soft_domain_penalty"].mean()
+                    soft_domain_loss + step_weights[step_idx] * step_soft_domain
                 )
-            monotonic_loss = _monotonic_improvement_loss(step_errors)
-            monotonic_loss = _monotonic_improvement_loss(step_errors)
+                step_objectives.append(
+                    config.property_weight * step_error
+                    + config.structural_integrity_weight * step_structural_integrity
+                    + config.material_weight * step_material
+                    + config.sparsity_weight * step_sparsity
+                    + config.connectivity_weight * step_connectivity
+                    + config.fixed_mobile_connectivity_weight
+                    * step_fixed_mobile_connectivity
+                    + config.short_beam_weight * step_short_beam
+                    + config.long_beam_weight * step_long_beam
+                    + config.thin_diameter_weight * step_thin_diameter
+                    + config.thick_diameter_weight * step_thick_diameter
+                    + config.node_spacing_weight * step_node_spacing
+                    + config.free_repulsion_weight * step_free_repulsion
+                    + config.rigid_attachment_weight * step_rigid_attachment
+                    + config.centroid_weight * step_centroid
+                    + config.spread_weight * step_spread
+                    + config.soft_domain_weight * step_soft_domain
+                )
+            monotonic_loss = _monotonic_improvement_loss(step_objectives)
             total = (
                 config.property_weight * property_loss
                 + config.structural_integrity_weight * structural_integrity_loss
