@@ -48,7 +48,7 @@ class TrainConfig:
     num_layers: int = 12
     node_effect_dim: int = 64
     batch_size: int = 128
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 4
     train_steps: int = 20_000
     learning_rate: float = 4e-5
     learning_rate_warmup_steps: int = 100
@@ -56,13 +56,13 @@ class TrainConfig:
     rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 0.1
-    rollout_position_noise: float = 0.8
-    rollout_connectivity_noise: float = 0.8
-    supervised_denoising_weight: float = 0.5
+    rollout_position_noise: float = 0.1
+    rollout_connectivity_noise: float = 0.1
+    supervised_denoising_weight: float = 0.1
     supervised_position_weight: float = 1.0
     supervised_adjacency_weight: float = 1.0
-    supervised_position_noise: float = 1
-    supervised_connectivity_noise: float = 1
+    supervised_position_noise: float = 0.15
+    supervised_connectivity_noise: float = 0.2
     supervised_every_steps: int = 1
     supervised_priority_start: int = 3
     supervised_priority_end: int = 1
@@ -95,7 +95,7 @@ class TrainConfig:
     display_animation_scale: float = 4.0
     animation_every_steps: int = 500
     log_every_steps: int = 1
-    canonical_eval_every_steps: int = 100
+    canonical_eval_every_steps: int = 200
     sample_threshold: float = 0.5
     device: str = "auto"
     name: str = "prototype"
