@@ -50,19 +50,19 @@ class TrainConfig:
     batch_size: int = 128
     gradient_accumulation_steps: int = 8
     train_steps: int = 20_000
-    learning_rate: float = 1e-4
+    learning_rate: float = 4e-5
     learning_rate_warmup_steps: int = 100
     learning_rate_min_scale: float = 0.1
     rollout_steps: int = 8
-    position_step_size: float = 0.1
+    position_step_size: float = 0.2
     connectivity_step_size: float = 0.1
-    rollout_position_noise: float = 0.04
-    rollout_connectivity_noise: float = 0.08
+    rollout_position_noise: float = 0.8
+    rollout_connectivity_noise: float = 0.8
     supervised_denoising_weight: float = 0.5
     supervised_position_weight: float = 1.0
     supervised_adjacency_weight: float = 1.0
-    supervised_position_noise: float = 0.08
-    supervised_connectivity_noise: float = 0.16
+    supervised_position_noise: float = 1
+    supervised_connectivity_noise: float = 1
     supervised_every_steps: int = 1
     supervised_priority_start: int = 3
     supervised_priority_end: int = 1
@@ -626,9 +626,9 @@ def rollout_refinement(
         }
         if geometry_config is not None:
             step_terms = mechanical_terms(
-                current_positions,
+                refined_positions,
                 roles,
-                current_adjacency,
+                refined_adjacency,
                 geometry_config=geometry_config,
             )
             finite_stiffness = torch.isfinite(step_terms["stiffness_matrix"]).all(

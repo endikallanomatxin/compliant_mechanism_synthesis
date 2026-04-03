@@ -18,7 +18,9 @@ from compliant_mechanism_synthesis.cli import (
     _scheduled_training_phase,
     _stiffness_to_response,
     _supervised_reconstruction_losses,
+    _geometry_regularization_config,
     TrainConfig,
+    rollout_refinement,
 )
 from compliant_mechanism_synthesis.common import (
     ROLE_FIXED,
@@ -26,7 +28,12 @@ from compliant_mechanism_synthesis.common import (
     ROLE_MOBILE,
     apply_free_node_update,
 )
-from compliant_mechanism_synthesis.mechanics import characteristic_scales, FrameFEMConfig
+from compliant_mechanism_synthesis.mechanics import (
+    characteristic_scales,
+    FrameFEMConfig,
+    mechanical_terms,
+)
+from compliant_mechanism_synthesis.model import GraphRefinementModel
 from compliant_mechanism_synthesis.repertoire import SimulationRepertoire
 from compliant_mechanism_synthesis.scaling import normalize_generalized_stiffness_matrix
 
@@ -292,12 +299,94 @@ def test_repertoire_canonical_specs_choose_positive_definite_cases() -> None:
     assert torch.all(eigenvalues > 0.0)
 
 
+def test_repertoire_canonical_specs_avoid_duplicate_fallback_cases() -> None:
+    positions, roles, adjacency = _pure_noise_batch(256, 64, torch.device("cpu"), seed=123)
+    repertoire = SimulationRepertoire.empty(num_nodes=64, max_cases=512)
+    generated_terms = mechanical_terms(positions, roles, adjacency)
+    repertoire.add(
+        positions,
+        roles,
+        adjacency,
+        generated_terms["stiffness_matrix"],
+        source_code=0,
+    )
+
+    specs = repertoire.canonical_specs(torch.device("cpu"), max_specs=6)
+    canonical_matrices = torch.stack([matrix for _, matrix in specs], dim=0)
+    unique_components = torch.unique(canonical_matrices.reshape(6, -1), dim=0)
+
+    assert len(specs) == 6
+    assert unique_components.shape[0] == 6
+
+
 def test_pure_noise_batch_is_reproducible_with_explicit_seed() -> None:
     batch_a = _pure_noise_batch(2, 8, torch.device("cpu"), seed=123)
     batch_b = _pure_noise_batch(2, 8, torch.device("cpu"), seed=123)
 
     for a, b in zip(batch_a, batch_b):
         assert torch.allclose(a, b)
+
+
+def test_rollout_terms_are_computed_on_refined_state_before_noise() -> None:
+    device = torch.device("cpu")
+    config = TrainConfig(
+        device="cpu",
+        batch_size=2,
+        num_nodes=8,
+        rollout_steps=2,
+        rollout_position_noise=0.05,
+        rollout_connectivity_noise=0.10,
+    )
+    model = GraphRefinementModel(
+        d_model=config.d_model,
+        nhead=config.nhead,
+        num_layers=2,
+        node_effect_dim=config.node_effect_dim,
+    )
+    positions, roles, adjacency = _pure_noise_batch(
+        config.batch_size,
+        config.num_nodes,
+        device,
+        seed=123,
+    )
+    target_stiffness = torch.eye(3).repeat(config.batch_size, 1, 1)
+    rollout = rollout_refinement(
+        model,
+        positions,
+        roles,
+        adjacency,
+        target_stiffness,
+        steps=config.rollout_steps,
+        position_step_size=config.position_step_size,
+        connectivity_step_size=config.connectivity_step_size,
+        base_time=torch.ones((config.batch_size,), device=device),
+        position_noise_scale=config.rollout_position_noise,
+        connectivity_noise_scale=config.rollout_connectivity_noise,
+        geometry_config=_geometry_regularization_config(config),
+    )
+
+    state = rollout[0]
+    refined_terms = mechanical_terms(
+        state["refined_positions"],
+        roles,
+        state["refined_adjacency"],
+        geometry_config=_geometry_regularization_config(config),
+    )
+    noisy_terms = mechanical_terms(
+        state["positions"],
+        roles,
+        state["adjacency"],
+        geometry_config=_geometry_regularization_config(config),
+    )
+
+    assert torch.allclose(
+        state["terms"]["stiffness_matrix"],
+        refined_terms["stiffness_matrix"],
+    )
+    assert not torch.allclose(
+        state["terms"]["stiffness_matrix"],
+        noisy_terms["stiffness_matrix"],
+    )
 
 
 def test_resolve_sample_seed_uses_override_when_provided() -> None:

@@ -48,6 +48,60 @@ def _project_positive_definite(matrices: torch.Tensor, eps: float = 1e-3) -> tor
     return projected + (min_eigenvalue + eps).view(-1, 1, 1) * eye.unsqueeze(0)
 
 
+def _select_best_index(
+    candidate_mask: torch.Tensor,
+    component_sum: torch.Tensor,
+    used_indices: set[int],
+) -> int | None:
+    candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+    if candidate_indices.numel() == 0:
+        return None
+    available = [int(index.item()) for index in candidate_indices if int(index.item()) not in used_indices]
+    if available:
+        available_indices = torch.tensor(
+            available,
+            device=component_sum.device,
+            dtype=torch.long,
+        )
+        scores = component_sum.index_select(0, available_indices)
+        return int(available_indices[torch.argmax(scores)].item())
+    scores = component_sum.index_select(0, candidate_indices)
+    return int(candidate_indices[torch.argmax(scores)].item())
+
+
+def _select_nearest_zero_index(
+    absolute_component: torch.Tensor,
+    component_sum: torch.Tensor,
+    used_indices: set[int],
+) -> int | None:
+    sorted_indices = torch.argsort(absolute_component, stable=True)
+    available = [
+        int(index.item())
+        for index in sorted_indices
+        if int(index.item()) not in used_indices
+    ]
+    if available:
+        available_indices = torch.tensor(
+            available,
+            device=component_sum.device,
+            dtype=torch.long,
+        )
+        absolute_values = absolute_component.index_select(0, available_indices)
+        minimum = absolute_values.amin()
+        tie_mask = absolute_values <= (minimum + 1e-9)
+        tie_indices = available_indices[tie_mask]
+        tie_scores = component_sum.index_select(0, tie_indices)
+        return int(tie_indices[torch.argmax(tie_scores)].item())
+    if sorted_indices.numel() == 0:
+        return None
+    absolute_values = absolute_component.index_select(0, sorted_indices)
+    minimum = absolute_values.amin()
+    tie_mask = absolute_values <= (minimum + 1e-9)
+    tie_indices = sorted_indices[tie_mask]
+    tie_scores = component_sum.index_select(0, tie_indices)
+    return int(tie_indices[torch.argmax(tie_scores)].item())
+
+
 @dataclass
 class SimulationRepertoire:
     positions: torch.Tensor
@@ -188,12 +242,18 @@ class SimulationRepertoire:
         component_sum = components.sum(dim=1)
         max_abs = components.abs().amax(dim=0).clamp_min(1e-6)
         specs: list[tuple[str, torch.Tensor]] = []
+        used_indices: set[int] = set()
         for dim_idx, label in enumerate(COMPONENT_LABELS):
             mask = components[:, dim_idx].abs() <= 0.1 * max_abs[dim_idx]
-            if mask.any():
-                masked_scores = component_sum.masked_fill(~mask, float("-inf"))
-                best_index = int(torch.argmax(masked_scores).item())
-            else:
+            best_index = _select_best_index(mask, component_sum, used_indices)
+            if best_index is None:
+                absolute_component = components[:, dim_idx].abs()
+                best_index = _select_nearest_zero_index(
+                    absolute_component,
+                    component_sum,
+                    used_indices,
+                )
+            if best_index is None:
                 best_index = int(torch.argmax(component_sum).item())
             specs.append(
                 (
@@ -201,6 +261,7 @@ class SimulationRepertoire:
                     self.stiffness[best_index].to(device),
                 )
             )
+            used_indices.add(best_index)
         if max_specs is not None:
             specs = specs[:max_specs]
         return specs
