@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 import numpy as np
 import torch
 from PIL import Image
@@ -74,6 +75,7 @@ def _draw_graph(
     edge_color: str = "black",
     edge_linestyle: str = "-",
     fill_nodes: bool = True,
+    axis_width_in: float | None = None,
     x_limits: tuple[float, float] = (-0.15, 1.15),
     y_limits: tuple[float, float] = (-0.15, 1.15),
 ) -> None:
@@ -82,11 +84,14 @@ def _draw_graph(
     roles = roles.detach().cpu()
     adjacency = adjacency.detach().cpu()
 
-    ax.figure.canvas.draw()
-    axis_width_in = (
-        ax.get_window_extent().transformed(ax.figure.dpi_scale_trans.inverted()).width
-    )
+    if axis_width_in is None:
+        ax.figure.canvas.draw()
+        axis_width_in = (
+            ax.get_window_extent().transformed(ax.figure.dpi_scale_trans.inverted()).width
+        )
 
+    segments = []
+    linewidths = []
     for i in range(positions.shape[0]):
         for j in range(i + 1, positions.shape[0]):
             activation = adjacency[i, j].item()
@@ -96,14 +101,24 @@ def _draw_graph(
             linewidth = (diameter / frame_config.workspace_size) * axis_width_in * 72.0
             if linewidth <= 0.0 or activation <= 0.0:
                 continue
-            ax.plot(
-                [positions[i, 0].item(), positions[j, 0].item()],
-                [positions[i, 1].item(), positions[j, 1].item()],
-                color=edge_color,
-                linestyle=edge_linestyle,
-                linewidth=linewidth,
+            segments.append(
+                [
+                    [positions[i, 0].item(), positions[i, 1].item()],
+                    [positions[j, 0].item(), positions[j, 1].item()],
+                ]
+            )
+            linewidths.append(linewidth)
+
+    if segments:
+        ax.add_collection(
+            LineCollection(
+                segments,
+                colors=edge_color,
+                linewidths=linewidths,
+                linestyles=edge_linestyle,
                 zorder=1,
             )
+        )
 
     _draw_rigid_pair(ax, positions, roles, linestyle=edge_linestyle)
 
@@ -261,6 +276,7 @@ def _draw_load_case_panel(
     load_name: str,
     threshold: float,
     frame_config: FrameFEMConfig,
+    axis_width_in: float,
 ) -> None:
     case_scale = _display_scale(deformation, frame_config)
     normalized_deformation = deformation / frame_config.workspace_size
@@ -288,6 +304,7 @@ def _draw_load_case_panel(
         edge_color=UNDEFORMED_EDGE_COLOR,
         edge_linestyle="--",
         fill_nodes=False,
+        axis_width_in=axis_width_in,
     )
     _draw_graph(
         ax,
@@ -300,6 +317,7 @@ def _draw_load_case_panel(
         edge_color=DEFORMED_EDGE_COLOR,
         edge_linestyle="-",
         fill_nodes=True,
+        axis_width_in=axis_width_in,
     )
     if target_pair is not None:
         _draw_mobile_pair_overlay(
@@ -339,6 +357,8 @@ def _render_rollout_frame(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
+    deformations: torch.Tensor,
+    achieved: torch.Tensor,
     target_response: torch.Tensor,
     phase_label: str,
     threshold: float,
@@ -348,15 +368,9 @@ def _render_rollout_frame(
     positions = positions.detach().cpu()
     roles = roles.detach().cpu()
     adjacency = adjacency.detach().cpu()
+    deformations = deformations.detach().cpu()
+    achieved = achieved.detach().cpu()
     target_response = target_response.detach().cpu()
-    deformations, achieved = load_case_deformations(
-        positions.unsqueeze(0),
-        roles.unsqueeze(0),
-        adjacency.unsqueeze(0),
-        config=frame_config,
-    )
-    deformations = deformations[0].detach().cpu()
-    achieved = achieved[0].detach().cpu()
 
     fig, axes = plt.subplots(2, 2, figsize=(10, 8))
     fig.subplots_adjust(
@@ -366,6 +380,13 @@ def _render_rollout_frame(
         top=0.94,
         wspace=0.16,
         hspace=0.20,
+    )
+    fig.canvas.draw()
+    axis_width_in = (
+        axes[0, 0]
+        .get_window_extent()
+        .transformed(fig.dpi_scale_trans.inverted())
+        .width
     )
     main_title = phase_label if title is None else f"{title} | {phase_label}"
     _draw_graph(
@@ -377,6 +398,7 @@ def _render_rollout_frame(
         frame_config=frame_config,
         title=main_title,
         legend=True,
+        axis_width_in=axis_width_in,
     )
     for idx, (load_name, ax) in enumerate(
         zip(LOAD_CASES, [axes[0, 1], axes[1, 0], axes[1, 1]])
@@ -392,6 +414,7 @@ def _render_rollout_frame(
             load_name,
             threshold,
             frame_config,
+            axis_width_in,
         )
     fig.canvas.draw()
     image = Image.fromarray(np.asarray(fig.canvas.buffer_rgba())[..., :3])
@@ -435,18 +458,36 @@ def export_rollout_animation(
     if final_positions is not None and final_adjacency is not None:
         frames.append((final_positions, final_adjacency, "99 final_eval"))
 
+    frame_positions = torch.stack(
+        [positions.detach().cpu() for positions, _, _ in frames],
+        dim=0,
+    )
+    frame_roles = roles.detach().cpu().unsqueeze(0).expand(len(frames), -1)
+    frame_adjacency = torch.stack(
+        [adjacency.detach().cpu() for _, adjacency, _ in frames],
+        dim=0,
+    )
+    frame_deformations, frame_achieved = load_case_deformations(
+        frame_positions,
+        frame_roles,
+        frame_adjacency,
+        config=frame_config,
+    )
+
     images = [
         _render_rollout_frame(
             positions,
             roles,
             adjacency,
+            frame_deformations[idx],
+            frame_achieved[idx],
             target_response,
             phase_label,
             threshold,
             frame_config,
             title,
         )
-        for positions, adjacency, phase_label in frames
+        for idx, (positions, adjacency, phase_label) in enumerate(frames)
     ]
     images[0].save(
         output_path,
