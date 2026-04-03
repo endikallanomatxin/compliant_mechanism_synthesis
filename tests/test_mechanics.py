@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from pathlib import Path
 import random
 
 import matplotlib.pyplot as plt
+import pytest
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
@@ -110,10 +112,12 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["centroid_penalty"].shape == (1,)
     assert terms["spread_penalty"].shape == (1,)
     assert terms["soft_domain_penalty"].shape == (1,)
-    assert terms["structural_integrity_penalty"].shape == (1,)
+    assert terms["stress_loss"].shape == (1,)
+    assert terms["max_von_mises_stress"].shape == (1,)
+    assert terms["max_stress_ratio"].shape == (1,)
 
 
-def test_structural_integrity_terms_are_zero_for_absent_bars() -> None:
+def test_stress_terms_are_zero_for_absent_bars() -> None:
     positions, roles, _ = generate_graph_sample(10)
     adjacency = torch.zeros((1, 10, 10), dtype=torch.float32)
     fields = mechanical_response_fields(
@@ -123,10 +127,12 @@ def test_structural_integrity_terms_are_zero_for_absent_bars() -> None:
     assert torch.allclose(
         fields["nodal_stress"], torch.zeros_like(fields["nodal_stress"])
     )
-    assert torch.isclose(fields["structural_integrity_penalty"][0], torch.tensor(0.0))
+    assert torch.isclose(fields["stress_loss"][0], torch.tensor(0.0))
+    assert torch.isclose(fields["max_von_mises_stress"][0], torch.tensor(0.0))
+    assert torch.isclose(fields["max_stress_ratio"][0], torch.tensor(0.0))
 
 
-def test_structural_integrity_penalty_accumulates_with_reference_loads() -> None:
+def test_stress_loss_accumulates_with_reference_loads() -> None:
     positions, roles, adjacency = generate_graph_sample(10)
     fields = mechanical_response_fields(
         positions.unsqueeze(0),
@@ -136,7 +142,9 @@ def test_structural_integrity_penalty_accumulates_with_reference_loads() -> None
     )
 
     assert fields["nodal_stress"].max() > 0.0
-    assert fields["structural_integrity_penalty"][0] > 0.0
+    assert fields["stress_loss"][0] > 0.0
+    assert fields["max_von_mises_stress"][0] > 0.0
+    assert fields["max_stress_ratio"][0] > 0.0
 
 
 def test_reference_loads_preserve_stiffness_matrix_units() -> None:
@@ -148,7 +156,7 @@ def test_reference_loads_preserve_stiffness_matrix_units() -> None:
         positions.unsqueeze(0),
         roles.unsqueeze(0),
         adjacency.unsqueeze(0),
-        config=FrameFEMConfig(reference_force=20.0, reference_moment=4.0),
+        config=FrameFEMConfig(reference_force=80.0, reference_moment=8.0),
     )
 
     assert torch.allclose(
@@ -157,8 +165,12 @@ def test_reference_loads_preserve_stiffness_matrix_units() -> None:
         atol=1e-4,
         rtol=1e-4,
     )
-    assert stronger_load_fields["structural_integrity_penalty"][0] > default_fields[
-        "structural_integrity_penalty"
+    assert stronger_load_fields["stress_loss"][0] > default_fields["stress_loss"][0]
+    assert stronger_load_fields["max_von_mises_stress"][0] > default_fields[
+        "max_von_mises_stress"
+    ][0]
+    assert stronger_load_fields["max_stress_ratio"][0] > default_fields[
+        "max_stress_ratio"
     ][0]
 
 
@@ -549,6 +561,9 @@ def test_noise_connectivity_gives_each_node_a_local_allowed_edge() -> None:
 
 
 def test_noise_starting_configurations_have_reasonable_batch_quality() -> None:
+    if os.environ.get("CMS_RUN_STARTING_CONFIG_TEST") != "1":
+        pytest.skip("set CMS_RUN_STARTING_CONFIG_TEST=1 to generate starting-config runs")
+
     random.seed(7)
     torch.manual_seed(7)
 

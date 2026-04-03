@@ -79,6 +79,17 @@ class SimulationRepertoire:
         stiffness: torch.Tensor,
         source_code: int,
     ) -> None:
+        finite_mask = (
+            torch.isfinite(positions).all(dim=(1, 2))
+            & torch.isfinite(adjacency).all(dim=(1, 2))
+            & torch.isfinite(stiffness).all(dim=(1, 2))
+        )
+        if not finite_mask.any():
+            return
+        positions = positions[finite_mask]
+        roles = roles[finite_mask]
+        adjacency = adjacency[finite_mask]
+        stiffness = stiffness[finite_mask]
         batch_size = positions.shape[0]
         source = torch.full((batch_size,), source_code, dtype=torch.long)
         self.positions = torch.cat([self.positions, positions.detach().cpu()], dim=0)
@@ -104,7 +115,9 @@ class SimulationRepertoire:
             self.stiffness,
             characteristic_scales(frame_config),
         )
-        return _upper_triangular_components(normalized)
+        components = _upper_triangular_components(normalized)
+        finite_mask = torch.isfinite(components).all(dim=1)
+        return components[finite_mask]
 
     def sample_cases(
         self,
@@ -129,15 +142,25 @@ class SimulationRepertoire:
     ) -> torch.Tensor:
         if len(self) == 0:
             raise RuntimeError("cannot sample target stiffness from an empty repertoire")
-        if len(self) == 1:
-            return self.stiffness[:1].expand(batch_size, -1, -1).to(device)
+        finite_stiffness_mask = torch.isfinite(self.stiffness).all(dim=(1, 2))
+        finite_stiffness = self.stiffness[finite_stiffness_mask]
+        if finite_stiffness.shape[0] == 0:
+            raise RuntimeError("cannot sample target stiffness from a non-finite repertoire")
+        if finite_stiffness.shape[0] == 1:
+            return finite_stiffness[:1].expand(batch_size, -1, -1).to(device)
         components = self.normalized_components(frame_config)
+        if components.shape[0] < 2 or not torch.isfinite(components).all():
+            indices = torch.randint(finite_stiffness.shape[0], (batch_size,))
+            return finite_stiffness.index_select(0, indices).to(device)
         mean = components.mean(dim=0)
         centered = components - mean
-        covariance = centered.transpose(0, 1) @ centered / max(len(self) - 1, 1)
+        covariance = centered.transpose(0, 1) @ centered / max(components.shape[0] - 1, 1)
         covariance = covariance + 1e-3 * torch.eye(
             covariance.shape[0], dtype=covariance.dtype
         )
+        if not torch.isfinite(mean).all() or not torch.isfinite(covariance).all():
+            indices = torch.randint(finite_stiffness.shape[0], (batch_size,))
+            return finite_stiffness.index_select(0, indices).to(device)
         distribution = torch.distributions.MultivariateNormal(
             mean.to(device),
             covariance_matrix=covariance.to(device),

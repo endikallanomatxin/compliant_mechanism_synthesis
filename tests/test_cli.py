@@ -137,6 +137,43 @@ def test_stiffness_target_sampling_from_repertoire_is_positive_definite() -> Non
     assert torch.all(eigenvalues > -5e-2)
 
 
+def test_repertoire_add_discards_nonfinite_cases() -> None:
+    repertoire = SimulationRepertoire.empty(num_nodes=4, max_cases=8)
+    positions = torch.rand(2, 4, 2)
+    roles = torch.tensor(
+        [[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_FREE]] * 2,
+        dtype=torch.long,
+    )
+    adjacency = torch.rand(2, 4, 4)
+    stiffness = torch.eye(3).repeat(2, 1, 1)
+    stiffness[1, 0, 0] = torch.nan
+
+    repertoire.add(positions, roles, adjacency, stiffness, source_code=0)
+
+    assert len(repertoire) == 1
+    assert torch.isfinite(repertoire.stiffness).all()
+
+
+def test_stiffness_target_sampling_falls_back_when_repertoire_has_nonfinite_components() -> (
+    None
+):
+    repertoire = SimulationRepertoire.empty(num_nodes=4, max_cases=8)
+    positions = torch.rand(3, 4, 2)
+    roles = torch.tensor(
+        [[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_FREE]] * 3,
+        dtype=torch.long,
+    )
+    adjacency = torch.rand(3, 4, 4)
+    stiffness = torch.eye(3).repeat(3, 1, 1)
+    repertoire.add(positions, roles, adjacency, stiffness, source_code=0)
+    repertoire.stiffness[2, 0, 0] = torch.nan
+
+    sampled = repertoire.sample_target_stiffness(4, torch.device("cpu"))
+
+    assert sampled.shape == (4, 3, 3)
+    assert torch.isfinite(sampled).all()
+
+
 def test_matrix_loss_is_zero_for_exact_match_under_characteristic_scaling() -> None:
     repertoire = _bootstrap_repertoire(
         TrainConfig(batch_size=8, repertoire_bootstrap_cases=8, repertoire_max_cases=16),

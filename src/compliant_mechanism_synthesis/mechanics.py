@@ -34,8 +34,8 @@ class FrameFEMConfig:
     r_max: float = 1.5e-3
     stiffness_regularization: float = 1e-4
     yield_stress: float = 250e6
-    reference_force: float = 10.0
-    reference_moment: float = 2.0
+    reference_force: float = 40.0
+    reference_moment: float = 8.0
 
 
 @dataclass(frozen=True)
@@ -364,7 +364,7 @@ def _stress_response_fields(
     transforms: torch.Tensor,
     reduced_displacements: torch.Tensor,
     config: FrameFEMConfig,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     physical_positions = _physical_positions(positions, config)
     batch_size, num_nodes, _ = positions.shape
     edge_i, edge_j = _cached_edge_index_pairs(num_nodes)
@@ -403,16 +403,25 @@ def _stress_response_fields(
         local_forces[..., 0, :].abs(),
         local_forces[..., 3, :].abs(),
     )
+    shear_force = torch.maximum(
+        local_forces[..., 1, :].abs(),
+        local_forces[..., 4, :].abs(),
+    )
     moment_i = local_forces[..., 2, :].abs()
     moment_j = local_forces[..., 5, :].abs()
     axial_stress = axial_force / area.unsqueeze(-1)
+    shear_stress = shear_force / area.unsqueeze(-1)
     bending_i = moment_i * radius.unsqueeze(-1) / inertia.unsqueeze(-1)
     bending_j = moment_j * radius.unsqueeze(-1) / inertia.unsqueeze(-1)
-    edge_stress = torch.maximum(axial_stress + bending_i, axial_stress + bending_j)
-    edge_stress = edge_stress.masked_fill(activations.unsqueeze(-1) <= 1e-6, 0.0)
-    max_edge_stress = edge_stress.max(dim=-1).values
+    normal_stress_i = axial_stress + bending_i
+    normal_stress_j = axial_stress + bending_j
+    von_mises_i = torch.sqrt(normal_stress_i.square() + 3.0 * shear_stress.square())
+    von_mises_j = torch.sqrt(normal_stress_j.square() + 3.0 * shear_stress.square())
+    edge_von_mises = torch.maximum(von_mises_i, von_mises_j)
+    edge_von_mises = edge_von_mises.masked_fill(activations.unsqueeze(-1) <= 1e-6, 0.0)
+    max_edge_von_mises = edge_von_mises.max(dim=-1).values
 
-    weighted_stress = activations * max_edge_stress
+    weighted_stress = activations * max_edge_von_mises
     stress_sum = torch.zeros(
         (batch_size, num_nodes), device=positions.device, dtype=positions.dtype
     )
@@ -426,11 +435,13 @@ def _stress_response_fields(
     weight_sum.scatter_add_(1, scatter_i, activations)
     weight_sum.scatter_add_(1, scatter_j, activations)
     nodal_stress = stress_sum / weight_sum.clamp_min(1e-6)
-    yield_ratio = max_edge_stress / config.yield_stress
-    yield_penalty = (activations * yield_ratio.square()).sum(dim=1) / activations.sum(
+    stress_ratio = max_edge_von_mises / config.yield_stress
+    stress_loss = (activations * stress_ratio.square()).sum(dim=1) / activations.sum(
         dim=1
     ).clamp_min(1e-6)
-    return nodal_stress, yield_penalty
+    max_von_mises_stress = max_edge_von_mises.max(dim=1).values
+    max_stress_ratio = stress_ratio.max(dim=1).values
+    return nodal_stress, stress_loss, max_von_mises_stress, max_stress_ratio
 
 
 def mechanical_response_fields(
@@ -459,7 +470,12 @@ def mechanical_response_fields(
         0, 3, 1, 2
     )
     translations = full_displacements[..., :2]
-    nodal_stress, yield_penalty = _stress_response_fields(
+    (
+        nodal_stress,
+        stress_loss,
+        max_von_mises_stress,
+        max_stress_ratio,
+    ) = _stress_response_fields(
         positions,
         adjacency,
         transforms,
@@ -485,8 +501,9 @@ def mechanical_response_fields(
         "normalized_stiffness_matrix": normalized_stiffness_matrix,
         "normalized_translations": normalized_translations,
         "normalized_nodal_stress": normalized_nodal_stress,
-        "yield_stress_penalty": yield_penalty,
-        "structural_integrity_penalty": yield_penalty,
+        "stress_loss": stress_loss,
+        "max_von_mises_stress": max_von_mises_stress,
+        "max_stress_ratio": max_stress_ratio,
     }
 
 
@@ -787,10 +804,9 @@ def mechanical_terms(
         "normalized_stiffness_matrix": response_fields["normalized_stiffness_matrix"],
         "normalized_translations": response_fields["normalized_translations"],
         "normalized_nodal_stress": response_fields["normalized_nodal_stress"],
-        "yield_stress_penalty": response_fields["yield_stress_penalty"],
-        "structural_integrity_penalty": response_fields[
-            "structural_integrity_penalty"
-        ],
+        "stress_loss": response_fields["stress_loss"],
+        "max_von_mises_stress": response_fields["max_von_mises_stress"],
+        "max_stress_ratio": response_fields["max_stress_ratio"],
         "connectivity_penalty": connectivity_penalty(roles, adjacency),
         "fixed_mobile_connectivity_penalty": fixed_mobile_connectivity_penalty(
             roles,

@@ -56,8 +56,8 @@ class TrainConfig:
     rollout_position_noise: float = 0.01
     rollout_connectivity_noise: float = 0.05
     supervised_denoising_weight: float = 0.5
-    supervised_position_weight: float = 1.0
-    supervised_adjacency_weight: float = 1.0
+    supervised_position_weight: float = 2.0
+    supervised_adjacency_weight: float = 2.0
     supervised_position_noise: float = 0.02
     supervised_connectivity_noise: float = 0.08
     supervised_every_steps: int = 1
@@ -68,7 +68,7 @@ class TrainConfig:
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
     property_weight: float = 1.0
-    structural_integrity_weight: float = 1.2
+    stress_weight: float = 0.3
     monotonic_improvement_weight: float = 0.2
     material_weight: float = 0.0
     sparsity_weight: float = 0.0
@@ -232,11 +232,14 @@ def _observe_cases(
 ) -> None:
     with torch.no_grad():
         terms = mechanical_terms(positions, roles, adjacency)
+    finite_mask = torch.isfinite(terms["stiffness_matrix"]).all(dim=(1, 2))
+    if not finite_mask.any():
+        return
     repertoire.add(
-        positions,
-        roles,
-        adjacency,
-        terms["stiffness_matrix"],
+        positions[finite_mask],
+        roles[finite_mask],
+        adjacency[finite_mask],
+        terms["stiffness_matrix"][finite_mask],
         source_code=source_code,
     )
 
@@ -577,6 +580,15 @@ def rollout_refinement(
             position_noise_levels,
             connectivity_noise_levels,
         )
+        outputs["displacements"] = torch.nan_to_num(
+            outputs["displacements"], nan=0.0, posinf=0.0, neginf=0.0
+        )
+        outputs["delta_scores"] = torch.nan_to_num(
+            outputs["delta_scores"], nan=0.0, posinf=0.0, neginf=0.0
+        )
+        outputs["node_latents"] = torch.nan_to_num(
+            outputs["node_latents"], nan=0.0, posinf=0.0, neginf=0.0
+        )
         refined_positions = apply_free_node_update(
             current_positions,
             outputs["displacements"],
@@ -615,6 +627,20 @@ def rollout_refinement(
                 current_adjacency,
                 geometry_config=geometry_config,
             )
+            finite_stiffness = torch.isfinite(step_terms["stiffness_matrix"]).all(
+                dim=(1, 2)
+            )
+            if not finite_stiffness.all():
+                fallback_stiffness = (
+                    current_stiffness
+                    if current_stiffness is not None
+                    else target_stiffness.detach()
+                )
+                sanitized_stiffness = step_terms["stiffness_matrix"].detach().clone()
+                sanitized_stiffness[~finite_stiffness] = fallback_stiffness[
+                    ~finite_stiffness
+                ]
+                step_terms["stiffness_matrix"] = sanitized_stiffness
             state["terms"] = step_terms
             current_stiffness = step_terms["stiffness_matrix"].detach()
         else:
@@ -763,11 +789,24 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     running_totals = {
         "total": 0.0,
         "property": 0.0,
-        "structural_integrity": 0.0,
+        "stress": 0.0,
         "monotonic": 0.0,
         "supervised": 0.0,
         "supervised_position": 0.0,
         "supervised_adjacency": 0.0,
+        "max_von_mises_stress": 0.0,
+        "max_stress_ratio": 0.0,
+    }
+    running_counts = {
+        "total": 0,
+        "property": 0,
+        "stress": 0,
+        "monotonic": 0,
+        "supervised": 0,
+        "supervised_position": 0,
+        "supervised_adjacency": 0,
+        "max_von_mises_stress": 0,
+        "max_stress_ratio": 0,
     }
     step_weights = _step_weights(config.rollout_steps, device)
 
@@ -786,7 +825,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         supervised_position_loss = torch.zeros((), device=device)
         supervised_adjacency_loss = torch.zeros((), device=device)
         supervised_loss = torch.zeros((), device=device)
-        structural_integrity_loss = torch.zeros((), device=device)
+        stress_loss = torch.zeros((), device=device)
         monotonic_loss = torch.zeros((), device=device)
         phase = _scheduled_training_phase(
             step,
@@ -869,13 +908,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     raw_targets,
                 )
                 property_loss = property_loss + step_weights[step_idx] * step_error
-                step_structural_integrity = step_terms[
-                    "structural_integrity_penalty"
-                ].mean()
-                structural_integrity_loss = (
-                    structural_integrity_loss
-                    + step_weights[step_idx] * step_structural_integrity
-                )
+                step_stress_loss = step_terms["stress_loss"].mean()
+                stress_loss = stress_loss + step_weights[step_idx] * step_stress_loss
                 step_material = step_terms["normalized_material"].mean()
                 material_loss = (
                     material_loss + step_weights[step_idx] * step_material
@@ -929,7 +963,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 )
                 step_objectives.append(
                     config.property_weight * step_error
-                    + config.structural_integrity_weight * step_structural_integrity
+                    + config.stress_weight * step_stress_loss
                     + config.material_weight * step_material
                     + config.sparsity_weight * step_sparsity
                     + config.connectivity_weight * step_connectivity
@@ -950,7 +984,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             thick_diameter_loss = final_step_terms["thick_diameter_penalty"].mean()
             total = (
                 config.property_weight * property_loss
-                + config.structural_integrity_weight * structural_integrity_loss
+                + config.stress_weight * stress_loss
                 + config.monotonic_improvement_weight * monotonic_loss
                 + config.material_weight * material_loss
                 + config.sparsity_weight * sparsity_loss
@@ -977,50 +1011,91 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 source_code=1,
             )
         optimizer.zero_grad(set_to_none=True)
+        if not torch.isfinite(total):
+            _progress(
+                f"train:skip_nonfinite step={step} phase={phase} total={total.item()}"
+            )
+            continue
         total.backward()
         optimizer.step()
 
         running_totals["total"] += total.item()
+        running_counts["total"] += 1
         if phase == "supervised":
             running_totals["supervised"] += supervised_loss.item()
             running_totals["supervised_position"] += supervised_position_loss.item()
             running_totals["supervised_adjacency"] += supervised_adjacency_loss.item()
+            running_counts["supervised"] += 1
+            running_counts["supervised_position"] += 1
+            running_counts["supervised_adjacency"] += 1
         else:
             running_totals["property"] += property_loss.item()
-            running_totals["structural_integrity"] += structural_integrity_loss.item()
+            running_totals["stress"] += stress_loss.item()
             running_totals["monotonic"] += monotonic_loss.item()
+            running_totals["max_von_mises_stress"] += final_step_terms[
+                "max_von_mises_stress"
+            ].mean().item()
+            running_totals["max_stress_ratio"] += final_step_terms[
+                "max_stress_ratio"
+            ].mean().item()
+            running_counts["property"] += 1
+            running_counts["stress"] += 1
+            running_counts["monotonic"] += 1
+            running_counts["max_von_mises_stress"] += 1
+            running_counts["max_stress_ratio"] += 1
 
-        if config.log_every_steps > 0 and step % config.log_every_steps == 0:
-            writer.add_scalar("train/total_loss", total.item(), global_step)
+        if config.log_every_steps > 0 and (
+            step % config.log_every_steps == 0 or step == train_steps
+        ):
+            total_mean = running_totals["total"] / max(running_counts["total"], 1)
+            writer.add_scalar("train/total_loss", total_mean, global_step)
             writer.add_scalar("train/learning_rate", scheduled_lr, global_step)
             writer.add_text("train/phase", phase, global_step)
             writer.add_scalar("train/repertoire_size", len(repertoire), global_step)
-            if phase == "supervised":
+            if running_counts["supervised"] > 0:
                 writer.add_scalar(
-                    "train/supervised_loss", supervised_loss.item(), global_step
+                    "train/supervised_loss",
+                    running_totals["supervised"] / running_counts["supervised"],
+                    global_step,
                 )
                 writer.add_scalar(
                     "train/supervised_position_loss",
-                    supervised_position_loss.item(),
+                    running_totals["supervised_position"]
+                    / running_counts["supervised_position"],
                     global_step,
                 )
                 writer.add_scalar(
                     "train/supervised_adjacency_loss",
-                    supervised_adjacency_loss.item(),
+                    running_totals["supervised_adjacency"]
+                    / running_counts["supervised_adjacency"],
                     global_step,
                 )
-            else:
+            if running_counts["property"] > 0:
                 writer.add_scalar(
-                    "train/property_loss", property_loss.item(), global_step
+                    "train/property_loss",
+                    running_totals["property"] / running_counts["property"],
+                    global_step,
                 )
                 writer.add_scalar(
                     "train/monotonic_improvement_loss",
-                    monotonic_loss.item(),
+                    running_totals["monotonic"] / running_counts["monotonic"],
                     global_step,
                 )
                 writer.add_scalar(
-                    "train/structural_integrity_penalty",
-                    structural_integrity_loss.item(),
+                    "train/stress_loss",
+                    running_totals["stress"] / running_counts["stress"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "metrics/max_von_mises_stress",
+                    running_totals["max_von_mises_stress"]
+                    / running_counts["max_von_mises_stress"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "metrics/max_stress_ratio",
+                    running_totals["max_stress_ratio"]
+                    / running_counts["max_stress_ratio"],
                     global_step,
                 )
         global_step += 1
@@ -1036,17 +1111,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             if window == 0:
                 window = config.log_every_steps
             _progress(
-                f"train:step {step}/{train_steps} phase={phase} total={total.item():.4f} prop={property_loss.item():.4f} integ={structural_integrity_loss.item():.4f} sup={supervised_loss.item():.4f} rep={len(repertoire)}"
+                f"train:step {step}/{train_steps} phase={phase} total={total.item():.4f} prop={property_loss.item():.4f} stress={stress_loss.item():.4f} sup={supervised_loss.item():.4f} rep={len(repertoire)}"
             )
-            active_window_keys = (
-                ("total", "supervised", "supervised_position", "supervised_adjacency")
-                if phase == "supervised"
-                else ("total", "property", "structural_integrity", "monotonic")
-            )
-            for key in active_window_keys:
-                value = running_totals[key]
-                writer.add_scalar(f"window/{key}", value / window, global_step)
+            for key in running_totals:
                 running_totals[key] = 0.0
+                running_counts[key] = 0
 
         if (
             config.canonical_eval_every_steps > 0
@@ -1115,8 +1184,7 @@ def refine_sample_state(
         )
         loss = (
             config.property_weight * property_loss
-            + config.structural_integrity_weight
-            * terms["structural_integrity_penalty"].mean()
+            + config.stress_weight * terms["stress_loss"].mean()
             + config.material_weight * terms["normalized_material"].mean()
             + config.sparsity_weight * terms["sparsity"].mean()
             + config.connectivity_weight * terms["connectivity_penalty"].mean()
@@ -1265,8 +1333,18 @@ def sample(
         "sample/40_soft_domain_penalty", terms["soft_domain_penalty"][0].item(), 0
     )
     writer.add_scalar(
-        "sample/40_structural_integrity_penalty",
-        terms["structural_integrity_penalty"][0].item(),
+        "sample/40_stress_loss",
+        terms["stress_loss"][0].item(),
+        0,
+    )
+    writer.add_scalar(
+        "metrics/max_von_mises_stress",
+        terms["max_von_mises_stress"][0].item(),
+        0,
+    )
+    writer.add_scalar(
+        "metrics/max_stress_ratio",
+        terms["max_stress_ratio"][0].item(),
         0,
     )
     animation_rollout = []
@@ -1317,7 +1395,9 @@ def sample(
         "centroid_penalty": terms["centroid_penalty"].cpu(),
         "spread_penalty": terms["spread_penalty"].cpu(),
         "soft_domain_penalty": terms["soft_domain_penalty"].cpu(),
-        "structural_integrity_penalty": terms["structural_integrity_penalty"].cpu(),
+        "stress_loss": terms["stress_loss"].cpu(),
+        "max_von_mises_stress": terms["max_von_mises_stress"].cpu(),
+        "max_stress_ratio": terms["max_stress_ratio"].cpu(),
         "log_dir": str(log_dir),
     }
     output = Path(output_path)
@@ -1425,9 +1505,9 @@ def _train_parser() -> argparse.ArgumentParser:
         "--property-weight", type=float, default=defaults.property_weight
     )
     parser.add_argument(
-        "--structural-integrity-weight",
+        "--stress-weight",
         type=float,
-        default=defaults.structural_integrity_weight,
+        default=defaults.stress_weight,
     )
     parser.add_argument(
         "--monotonic-improvement-weight",
