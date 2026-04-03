@@ -147,6 +147,21 @@ def test_stress_loss_accumulates_with_reference_loads() -> None:
     assert fields["max_stress_ratio"][0] > 0.0
 
 
+def test_stress_loss_backward_is_finite() -> None:
+    positions, roles, adjacency = generate_graph_sample(10)
+    positions = positions.unsqueeze(0).clone().requires_grad_(True)
+    fields = mechanical_response_fields(
+        positions,
+        roles.unsqueeze(0),
+        adjacency.unsqueeze(0),
+    )
+
+    fields["stress_loss"].sum().backward()
+
+    assert positions.grad is not None
+    assert torch.isfinite(positions.grad).all()
+
+
 def test_reference_loads_preserve_stiffness_matrix_units() -> None:
     positions, roles, adjacency = generate_graph_sample(10)
     default_fields = mechanical_response_fields(

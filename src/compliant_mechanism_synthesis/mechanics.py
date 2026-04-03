@@ -415,8 +415,12 @@ def _stress_response_fields(
     bending_j = moment_j * radius.unsqueeze(-1) / inertia.unsqueeze(-1)
     normal_stress_i = axial_stress + bending_i
     normal_stress_j = axial_stress + bending_j
-    von_mises_i = torch.sqrt(normal_stress_i.square() + 3.0 * shear_stress.square())
-    von_mises_j = torch.sqrt(normal_stress_j.square() + 3.0 * shear_stress.square())
+    von_mises_i = torch.sqrt(
+        (normal_stress_i.square() + 3.0 * shear_stress.square()).clamp_min(1e-12)
+    )
+    von_mises_j = torch.sqrt(
+        (normal_stress_j.square() + 3.0 * shear_stress.square()).clamp_min(1e-12)
+    )
     edge_von_mises = torch.maximum(von_mises_i, von_mises_j)
     edge_von_mises = edge_von_mises.masked_fill(activations.unsqueeze(-1) <= 1e-6, 0.0)
     max_edge_von_mises = edge_von_mises.max(dim=-1).values
