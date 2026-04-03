@@ -62,7 +62,12 @@ def test_model_output_shapes() -> None:
         position_noise_levels,
         connectivity_noise_levels,
     ) = _dummy_inputs()
-    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
+    model = GraphRefinementModel(
+        d_model=128,
+        nhead=4,
+        num_layers=4,
+        node_effect_dim=32,
+    )
     outputs = model(
         positions,
         roles,
@@ -94,7 +99,12 @@ def test_connectivity_update_is_symmetric_and_zero_diagonal() -> None:
         position_noise_levels,
         connectivity_noise_levels,
     ) = _dummy_inputs()
-    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
+    model = GraphRefinementModel(
+        d_model=128,
+        nhead=4,
+        num_layers=4,
+        node_effect_dim=32,
+    )
     outputs = model(
         positions,
         roles,
@@ -128,7 +138,12 @@ def test_connectivity_delta_comes_from_node_latent_dot_products() -> None:
         position_noise_levels,
         connectivity_noise_levels,
     ) = _dummy_inputs()
-    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
+    model = GraphRefinementModel(
+        d_model=128,
+        nhead=4,
+        num_layers=4,
+        node_effect_dim=32,
+    )
     outputs = model(
         positions,
         roles,
@@ -149,7 +164,12 @@ def test_connectivity_delta_comes_from_node_latent_dot_products() -> None:
 
 
 def test_attention_layers_cycle_distance_connectivity_free() -> None:
-    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=6, latent_dim=32)
+    model = GraphRefinementModel(
+        d_model=128,
+        nhead=4,
+        num_layers=6,
+        node_effect_dim=32,
+    )
     modes = [layer.mode for layer in model.layers]
     assert modes == [
         "distance",
@@ -174,7 +194,12 @@ def test_model_conditioning_depends_on_current_stiffness() -> None:
         position_noise_levels,
         connectivity_noise_levels,
     ) = _dummy_inputs(batch_size=1)
-    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
+    model = GraphRefinementModel(
+        d_model=128,
+        nhead=4,
+        num_layers=4,
+        node_effect_dim=32,
+    )
     outputs_a = model(
         positions,
         roles,
@@ -218,7 +243,12 @@ def test_model_conditioning_depends_on_noise_levels() -> None:
         position_noise_levels,
         connectivity_noise_levels,
     ) = _dummy_inputs(batch_size=1)
-    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
+    model = GraphRefinementModel(
+        d_model=128,
+        nhead=4,
+        num_layers=4,
+        node_effect_dim=32,
+    )
     outputs_a = model(
         positions,
         roles,
@@ -260,7 +290,12 @@ def test_model_conditioning_depends_on_nodal_mechanics() -> None:
         position_noise_levels,
         connectivity_noise_levels,
     ) = _dummy_inputs(batch_size=1)
-    model = GraphRefinementModel(d_model=128, nhead=4, num_layers=4, latent_dim=32)
+    model = GraphRefinementModel(
+        d_model=128,
+        nhead=4,
+        num_layers=4,
+        node_effect_dim=32,
+    )
     outputs_a = model(
         positions,
         roles,

@@ -55,6 +55,29 @@ def test_rollout_noise_preserves_adjacency_symmetry_and_zero_diagonal() -> None:
     )
 
 
+def test_rollout_noise_does_not_clip_existing_strong_connections() -> None:
+    positions = torch.rand(1, 8, 2)
+    roles = torch.tensor(
+        [[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_MOBILE] + [ROLE_FREE] * 4],
+        dtype=torch.long,
+    )
+    adjacency = torch.zeros(1, 8, 8)
+    adjacency[:, 4, 5] = 1.2
+    adjacency[:, 5, 4] = 1.2
+
+    _, noisy_adjacency = _inject_rollout_noise(
+        positions,
+        roles,
+        adjacency,
+        torch.tensor([0.0]),
+        position_noise_scale=0.0,
+        connectivity_noise_scale=0.0,
+    )
+
+    assert torch.isclose(noisy_adjacency[0, 4, 5], torch.tensor(1.2))
+    assert torch.isclose(noisy_adjacency[0, 5, 4], torch.tensor(1.2))
+
+
 def test_apply_free_node_update_does_not_clamp_free_nodes() -> None:
     positions = torch.tensor(
         [[[0.0, 0.0], [1.0, 1.0], [0.0, 1.0], [1.0, 0.0], [0.95, 0.05]]],

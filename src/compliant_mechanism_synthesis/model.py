@@ -111,7 +111,7 @@ class GraphRefinementModel(nn.Module):
         d_model: int,
         nhead: int,
         num_layers: int,
-        latent_dim: int,
+        node_effect_dim: int,
     ) -> None:
         super().__init__()
         self.position_mlp = nn.Sequential(
@@ -152,7 +152,7 @@ class GraphRefinementModel(nn.Module):
         self.node_latent_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Linear(d_model, latent_dim),
+            nn.Linear(d_model, node_effect_dim),
         )
         nn.init.normal_(self.displacement_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.displacement_head[-1].bias)
@@ -217,7 +217,7 @@ class GraphRefinementModel(nn.Module):
                 current_adjacency
                 + torch.tanh(delta_scores) * update_gate
                 - current_adjacency * (1.0 - update_gate)
-            ).clamp(0.0, 1.0),
+            ).clamp_min(0.0),
             roles,
         )
         return {

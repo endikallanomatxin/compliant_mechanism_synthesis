@@ -197,7 +197,7 @@ def assemble_global_stiffness(
     config: FrameFEMConfig | None = None,
 ) -> torch.Tensor:
     config = config or FrameFEMConfig()
-    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    adjacency = symmetrize_adjacency(adjacency.float().clamp_min(0.0))
     physical_positions = _physical_positions(positions, config)
     batch_size, num_nodes, _ = positions.shape
     edge_i, edge_j = _cached_edge_index_pairs(num_nodes)
@@ -583,7 +583,7 @@ def rigid_attachment_penalty(
     adjacency: torch.Tensor,
     min_attachment_activation: float,
 ) -> torch.Tensor:
-    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    adjacency = symmetrize_adjacency(adjacency.float().clamp_min(0.0))
     fixed, mobile, free = role_masks(roles)
 
     def _attachment(mask: torch.Tensor) -> torch.Tensor:
@@ -608,7 +608,7 @@ def beam_material(
     config: FrameFEMConfig | None = None,
 ) -> torch.Tensor:
     config = config or FrameFEMConfig()
-    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    adjacency = symmetrize_adjacency(adjacency.float().clamp_min(0.0))
     physical_positions = _physical_positions(positions, config)
     edge_i, edge_j = _cached_edge_index_pairs(positions.shape[1])
     edge_i = edge_i.to(positions.device)
@@ -622,7 +622,7 @@ def beam_material(
 
 
 def connectivity_sparsity(adjacency: torch.Tensor) -> torch.Tensor:
-    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    adjacency = symmetrize_adjacency(adjacency.float().clamp_min(0.0))
     edge_i, edge_j = _cached_edge_index_pairs(adjacency.shape[1])
     edge_i = edge_i.to(adjacency.device)
     edge_j = edge_j.to(adjacency.device)
@@ -638,7 +638,7 @@ def geometric_regularization_terms(
 ) -> dict[str, torch.Tensor]:
     frame_config = frame_config or FrameFEMConfig()
     scales = characteristic_scales(frame_config)
-    adjacency = symmetrize_adjacency(adjacency.float().clamp(0.0, 1.0))
+    adjacency = symmetrize_adjacency(adjacency.float().clamp_min(0.0))
     physical_positions = _physical_positions(positions, frame_config)
     edge_i, edge_j = _cached_edge_index_pairs(positions.shape[1])
     edge_i = edge_i.to(positions.device)
@@ -658,12 +658,14 @@ def geometric_regularization_terms(
     long = (activations * (lengths - geometry_config.max_length).clamp_min(0.0)).sum(
         dim=1
     ) / (normalizer * scales.length)
-    normalized_diameter = (diameters / geometry_config.min_diameter).clamp(0.0, 1.0)
-    thin_profile = normalized_diameter * (1.0 - normalized_diameter)
-    thin = thin_profile.sum(dim=1) / normalizer
-    thick = ((diameters - geometry_config.max_diameter).clamp_min(0.0).square()).sum(
-        dim=1
-    ) / (normalizer * diameter_scale**2)
+    thin = (
+        activations
+        * (geometry_config.min_diameter - diameters).clamp_min(0.0).square()
+    ).sum(dim=1) / (normalizer * geometry_config.min_diameter**2)
+    thick = (
+        activations
+        * (diameters - geometry_config.max_diameter).clamp_min(0.0).square()
+    ).sum(dim=1) / (normalizer * diameter_scale**2)
 
     free_mask = roles == ROLE_FREE
     free_positions = physical_positions
@@ -746,7 +748,7 @@ def mechanical_terms(
 ) -> dict[str, torch.Tensor]:
     config = config or FrameFEMConfig()
     adjacency = enforce_role_adjacency_constraints(
-        adjacency.float().clamp(0.0, 1.0),
+        adjacency.float().clamp_min(0.0),
         roles,
     )
     response_fields = mechanical_response_fields(positions, roles, adjacency, config)
@@ -813,4 +815,4 @@ def refine_connectivity(
     updated = adjacency + step_size * (
         torch.tanh(delta_scores) * gate - adjacency * (1.0 - gate)
     )
-    return enforce_role_adjacency_constraints(updated.clamp(0.0, 1.0), roles)
+    return enforce_role_adjacency_constraints(updated.clamp_min(0.0), roles)

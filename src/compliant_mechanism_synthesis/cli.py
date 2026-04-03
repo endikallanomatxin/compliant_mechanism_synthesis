@@ -39,14 +39,14 @@ from compliant_mechanism_synthesis.viz import (
 
 @dataclass
 class TrainConfig:
-    num_nodes: int = 32
-    d_model: int = 128
-    nhead: int = 16
+    num_nodes: int = 64
+    d_model: int = 256
+    nhead: int = 8
     num_layers: int = 12
-    latent_dim: int = 128
+    node_effect_dim: int = 64
     batch_size: int = 128
     train_steps: int = 20_000
-    learning_rate: float = 3e-5
+    learning_rate: float = 2e-5
     rollout_steps: int = 8
     position_step_size: float = 0.2
     connectivity_step_size: float = 0.1
@@ -60,13 +60,13 @@ class TrainConfig:
     supervised_every_steps: int = 1
     supervised_priority_start: int = 20
     supervised_priority_end: int = 1
-    supervised_priority_duration: int = 1_000
+    supervised_priority_duration: int = 2_000
     repertoire_bootstrap_cases: int = 512
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
     property_weight: float = 1.0
     structural_integrity_weight: float = 1.2
-    monotonic_improvement_weight: float = 0.15
+    monotonic_improvement_weight: float = 0.2
     material_weight: float = 0.0
     sparsity_weight: float = 0.0
     connectivity_weight: float = 0.0
@@ -444,7 +444,7 @@ def _inject_rollout_noise(
             connectivity_noise_scale * time_fraction[:, None, None]
         )
         adjacency = enforce_role_adjacency_constraints(
-            (adjacency + adjacency_noise).clamp(0.0, 1.0),
+            (adjacency + adjacency_noise).clamp_min(0.0),
             roles,
         )
     return positions, adjacency
@@ -728,7 +728,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         d_model=config.d_model,
         nhead=config.nhead,
         num_layers=config.num_layers,
-        latent_dim=config.latent_dim,
+        node_effect_dim=config.node_effect_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     writer = SummaryWriter(log_dir=str(_timestamped_run_dir(config.name)))
@@ -870,16 +870,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 long_beam_loss = (
                     long_beam_loss + step_weights[step_idx] * step_long_beam
                 )
-                step_thin_diameter = step_terms["thin_diameter_penalty"].mean()
-                thin_diameter_loss = (
-                    thin_diameter_loss
-                    + step_weights[step_idx] * step_thin_diameter
-                )
-                step_thick_diameter = step_terms["thick_diameter_penalty"].mean()
-                thick_diameter_loss = (
-                    thick_diameter_loss
-                    + step_weights[step_idx] * step_thick_diameter
-                )
                 step_node_spacing = step_terms["node_spacing_penalty"].mean()
                 node_spacing_loss = (
                     node_spacing_loss + step_weights[step_idx] * step_node_spacing
@@ -914,8 +904,6 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     * step_fixed_mobile_connectivity
                     + config.short_beam_weight * step_short_beam
                     + config.long_beam_weight * step_long_beam
-                    + config.thin_diameter_weight * step_thin_diameter
-                    + config.thick_diameter_weight * step_thick_diameter
                     + config.node_spacing_weight * step_node_spacing
                     + config.free_repulsion_weight * step_free_repulsion
                     + config.rigid_attachment_weight * step_rigid_attachment
@@ -924,6 +912,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     + config.soft_domain_weight * step_soft_domain
                 )
             monotonic_loss = _monotonic_improvement_loss(step_objectives)
+            final_step_terms = rollout[-1]["terms"]
+            thin_diameter_loss = final_step_terms["thin_diameter_penalty"].mean()
+            thick_diameter_loss = final_step_terms["thick_diameter_penalty"].mean()
             total = (
                 config.property_weight * property_loss
                 + config.structural_integrity_weight * structural_integrity_loss
@@ -1075,7 +1066,7 @@ def refine_sample_state(
     for _ in range(steps):
         current_positions = positions + free_mask * (position_param - positions)
         current_adjacency = enforce_role_adjacency_constraints(
-            adjacency_param.clamp(0.0, 1.0),
+            adjacency_param.clamp_min(0.0),
             roles,
         )
         terms = mechanical_terms(
@@ -1099,8 +1090,6 @@ def refine_sample_state(
             * terms["fixed_mobile_connectivity_penalty"].mean()
             + config.short_beam_weight * terms["short_beam_penalty"].mean()
             + config.long_beam_weight * terms["long_beam_penalty"].mean()
-            + config.thin_diameter_weight * terms["thin_diameter_penalty"].mean()
-            + config.thick_diameter_weight * terms["thick_diameter_penalty"].mean()
             + config.node_spacing_weight * terms["node_spacing_penalty"].mean()
             + config.free_repulsion_weight * terms["free_repulsion_penalty"].mean()
             + config.rigid_attachment_weight
@@ -1115,7 +1104,7 @@ def refine_sample_state(
 
     refined_positions = (positions + free_mask * (position_param - positions)).detach()
     refined_adjacency = enforce_role_adjacency_constraints(
-        adjacency_param.detach().clamp(0.0, 1.0),
+        adjacency_param.detach().clamp_min(0.0),
         roles,
     )
     return refined_positions, refined_adjacency
@@ -1144,7 +1133,7 @@ def sample(
         d_model=config.d_model,
         nhead=config.nhead,
         num_layers=config.num_layers,
-        latent_dim=config.latent_dim,
+        node_effect_dim=config.node_effect_dim,
     ).to(device)
     model.load_state_dict(payload["state_dict"])
     model.eval()
@@ -1316,7 +1305,11 @@ def _train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--d-model", type=int, default=defaults.d_model)
     parser.add_argument("--nhead", type=int, default=defaults.nhead)
     parser.add_argument("--num-layers", type=int, default=defaults.num_layers)
-    parser.add_argument("--latent-dim", type=int, default=defaults.latent_dim)
+    parser.add_argument(
+        "--node-effect-dim",
+        type=int,
+        default=defaults.node_effect_dim,
+    )
     parser.add_argument("--train-steps", type=int, default=defaults.train_steps)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
