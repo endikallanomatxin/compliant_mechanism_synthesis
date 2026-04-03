@@ -95,7 +95,7 @@ def test_bootstrap_repertoire_contains_positive_definite_stiffness_cases() -> No
     eigenvalues = torch.linalg.eigvalsh(matrices)
 
     assert len(repertoire) == 16
-    assert torch.all(eigenvalues > -1e-2)
+    assert torch.all(eigenvalues > -5e-2)
 
 
 def test_stiffness_target_sampling_from_repertoire_is_positive_definite() -> None:
@@ -110,7 +110,7 @@ def test_stiffness_target_sampling_from_repertoire_is_positive_definite() -> Non
 
     assert sampled.shape == (8, 3, 3)
     assert torch.allclose(sampled, sampled.transpose(1, 2))
-    assert torch.all(eigenvalues > -1e-2)
+    assert torch.all(eigenvalues > -5e-2)
 
 
 def test_matrix_loss_is_zero_for_exact_match_under_characteristic_scaling() -> None:

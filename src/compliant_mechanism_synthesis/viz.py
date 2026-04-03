@@ -158,7 +158,7 @@ def _mobile_pair_positions(
 def _target_mobile_pair(
     positions: torch.Tensor,
     roles: torch.Tensor,
-    response_column: torch.Tensor,
+    generalized_displacement: torch.Tensor,
     frame_config: FrameFEMConfig,
     response_scale: float = 1.0,
 ) -> torch.Tensor | None:
@@ -168,7 +168,7 @@ def _target_mobile_pair(
     physical_pair = pair * frame_config.workspace_size
     centroid = physical_pair.mean(dim=0, keepdim=True)
     rel = physical_pair - centroid
-    theta = response_scale * response_column[2].item()
+    theta = response_scale * generalized_displacement[2].item()
     rotation = torch.tensor(
         [
             [np.cos(theta), -np.sin(theta)],
@@ -176,7 +176,9 @@ def _target_mobile_pair(
         ],
         dtype=physical_pair.dtype,
     )
-    translation = response_scale * response_column[:2].to(dtype=physical_pair.dtype)
+    translation = response_scale * generalized_displacement[:2].to(
+        dtype=physical_pair.dtype
+    )
     transformed = centroid + rel @ rotation.transpose(0, 1) + translation.unsqueeze(0)
     return transformed / frame_config.workspace_size
 
@@ -241,7 +243,7 @@ def _display_scale(
     reference = torch.quantile(norms, 0.95).item()
     if reference <= 1e-8:
         return 1.0
-    return min(0.16 / reference, 2.0)
+    return min(max(0.16 / reference, 1.0), 5_000.0)
 
 
 def _draw_load_case_panel(
@@ -261,10 +263,13 @@ def _draw_load_case_panel(
     normalized_deformation = deformation / frame_config.workspace_size
     deformed_positions = positions + case_scale * normalized_deformation
     achieved_mobile_pair = _mobile_pair_positions(deformed_positions, roles)
+    load_magnitude = (
+        frame_config.reference_moment if load_name == "M" else frame_config.reference_force
+    )
     target_pair = _target_mobile_pair(
         positions,
         roles,
-        target_response,
+        load_magnitude * target_response,
         frame_config=frame_config,
         response_scale=case_scale,
     )
