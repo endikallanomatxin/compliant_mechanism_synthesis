@@ -110,10 +110,10 @@ def test_mechanical_terms_have_expected_keys() -> None:
     assert terms["centroid_penalty"].shape == (1,)
     assert terms["spread_penalty"].shape == (1,)
     assert terms["soft_domain_penalty"].shape == (1,)
-    assert terms["yield_stress_penalty"].shape == (1,)
+    assert terms["structural_integrity_penalty"].shape == (1,)
 
 
-def test_yield_stress_terms_are_zero_for_absent_bars() -> None:
+def test_structural_integrity_terms_are_zero_for_absent_bars() -> None:
     positions, roles, _ = generate_graph_sample(10)
     adjacency = torch.zeros((1, 10, 10), dtype=torch.float32)
     fields = mechanical_response_fields(
@@ -123,10 +123,10 @@ def test_yield_stress_terms_are_zero_for_absent_bars() -> None:
     assert torch.allclose(
         fields["nodal_stress"], torch.zeros_like(fields["nodal_stress"])
     )
-    assert torch.isclose(fields["yield_stress_penalty"][0], torch.tensor(0.0))
+    assert torch.isclose(fields["structural_integrity_penalty"][0], torch.tensor(0.0))
 
 
-def test_yield_stress_penalty_accumulates_subyield_stress() -> None:
+def test_structural_integrity_penalty_accumulates_with_reference_loads() -> None:
     positions, roles, adjacency = generate_graph_sample(10)
     fields = mechanical_response_fields(
         positions.unsqueeze(0),
@@ -136,7 +136,30 @@ def test_yield_stress_penalty_accumulates_subyield_stress() -> None:
     )
 
     assert fields["nodal_stress"].max() > 0.0
-    assert fields["yield_stress_penalty"][0] > 0.0
+    assert fields["structural_integrity_penalty"][0] > 0.0
+
+
+def test_reference_loads_preserve_stiffness_matrix_units() -> None:
+    positions, roles, adjacency = generate_graph_sample(10)
+    default_fields = mechanical_response_fields(
+        positions.unsqueeze(0), roles.unsqueeze(0), adjacency.unsqueeze(0)
+    )
+    stronger_load_fields = mechanical_response_fields(
+        positions.unsqueeze(0),
+        roles.unsqueeze(0),
+        adjacency.unsqueeze(0),
+        config=FrameFEMConfig(reference_force=20.0, reference_moment=4.0),
+    )
+
+    assert torch.allclose(
+        default_fields["stiffness_matrix"],
+        stronger_load_fields["stiffness_matrix"],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert stronger_load_fields["structural_integrity_penalty"][0] > default_fields[
+        "structural_integrity_penalty"
+    ][0]
 
 
 def test_geometric_regularization_penalizes_extreme_lengths_and_diameters() -> None:

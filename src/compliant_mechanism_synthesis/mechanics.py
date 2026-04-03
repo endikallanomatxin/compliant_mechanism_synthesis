@@ -34,6 +34,8 @@ class FrameFEMConfig:
     r_max: float = 1.5e-3
     stiffness_regularization: float = 1e-4
     yield_stress: float = 250e6
+    reference_force: float = 10.0
+    reference_moment: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -283,14 +285,15 @@ def _mobile_load_cases(
     positions: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    config: FrameFEMConfig,
 ) -> torch.Tensor:
     reduced_size = 3 * (positions.shape[1] - 4) + 3
     free_count = positions.shape[1] - 4
     mobile_base = 3 * free_count
     load_cases = torch.zeros((3, reduced_size), device=device, dtype=dtype)
-    load_cases[0, mobile_base + 0] = 1.0
-    load_cases[1, mobile_base + 1] = 1.0
-    load_cases[2, mobile_base + 2] = 1.0
+    load_cases[0, mobile_base + 0] = config.reference_force
+    load_cases[1, mobile_base + 1] = config.reference_force
+    load_cases[2, mobile_base + 2] = config.reference_moment
     return load_cases
 
 
@@ -308,6 +311,7 @@ def _solve_load_cases(
         positions,
         device=stabilized.device,
         dtype=stabilized.dtype,
+        config=config,
     )
     rhs = load_cases.transpose(0, 1).unsqueeze(0).expand(batch_size, -1, -1)
     reduced_displacements = torch.linalg.solve(stabilized, rhs)
@@ -323,7 +327,19 @@ def _response_and_stiffness_from_solution(
     batch_size = positions.shape[0]
     free_count = positions.shape[1] - 4
     mobile_base = 3 * free_count
-    response_matrix = reduced_displacements[:, mobile_base : mobile_base + 3, :]
+    load_scale = torch.tensor(
+        [
+            config.reference_force,
+            config.reference_force,
+            config.reference_moment,
+        ],
+        device=stabilized.device,
+        dtype=stabilized.dtype,
+    )
+    response_matrix = (
+        reduced_displacements[:, mobile_base : mobile_base + 3, :]
+        / load_scale.view(1, 1, 3)
+    )
     response_matrix = 0.5 * (response_matrix + response_matrix.transpose(1, 2))
     response_eye = torch.eye(3, device=stabilized.device, dtype=stabilized.dtype)
     response_trace = response_matrix.diagonal(dim1=1, dim2=2).sum(dim=1)
@@ -470,6 +486,7 @@ def mechanical_response_fields(
         "normalized_translations": normalized_translations,
         "normalized_nodal_stress": normalized_nodal_stress,
         "yield_stress_penalty": yield_penalty,
+        "structural_integrity_penalty": yield_penalty,
     }
 
 
@@ -767,6 +784,9 @@ def mechanical_terms(
         "normalized_translations": response_fields["normalized_translations"],
         "normalized_nodal_stress": response_fields["normalized_nodal_stress"],
         "yield_stress_penalty": response_fields["yield_stress_penalty"],
+        "structural_integrity_penalty": response_fields[
+            "structural_integrity_penalty"
+        ],
         "connectivity_penalty": connectivity_penalty(roles, adjacency),
         "fixed_mobile_connectivity_penalty": fixed_mobile_connectivity_penalty(
             roles,

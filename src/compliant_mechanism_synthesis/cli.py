@@ -15,7 +15,6 @@ from compliant_mechanism_synthesis.common import (
     enforce_role_adjacency_constraints,
     ROLE_FREE,
     apply_free_node_update,
-    unique_values_to_symmetric_matrix,
 )
 from compliant_mechanism_synthesis.data import generate_noise_sample
 from compliant_mechanism_synthesis.mechanics import (
@@ -28,8 +27,8 @@ from compliant_mechanism_synthesis.mechanics import (
     threshold_connectivity,
 )
 from compliant_mechanism_synthesis.model import GraphRefinementModel
+from compliant_mechanism_synthesis.repertoire import SimulationRepertoire
 from compliant_mechanism_synthesis.scaling import (
-    denormalize_generalized_stiffness_matrix,
     normalize_generalized_stiffness_matrix,
 )
 from compliant_mechanism_synthesis.viz import (
@@ -59,32 +58,38 @@ class TrainConfig:
     supervised_position_noise: float = 0.02
     supervised_connectivity_noise: float = 0.08
     supervised_every_steps: int = 1
-    training_goal_blend_start: float = 0.2
+    supervised_priority_start: int = 20
+    supervised_priority_end: int = 1
+    supervised_priority_duration: int = 1_000
+    training_goal_blend_start: float = 1.0
     training_goal_blend_end: float = 1.0
+    repertoire_bootstrap_cases: int = 512
+    repertoire_max_cases: int = 4_096
+    canonical_case_count: int = 6
     property_weight: float = 1.0
-    monotonic_improvement_weight: float = 0.1
-    material_weight: float = 0.01
-    sparsity_weight: float = 0.03
-    connectivity_weight: float = 0.2
-    fixed_mobile_connectivity_weight: float = 1.0
-    short_beam_weight: float = 0.15
-    long_beam_weight: float = 0.3
-    thin_diameter_weight: float = 0.05
-    thick_diameter_weight: float = 0.05
-    node_spacing_weight: float = 0.4
-    free_repulsion_weight: float = 0.4
-    rigid_attachment_weight: float = 0.5
-    centroid_weight: float = 0.2
-    spread_weight: float = 0.12
-    soft_domain_weight: float = 30.0
-    yield_stress_weight: float = 0.05
+    structural_integrity_weight: float = 1.0
+    monotonic_improvement_weight: float = 0.0
+    material_weight: float = 0.0
+    sparsity_weight: float = 0.0
+    connectivity_weight: float = 0.0
+    fixed_mobile_connectivity_weight: float = 0.0
+    short_beam_weight: float = 0.0
+    long_beam_weight: float = 0.0
+    thin_diameter_weight: float = 0.0
+    thick_diameter_weight: float = 0.0
+    node_spacing_weight: float = 0.0
+    free_repulsion_weight: float = 0.0
+    rigid_attachment_weight: float = 0.0
+    centroid_weight: float = 0.0
+    spread_weight: float = 0.0
+    soft_domain_weight: float = 0.0
     min_beam_length: float = 5e-3
     max_beam_length: float = 4e-2
     min_beam_diameter: float = 2e-4
     max_beam_diameter: float = 3e-3
     min_free_node_spacing: float = 1.2e-2
     animation_every_steps: int = 1_000
-    log_every_steps: int = 5
+    log_every_steps: int = 1
     canonical_eval_every_steps: int = 100
     sample_threshold: float = 0.5
     device: str = "auto"
@@ -163,60 +168,60 @@ def _pure_noise_batch(
     )
 
 
-def _fixed_stiffness_target_specs(
-    device: torch.device,
-) -> list[tuple[str, torch.Tensor]]:
-    scales = characteristic_scales(FrameFEMConfig())
-    specs = [
-        (
-            "01_flex_x",
-            [54.0, 0.0, 0.0, 80.0, 0.0, 32.0],
-        ),
-        (
-            "02_flex_y",
-            [80.0, 0.0, 0.0, 54.0, 0.0, 32.0],
-        ),
-        (
-            "03_flex_theta",
-            [62.0, 0.0, 0.0, 62.0, 0.0, 30.0],
-        ),
-        (
-            "04_balanced",
-            [58.0, 0.0, 0.0, 58.0, 0.0, 31.0],
-        ),
-        (
-            "05_couple_xy_pos",
-            [72.0, 6.5, -3.2, 56.0, 2.2, 30.0],
-        ),
-        (
-            "06_couple_xy_neg",
-            [56.0, -6.5, 3.2, 72.0, -2.2, 30.0],
-        ),
-    ]
-    return [
-        (
-            name,
-            denormalize_generalized_stiffness_matrix(
-                unique_values_to_symmetric_matrix(
-                    torch.tensor(values, device=device, dtype=torch.float32).unsqueeze(0),
-                    size=3,
-                ),
-                scales,
-            )[0],
-        )
-        for name, values in specs
-    ]
-
-
-def _sample_stiffness_targets(
+def _sample_target_stiffnesses(
     batch_size: int,
     device: torch.device,
+    repertoire: SimulationRepertoire,
 ) -> torch.Tensor:
-    library = torch.stack(
-        [matrix for _, matrix in _fixed_stiffness_target_specs(device)], dim=0
+    return repertoire.sample_target_stiffness(batch_size, device, FrameFEMConfig())
+
+
+def _bootstrap_repertoire(
+    config: TrainConfig,
+    device: torch.device,
+) -> SimulationRepertoire:
+    repertoire = SimulationRepertoire.empty(
+        num_nodes=config.num_nodes,
+        max_cases=config.repertoire_max_cases,
     )
-    indices = torch.randint(library.shape[0], (batch_size,), device=device)
-    return library.index_select(0, indices)
+    remaining = max(config.repertoire_bootstrap_cases, config.batch_size)
+    while remaining > 0:
+        batch_size = min(config.batch_size, remaining)
+        positions, roles, adjacency = _pure_noise_batch(
+            batch_size,
+            config.num_nodes,
+            device,
+            seed=config.seed + remaining + 17,
+        )
+        with torch.no_grad():
+            terms = mechanical_terms(positions, roles, adjacency)
+        repertoire.add(
+            positions,
+            roles,
+            adjacency,
+            terms["stiffness_matrix"],
+            source_code=0,
+        )
+        remaining -= batch_size
+    return repertoire
+
+
+def _observe_cases(
+    repertoire: SimulationRepertoire,
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    source_code: int,
+) -> None:
+    with torch.no_grad():
+        terms = mechanical_terms(positions, roles, adjacency)
+    repertoire.add(
+        positions,
+        roles,
+        adjacency,
+        terms["stiffness_matrix"],
+        source_code=source_code,
+    )
 
 
 def _blend_training_targets(
@@ -239,6 +244,42 @@ def _scheduled_goal_blend(
     progress = (step - 1) / max(train_steps - 1, 1)
     blend = blend_start + progress * (blend_end - blend_start)
     return float(min(max(blend, 0.0), 1.0))
+
+
+def _scheduled_supervised_priority(
+    step: int,
+    duration: int,
+    start: int,
+    end: int,
+) -> int:
+    if duration <= 1:
+        return max(int(end), 1)
+    progress = min(max((step - 1) / max(duration - 1, 1), 0.0), 1.0)
+    value = start + progress * (end - start)
+    return max(int(round(value)), 1)
+
+
+def _scheduled_training_phase(
+    step: int,
+    supervised_priority_start: int,
+    supervised_priority_end: int,
+    supervised_priority_duration: int,
+) -> str:
+    cycle_start = 1
+    while True:
+        supervised_span = _scheduled_supervised_priority(
+            cycle_start,
+            supervised_priority_duration,
+            supervised_priority_start,
+            supervised_priority_end,
+        )
+        rl_step = cycle_start + supervised_span
+        next_cycle_start = rl_step + 1
+        if step < rl_step:
+            return "supervised"
+        if step == rl_step:
+            return "rl"
+        cycle_start = next_cycle_start
 
 
 def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
@@ -319,6 +360,61 @@ def _sample_supervised_denoising_batch(
         position_noise_scale=position_noise_scale,
         connectivity_noise_scale=connectivity_noise_scale,
     )
+
+
+def _supervised_training_step(
+    model: GraphRefinementModel,
+    teacher_positions: torch.Tensor,
+    teacher_roles: torch.Tensor,
+    teacher_adjacency: torch.Tensor,
+    config: TrainConfig,
+    device: torch.device,
+    geometry_config: GeometryRegularizationConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        teacher_terms = mechanical_terms(
+            teacher_positions,
+            teacher_roles,
+            teacher_adjacency,
+        )
+        teacher_stiffness = teacher_terms["stiffness_matrix"]
+    noisy_positions, noisy_adjacency = _sample_supervised_denoising_batch(
+        teacher_positions,
+        teacher_roles,
+        teacher_adjacency,
+        position_noise_scale=config.supervised_position_noise,
+        connectivity_noise_scale=config.supervised_connectivity_noise,
+    )
+    with torch.no_grad():
+        noisy_terms = mechanical_terms(noisy_positions, teacher_roles, noisy_adjacency)
+    rollout = rollout_refinement(
+        model,
+        noisy_positions,
+        teacher_roles,
+        noisy_adjacency,
+        teacher_stiffness,
+        steps=config.rollout_steps,
+        position_step_size=config.position_step_size,
+        connectivity_step_size=config.connectivity_step_size,
+        base_time=torch.ones((config.batch_size,), device=device),
+        position_noise_scale=config.rollout_position_noise,
+        connectivity_noise_scale=config.rollout_connectivity_noise,
+        geometry_config=geometry_config,
+        initial_stiffness=noisy_terms["stiffness_matrix"],
+    )
+    final_state = rollout[-1]
+    position_loss, adjacency_loss = _supervised_reconstruction_losses(
+        final_state["refined_positions"],
+        teacher_positions,
+        teacher_roles,
+        final_state["refined_adjacency"],
+        teacher_adjacency,
+    )
+    total = config.supervised_denoising_weight * (
+        config.supervised_position_weight * position_loss
+        + config.supervised_adjacency_weight * adjacency_loss
+    )
+    return total, position_loss, adjacency_loss
 
 
 def _supervised_reconstruction_losses(
@@ -538,9 +634,16 @@ def _log_canonical_evaluation(
     config: TrainConfig,
     step: int,
     device: torch.device,
-    canonical_specs: list[tuple[str, torch.Tensor]],
+    repertoire: SimulationRepertoire,
     animation_output_dir: Path | None = None,
 ) -> None:
+    canonical_specs = repertoire.canonical_specs(
+        device,
+        FrameFEMConfig(),
+        max_specs=config.canonical_case_count,
+    )
+    if not canonical_specs:
+        return
     geometry_config = _geometry_regularization_config(config)
     positions, roles, adjacency = _pure_noise_batch(
         len(canonical_specs),
@@ -649,7 +752,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         f"train:start device={device} train_steps={train_steps} batch_size={config.batch_size} num_nodes={config.num_nodes}"
     )
 
-    canonical_specs = _fixed_stiffness_target_specs(device)[:3]
+    repertoire = _bootstrap_repertoire(config, device)
     model = GraphRefinementModel(
         d_model=config.d_model,
         nhead=config.nhead,
@@ -665,344 +768,252 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     running_totals = {
         "total": 0.0,
         "property": 0.0,
-        "monotonic": 0.0,
+        "structural_integrity": 0.0,
         "supervised": 0.0,
         "supervised_position": 0.0,
         "supervised_adjacency": 0.0,
-        "material": 0.0,
-        "sparsity": 0.0,
-        "connectivity": 0.0,
-        "fixed_mobile_connectivity": 0.0,
-        "short_beam": 0.0,
-        "long_beam": 0.0,
-        "thin_diameter": 0.0,
-        "thick_diameter": 0.0,
-        "node_spacing": 0.0,
-        "free_repulsion": 0.0,
-        "rigid_attachment": 0.0,
-        "centroid": 0.0,
-        "spread": 0.0,
-        "soft_domain": 0.0,
-        "yield_stress": 0.0,
     }
     step_weights = _step_weights(config.rollout_steps, device)
 
     model.train()
     for step in range(1, train_steps + 1):
+        property_loss = torch.zeros((), device=device)
+        supervised_position_loss = torch.zeros((), device=device)
+        supervised_adjacency_loss = torch.zeros((), device=device)
+        supervised_loss = torch.zeros((), device=device)
+        structural_integrity_loss = torch.zeros((), device=device)
+        goal_blend = 1.0
+        phase = _scheduled_training_phase(
+            step,
+            config.supervised_priority_start,
+            config.supervised_priority_end,
+            config.supervised_priority_duration,
+        )
+
         current_seed = config.seed + step + 1000
-        positions, roles, adjacency = _pure_noise_batch(
+        fresh_positions, fresh_roles, fresh_adjacency = _pure_noise_batch(
             config.batch_size,
             config.num_nodes,
             device,
             seed=current_seed,
         )
-        goal_targets = _sample_stiffness_targets(config.batch_size, device)
-        with torch.no_grad():
-            start_terms = mechanical_terms(positions, roles, adjacency)
-        goal_blend = _scheduled_goal_blend(
-            step,
-            train_steps,
-            blend_start=config.training_goal_blend_start,
-            blend_end=config.training_goal_blend_end,
-        )
-        raw_targets = _blend_training_targets(
-            start_terms["stiffness_matrix"],
-            goal_targets,
-            goal_blend=goal_blend,
-        )
-        base_time = torch.rand((positions.shape[0],), device=device)
-
-        rollout = rollout_refinement(
-            model,
-            positions,
-            roles,
-            adjacency,
-            raw_targets,
-            steps=config.rollout_steps,
-            position_step_size=config.position_step_size,
-            connectivity_step_size=config.connectivity_step_size,
-            base_time=base_time,
-            position_noise_scale=config.rollout_position_noise,
-            connectivity_noise_scale=config.rollout_connectivity_noise,
-            geometry_config=geometry_config,
-            initial_stiffness=start_terms["stiffness_matrix"],
-        )
-        property_loss = torch.zeros((), device=device)
-        material_loss = torch.zeros((), device=device)
-        sparsity_loss = torch.zeros((), device=device)
-        connectivity_loss = torch.zeros((), device=device)
-        fixed_mobile_connectivity_loss = torch.zeros((), device=device)
-        short_beam_loss = torch.zeros((), device=device)
-        long_beam_loss = torch.zeros((), device=device)
-        thin_diameter_loss = torch.zeros((), device=device)
-        thick_diameter_loss = torch.zeros((), device=device)
-        node_spacing_loss = torch.zeros((), device=device)
-        free_repulsion_loss = torch.zeros((), device=device)
-        rigid_attachment_loss = torch.zeros((), device=device)
-        centroid_loss = torch.zeros((), device=device)
-        spread_loss = torch.zeros((), device=device)
-        soft_domain_loss = torch.zeros((), device=device)
-        yield_stress_loss = torch.zeros((), device=device)
-        step_errors: list[torch.Tensor] = []
-        for step_idx, state in enumerate(rollout):
-            step_terms = state["terms"]
-            step_error = _matrix_loss(
-                step_terms["stiffness_matrix"],
-                raw_targets,
-            )
-            step_errors.append(step_error)
-            property_loss = property_loss + step_weights[step_idx] * step_error
-            material_loss = (
-                material_loss
-                + step_weights[step_idx] * step_terms["normalized_material"].mean()
-            )
-            sparsity_loss = (
-                sparsity_loss + step_weights[step_idx] * step_terms["sparsity"].mean()
-            )
-            connectivity_loss = (
-                connectivity_loss
-                + step_weights[step_idx] * step_terms["connectivity_penalty"].mean()
-            )
-            fixed_mobile_connectivity_loss = (
-                fixed_mobile_connectivity_loss
-                + step_weights[step_idx]
-                * step_terms["fixed_mobile_connectivity_penalty"].mean()
-            )
-            short_beam_loss = (
-                short_beam_loss
-                + step_weights[step_idx] * step_terms["short_beam_penalty"].mean()
-            )
-            long_beam_loss = (
-                long_beam_loss
-                + step_weights[step_idx] * step_terms["long_beam_penalty"].mean()
-            )
-            thin_diameter_loss = (
-                thin_diameter_loss
-                + step_weights[step_idx] * step_terms["thin_diameter_penalty"].mean()
-            )
-            thick_diameter_loss = (
-                thick_diameter_loss
-                + step_weights[step_idx] * step_terms["thick_diameter_penalty"].mean()
-            )
-            node_spacing_loss = (
-                node_spacing_loss
-                + step_weights[step_idx] * step_terms["node_spacing_penalty"].mean()
-            )
-            free_repulsion_loss = (
-                free_repulsion_loss
-                + step_weights[step_idx] * step_terms["free_repulsion_penalty"].mean()
-            )
-            rigid_attachment_loss = (
-                rigid_attachment_loss
-                + step_weights[step_idx]
-                * step_terms["rigid_attachment_penalty"].mean()
-            )
-            centroid_loss = (
-                centroid_loss
-                + step_weights[step_idx] * step_terms["centroid_penalty"].mean()
-            )
-            spread_loss = (
-                spread_loss
-                + step_weights[step_idx] * step_terms["spread_penalty"].mean()
-            )
-            soft_domain_loss = (
-                soft_domain_loss
-                + step_weights[step_idx] * step_terms["soft_domain_penalty"].mean()
-            )
-            yield_stress_loss = (
-                yield_stress_loss
-                + step_weights[step_idx] * step_terms["yield_stress_penalty"].mean()
-            )
-        monotonic_loss = _monotonic_improvement_loss(step_errors)
-
-        final_state = rollout[-1]
-        free_loss = (
-            config.property_weight * property_loss
-            + config.monotonic_improvement_weight * monotonic_loss
-            + config.material_weight * material_loss
-            + config.sparsity_weight * sparsity_loss
-            + config.connectivity_weight * connectivity_loss
-            + config.fixed_mobile_connectivity_weight * fixed_mobile_connectivity_loss
-            + config.short_beam_weight * short_beam_loss
-            + config.long_beam_weight * long_beam_loss
-            + config.thin_diameter_weight * thin_diameter_loss
-            + config.thick_diameter_weight * thick_diameter_loss
-            + config.node_spacing_weight * node_spacing_loss
-            + config.free_repulsion_weight * free_repulsion_loss
-            + config.rigid_attachment_weight * rigid_attachment_loss
-            + config.centroid_weight * centroid_loss
-            + config.spread_weight * spread_loss
-            + config.soft_domain_weight * soft_domain_loss
-            + config.yield_stress_weight * yield_stress_loss
+        _observe_cases(
+            repertoire,
+            fresh_positions,
+            fresh_roles,
+            fresh_adjacency,
+            source_code=0,
         )
 
-        supervised_position_loss = torch.zeros((), device=device)
-        supervised_adjacency_loss = torch.zeros((), device=device)
-        supervised_loss = torch.zeros((), device=device)
-        if (
-            config.supervised_denoising_weight > 0.0
-            and step % max(config.supervised_every_steps, 1) == 0
-        ):
-            teacher_positions = final_state["refined_positions"].detach()
-            teacher_adjacency = final_state["refined_adjacency"].detach()
-            noisy_positions, noisy_adjacency = _sample_supervised_denoising_batch(
-                teacher_positions,
-                roles,
-                teacher_adjacency,
-                position_noise_scale=config.supervised_position_noise,
-                connectivity_noise_scale=config.supervised_connectivity_noise,
+        if phase == "supervised":
+            supervised_loss, supervised_position_loss, supervised_adjacency_loss = (
+                _supervised_training_step(
+                    model,
+                    fresh_positions,
+                    fresh_roles,
+                    fresh_adjacency,
+                    config,
+                    device,
+                    geometry_config,
+                )
+            )
+            total = supervised_loss
+        else:
+            positions, roles, adjacency = fresh_positions, fresh_roles, fresh_adjacency
+            goal_targets = _sample_target_stiffnesses(
+                config.batch_size,
+                device,
+                repertoire,
             )
             with torch.no_grad():
-                noisy_terms = mechanical_terms(noisy_positions, roles, noisy_adjacency)
-                noisy_nodal_mechanics = _nodal_mechanics_features_from_fields(
-                    noisy_positions,
-                    noisy_terms,
-                )
-            target_features, current_features, residual_features = (
-                _mechanics_condition_matrices(
+                start_terms = mechanical_terms(positions, roles, adjacency)
+            goal_blend = _scheduled_goal_blend(
+                step,
+                train_steps,
+                blend_start=config.training_goal_blend_start,
+                blend_end=config.training_goal_blend_end,
+            )
+            raw_targets = _blend_training_targets(
+                start_terms["stiffness_matrix"],
+                goal_targets,
+                goal_blend=goal_blend,
+            )
+            base_time = torch.rand((positions.shape[0],), device=device)
+            rollout = rollout_refinement(
+                model,
+                positions,
+                roles,
+                adjacency,
+                raw_targets,
+                steps=config.rollout_steps,
+                position_step_size=config.position_step_size,
+                connectivity_step_size=config.connectivity_step_size,
+                base_time=base_time,
+                position_noise_scale=config.rollout_position_noise,
+                connectivity_noise_scale=config.rollout_connectivity_noise,
+                geometry_config=geometry_config,
+                initial_stiffness=start_terms["stiffness_matrix"],
+            )
+            material_loss = torch.zeros((), device=device)
+            sparsity_loss = torch.zeros((), device=device)
+            connectivity_loss = torch.zeros((), device=device)
+            fixed_mobile_connectivity_loss = torch.zeros((), device=device)
+            short_beam_loss = torch.zeros((), device=device)
+            long_beam_loss = torch.zeros((), device=device)
+            thin_diameter_loss = torch.zeros((), device=device)
+            thick_diameter_loss = torch.zeros((), device=device)
+            node_spacing_loss = torch.zeros((), device=device)
+            free_repulsion_loss = torch.zeros((), device=device)
+            rigid_attachment_loss = torch.zeros((), device=device)
+            centroid_loss = torch.zeros((), device=device)
+            spread_loss = torch.zeros((), device=device)
+            soft_domain_loss = torch.zeros((), device=device)
+            step_errors: list[torch.Tensor] = []
+            for step_idx, state in enumerate(rollout):
+                step_terms = state["terms"]
+                step_error = _matrix_loss(
+                    step_terms["stiffness_matrix"],
                     raw_targets,
-                    noisy_terms["stiffness_matrix"],
                 )
-            )
-            denoising_outputs = model(
-                noisy_positions,
-                roles,
-                noisy_adjacency,
-                target_features,
-                current_features,
-                residual_features,
-                noisy_nodal_mechanics,
-                torch.zeros((positions.shape[0],), device=device),
-                torch.full(
-                    (positions.shape[0],),
-                    config.supervised_position_noise,
-                    device=device,
-                ),
-                torch.full(
-                    (positions.shape[0],),
-                    config.supervised_connectivity_noise,
-                    device=device,
-                ),
-            )
-            predicted_positions = apply_free_node_update(
-                noisy_positions,
-                denoising_outputs["displacements"],
-                roles,
-                config.position_step_size,
-            )
-            predicted_adjacency = denoising_outputs["predicted_adjacency"]
-            supervised_position_loss, supervised_adjacency_loss = (
-                _supervised_reconstruction_losses(
-                    predicted_positions,
-                    teacher_positions,
-                    roles,
-                    predicted_adjacency,
-                    teacher_adjacency,
+                step_errors.append(step_error)
+                property_loss = property_loss + step_weights[step_idx] * step_error
+                structural_integrity_loss = (
+                    structural_integrity_loss
+                    + step_weights[step_idx]
+                    * step_terms["structural_integrity_penalty"].mean()
                 )
+                material_loss = (
+                    material_loss
+                    + step_weights[step_idx] * step_terms["normalized_material"].mean()
+                )
+                sparsity_loss = (
+                    sparsity_loss
+                    + step_weights[step_idx] * step_terms["sparsity"].mean()
+                )
+                connectivity_loss = (
+                    connectivity_loss
+                    + step_weights[step_idx]
+                    * step_terms["connectivity_penalty"].mean()
+                )
+                fixed_mobile_connectivity_loss = (
+                    fixed_mobile_connectivity_loss
+                    + step_weights[step_idx]
+                    * step_terms["fixed_mobile_connectivity_penalty"].mean()
+                )
+                short_beam_loss = (
+                    short_beam_loss
+                    + step_weights[step_idx] * step_terms["short_beam_penalty"].mean()
+                )
+                long_beam_loss = (
+                    long_beam_loss
+                    + step_weights[step_idx] * step_terms["long_beam_penalty"].mean()
+                )
+                thin_diameter_loss = (
+                    thin_diameter_loss
+                    + step_weights[step_idx]
+                    * step_terms["thin_diameter_penalty"].mean()
+                )
+                thick_diameter_loss = (
+                    thick_diameter_loss
+                    + step_weights[step_idx]
+                    * step_terms["thick_diameter_penalty"].mean()
+                )
+                node_spacing_loss = (
+                    node_spacing_loss
+                    + step_weights[step_idx] * step_terms["node_spacing_penalty"].mean()
+                )
+                free_repulsion_loss = (
+                    free_repulsion_loss
+                    + step_weights[step_idx]
+                    * step_terms["free_repulsion_penalty"].mean()
+                )
+                rigid_attachment_loss = (
+                    rigid_attachment_loss
+                    + step_weights[step_idx]
+                    * step_terms["rigid_attachment_penalty"].mean()
+                )
+                centroid_loss = (
+                    centroid_loss
+                    + step_weights[step_idx] * step_terms["centroid_penalty"].mean()
+                )
+                spread_loss = (
+                    spread_loss
+                    + step_weights[step_idx] * step_terms["spread_penalty"].mean()
+                )
+                soft_domain_loss = (
+                    soft_domain_loss
+                    + step_weights[step_idx] * step_terms["soft_domain_penalty"].mean()
+                )
+            monotonic_loss = _monotonic_improvement_loss(step_errors)
+            total = (
+                config.property_weight * property_loss
+                + config.structural_integrity_weight * structural_integrity_loss
+                + config.monotonic_improvement_weight * monotonic_loss
+                + config.material_weight * material_loss
+                + config.sparsity_weight * sparsity_loss
+                + config.connectivity_weight * connectivity_loss
+                + config.fixed_mobile_connectivity_weight
+                * fixed_mobile_connectivity_loss
+                + config.short_beam_weight * short_beam_loss
+                + config.long_beam_weight * long_beam_loss
+                + config.thin_diameter_weight * thin_diameter_loss
+                + config.thick_diameter_weight * thick_diameter_loss
+                + config.node_spacing_weight * node_spacing_loss
+                + config.free_repulsion_weight * free_repulsion_loss
+                + config.rigid_attachment_weight * rigid_attachment_loss
+                + config.centroid_weight * centroid_loss
+                + config.spread_weight * spread_loss
+                + config.soft_domain_weight * soft_domain_loss
             )
-            supervised_loss = config.supervised_denoising_weight * (
-                config.supervised_position_weight * supervised_position_loss
-                + config.supervised_adjacency_weight * supervised_adjacency_loss
+            final_state = rollout[-1]
+            _observe_cases(
+                repertoire,
+                final_state["refined_positions"],
+                roles,
+                final_state["refined_adjacency"],
+                source_code=1,
             )
-
-        total = free_loss + supervised_loss
         optimizer.zero_grad(set_to_none=True)
         total.backward()
         optimizer.step()
 
         running_totals["total"] += total.item()
-        running_totals["property"] += property_loss.item()
-        running_totals["monotonic"] += monotonic_loss.item()
-        running_totals["supervised"] += supervised_loss.item()
-        running_totals["supervised_position"] += supervised_position_loss.item()
-        running_totals["supervised_adjacency"] += supervised_adjacency_loss.item()
-        running_totals["material"] += material_loss.item()
-        running_totals["sparsity"] += sparsity_loss.item()
-        running_totals["connectivity"] += connectivity_loss.item()
-        running_totals["fixed_mobile_connectivity"] += (
-            fixed_mobile_connectivity_loss.item()
-        )
-        running_totals["short_beam"] += short_beam_loss.item()
-        running_totals["long_beam"] += long_beam_loss.item()
-        running_totals["thin_diameter"] += thin_diameter_loss.item()
-        running_totals["thick_diameter"] += thick_diameter_loss.item()
-        running_totals["node_spacing"] += node_spacing_loss.item()
-        running_totals["free_repulsion"] += free_repulsion_loss.item()
-        running_totals["rigid_attachment"] += rigid_attachment_loss.item()
-        running_totals["centroid"] += centroid_loss.item()
-        running_totals["spread"] += spread_loss.item()
-        running_totals["soft_domain"] += soft_domain_loss.item()
-        running_totals["yield_stress"] += yield_stress_loss.item()
+        if phase == "supervised":
+            running_totals["supervised"] += supervised_loss.item()
+            running_totals["supervised_position"] += supervised_position_loss.item()
+            running_totals["supervised_adjacency"] += supervised_adjacency_loss.item()
+        else:
+            running_totals["property"] += property_loss.item()
+            running_totals["structural_integrity"] += structural_integrity_loss.item()
 
         if config.log_every_steps > 0 and step % config.log_every_steps == 0:
             writer.add_scalar("train/total_loss", total.item(), global_step)
+            writer.add_text("train/phase", phase, global_step)
+            writer.add_scalar("train/repertoire_size", len(repertoire), global_step)
             writer.add_scalar("train/goal_blend", goal_blend, global_step)
-            writer.add_scalar("train/property_loss", property_loss.item(), global_step)
-            writer.add_scalar(
-                "train/monotonic_improvement_loss", monotonic_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/supervised_loss", supervised_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/supervised_position_loss",
-                supervised_position_loss.item(),
-                global_step,
-            )
-            writer.add_scalar(
-                "train/supervised_adjacency_loss",
-                supervised_adjacency_loss.item(),
-                global_step,
-            )
-            writer.add_scalar("train/material_loss", material_loss.item(), global_step)
-            writer.add_scalar("train/sparsity_loss", sparsity_loss.item(), global_step)
-            writer.add_scalar(
-                "train/connectivity_penalty", connectivity_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/fixed_mobile_connectivity_penalty",
-                fixed_mobile_connectivity_loss.item(),
-                global_step,
-            )
-            writer.add_scalar(
-                "train/short_beam_penalty", short_beam_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/long_beam_penalty", long_beam_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/thin_diameter_penalty", thin_diameter_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/thick_diameter_penalty", thick_diameter_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/node_spacing_penalty", node_spacing_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/free_repulsion_penalty",
-                free_repulsion_loss.item(),
-                global_step,
-            )
-            writer.add_scalar(
-                "train/rigid_attachment_penalty",
-                rigid_attachment_loss.item(),
-                global_step,
-            )
-            writer.add_scalar(
-                "train/centroid_penalty", centroid_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/spread_penalty", spread_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/soft_domain_penalty", soft_domain_loss.item(), global_step
-            )
-            writer.add_scalar(
-                "train/yield_stress_penalty",
-                yield_stress_loss.item(),
-                global_step,
-            )
+            if phase == "supervised":
+                writer.add_scalar(
+                    "train/supervised_loss", supervised_loss.item(), global_step
+                )
+                writer.add_scalar(
+                    "train/supervised_position_loss",
+                    supervised_position_loss.item(),
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/supervised_adjacency_loss",
+                    supervised_adjacency_loss.item(),
+                    global_step,
+                )
+            else:
+                writer.add_scalar(
+                    "train/property_loss", property_loss.item(), global_step
+                )
+                writer.add_scalar(
+                    "train/structural_integrity_penalty",
+                    structural_integrity_loss.item(),
+                    global_step,
+                )
         global_step += 1
 
         if config.log_every_steps > 0 and (
@@ -1016,9 +1027,15 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             if window == 0:
                 window = config.log_every_steps
             _progress(
-                f"train:step {step}/{train_steps} total={total.item():.4f} prop={property_loss.item():.4f} sup={supervised_loss.item():.4f} conn={connectivity_loss.item():.4f} material={material_loss.item():.4f}"
+                f"train:step {step}/{train_steps} phase={phase} total={total.item():.4f} prop={property_loss.item():.4f} integ={structural_integrity_loss.item():.4f} sup={supervised_loss.item():.4f} rep={len(repertoire)}"
             )
-            for key, value in running_totals.items():
+            active_window_keys = (
+                ("total", "supervised", "supervised_position", "supervised_adjacency")
+                if phase == "supervised"
+                else ("total", "property", "structural_integrity")
+            )
+            for key in active_window_keys:
+                value = running_totals[key]
                 writer.add_scalar(f"window/{key}", value / window, global_step)
                 running_totals[key] = 0.0
 
@@ -1034,7 +1051,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     config,
                     global_step,
                     device,
-                    canonical_specs,
+                    repertoire,
                     (
                         log_dir / "animations"
                         if config.animation_every_steps > 0
@@ -1047,8 +1064,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     payload = {
         "state_dict": model.state_dict(),
         "config": asdict(config),
+        "repertoire": repertoire.payload(),
     }
     torch.save(payload, checkpoint_path)
+    torch.save(repertoire.payload(), log_dir / "repertoire.pt")
     writer.close()
     _progress(f"train:done checkpoint={checkpoint_path} log_dir={log_dir}")
     return checkpoint_path, log_dir
@@ -1087,6 +1106,8 @@ def refine_sample_state(
         )
         loss = (
             config.property_weight * property_loss
+            + config.structural_integrity_weight
+            * terms["structural_integrity_penalty"].mean()
             + config.material_weight * terms["normalized_material"].mean()
             + config.sparsity_weight * terms["sparsity"].mean()
             + config.connectivity_weight * terms["connectivity_penalty"].mean()
@@ -1103,7 +1124,6 @@ def refine_sample_state(
             + config.centroid_weight * terms["centroid_penalty"].mean()
             + config.spread_weight * terms["spread_penalty"].mean()
             + config.soft_domain_weight * terms["soft_domain_penalty"].mean()
-            + config.yield_stress_weight * terms["yield_stress_penalty"].mean()
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -1238,8 +1258,8 @@ def sample(
         "sample/40_soft_domain_penalty", terms["soft_domain_penalty"][0].item(), 0
     )
     writer.add_scalar(
-        "sample/40_yield_stress_penalty",
-        terms["yield_stress_penalty"][0].item(),
+        "sample/40_structural_integrity_penalty",
+        terms["structural_integrity_penalty"][0].item(),
         0,
     )
     animation_rollout = []
@@ -1290,7 +1310,7 @@ def sample(
         "centroid_penalty": terms["centroid_penalty"].cpu(),
         "spread_penalty": terms["spread_penalty"].cpu(),
         "soft_domain_penalty": terms["soft_domain_penalty"].cpu(),
-        "yield_stress_penalty": terms["yield_stress_penalty"].cpu(),
+        "structural_integrity_penalty": terms["structural_integrity_penalty"].cpu(),
         "log_dir": str(log_dir),
     }
     output = Path(output_path)
@@ -1366,6 +1386,21 @@ def _train_parser() -> argparse.ArgumentParser:
         default=defaults.supervised_every_steps,
     )
     parser.add_argument(
+        "--supervised-priority-start",
+        type=int,
+        default=defaults.supervised_priority_start,
+    )
+    parser.add_argument(
+        "--supervised-priority-end",
+        type=int,
+        default=defaults.supervised_priority_end,
+    )
+    parser.add_argument(
+        "--supervised-priority-duration",
+        type=int,
+        default=defaults.supervised_priority_duration,
+    )
+    parser.add_argument(
         "--training-goal-blend-start",
         type=float,
         default=defaults.training_goal_blend_start,
@@ -1377,6 +1412,11 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--property-weight", type=float, default=defaults.property_weight
+    )
+    parser.add_argument(
+        "--structural-integrity-weight",
+        type=float,
+        default=defaults.structural_integrity_weight,
     )
     parser.add_argument(
         "--monotonic-improvement-weight",
@@ -1430,9 +1470,19 @@ def _train_parser() -> argparse.ArgumentParser:
         "--soft-domain-weight", type=float, default=defaults.soft_domain_weight
     )
     parser.add_argument(
-        "--yield-stress-weight",
-        type=float,
-        default=defaults.yield_stress_weight,
+        "--repertoire-bootstrap-cases",
+        type=int,
+        default=defaults.repertoire_bootstrap_cases,
+    )
+    parser.add_argument(
+        "--repertoire-max-cases",
+        type=int,
+        default=defaults.repertoire_max_cases,
+    )
+    parser.add_argument(
+        "--canonical-case-count",
+        type=int,
+        default=defaults.canonical_case_count,
     )
     parser.add_argument(
         "--min-beam-length", type=float, default=defaults.min_beam_length
