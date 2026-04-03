@@ -156,7 +156,7 @@ def test_reference_loads_preserve_stiffness_matrix_units() -> None:
         positions.unsqueeze(0),
         roles.unsqueeze(0),
         adjacency.unsqueeze(0),
-        config=FrameFEMConfig(reference_force=80.0, reference_moment=8.0),
+        config=FrameFEMConfig(reference_force=80.0, reference_moment=40.0),
     )
 
     assert torch.allclose(

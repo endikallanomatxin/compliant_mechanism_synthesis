@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ from compliant_mechanism_synthesis.scaling import (
     normalize_generalized_stiffness_matrix,
 )
 from compliant_mechanism_synthesis.viz import (
+    export_canonical_animation,
     export_rollout_animation,
     plot_graph_design,
 )
@@ -46,22 +48,23 @@ class TrainConfig:
     num_layers: int = 12
     node_effect_dim: int = 64
     batch_size: int = 128
+    gradient_accumulation_steps: int = 8
     train_steps: int = 20_000
-    learning_rate: float = 6e-5
-    learning_rate_warmup_steps: int = 200
+    learning_rate: float = 1e-4
+    learning_rate_warmup_steps: int = 100
     learning_rate_min_scale: float = 0.1
     rollout_steps: int = 8
-    position_step_size: float = 0.2
+    position_step_size: float = 0.1
     connectivity_step_size: float = 0.1
-    rollout_position_noise: float = 0.01
-    rollout_connectivity_noise: float = 0.05
+    rollout_position_noise: float = 0.04
+    rollout_connectivity_noise: float = 0.08
     supervised_denoising_weight: float = 0.5
-    supervised_position_weight: float = 2.0
-    supervised_adjacency_weight: float = 2.0
-    supervised_position_noise: float = 0.02
-    supervised_connectivity_noise: float = 0.08
+    supervised_position_weight: float = 1.0
+    supervised_adjacency_weight: float = 1.0
+    supervised_position_noise: float = 0.08
+    supervised_connectivity_noise: float = 0.16
     supervised_every_steps: int = 1
-    supervised_priority_start: int = 20
+    supervised_priority_start: int = 3
     supervised_priority_end: int = 1
     supervised_priority_duration: int = 2_000
     repertoire_bootstrap_cases: int = 512
@@ -89,7 +92,8 @@ class TrainConfig:
     min_beam_diameter: float = 2e-4
     max_beam_diameter: float = 3e-3
     min_free_node_spacing: float = 1.2e-2
-    animation_every_steps: int = 1_000
+    display_animation_scale: float = 4.0
+    animation_every_steps: int = 500
     log_every_steps: int = 1
     canonical_eval_every_steps: int = 100
     sample_threshold: float = 0.5
@@ -286,7 +290,7 @@ def _step_weights(steps: int, device: torch.device) -> torch.Tensor:
 
 
 def _visualization_threshold() -> float:
-    return 0.0
+    return 0.08
 
 
 def _format_matrix(matrix: torch.Tensor | list[list[float]]) -> str:
@@ -658,6 +662,7 @@ def _log_canonical_evaluation(
     repertoire: SimulationRepertoire,
     animation_output_dir: Path | None = None,
 ) -> None:
+    started_at = time.perf_counter()
     canonical_specs = repertoire.canonical_specs(
         device,
         FrameFEMConfig(),
@@ -665,7 +670,11 @@ def _log_canonical_evaluation(
     )
     if not canonical_specs:
         return
+    _progress(
+        f"train:canonical start step={step} cases={len(canonical_specs)} animation={animation_output_dir is not None}"
+    )
     geometry_config = _geometry_regularization_config(config)
+    stage_started_at = time.perf_counter()
     positions, roles, adjacency = _pure_noise_batch(
         len(canonical_specs),
         config.num_nodes,
@@ -677,6 +686,10 @@ def _log_canonical_evaluation(
     )
     target_responses = _stiffness_to_response(raw_targets)
     base_time = torch.ones((len(canonical_specs),), device=device)
+    _progress(
+        f"train:canonical prepare step={step} dt={time.perf_counter() - stage_started_at:.2f}s"
+    )
+    stage_started_at = time.perf_counter()
     rollout = rollout_refinement(
         model,
         positions,
@@ -691,6 +704,10 @@ def _log_canonical_evaluation(
         connectivity_noise_scale=0.0,
         geometry_config=geometry_config,
     )
+    _progress(
+        f"train:canonical rollout step={step} dt={time.perf_counter() - stage_started_at:.2f}s"
+    )
+    stage_started_at = time.perf_counter()
     final_state = rollout[-1]
     final_terms = mechanical_terms(
         final_state["positions"],
@@ -698,8 +715,12 @@ def _log_canonical_evaluation(
         final_state["adjacency"],
         geometry_config=geometry_config,
     )
+    _progress(
+        f"train:canonical final_terms step={step} dt={time.perf_counter() - stage_started_at:.2f}s"
+    )
 
     for idx, (name, _) in enumerate(canonical_specs):
+        case_started_at = time.perf_counter()
         figure = plot_graph_design(
             final_state["positions"][idx],
             roles[idx],
@@ -721,14 +742,8 @@ def _log_canonical_evaluation(
             step,
         )
         for rollout_idx, state in enumerate(rollout, start=1):
-            step_terms = mechanical_terms(
-                state["positions"][idx : idx + 1],
-                roles[idx : idx + 1],
-                state["adjacency"][idx : idx + 1],
-                geometry_config=geometry_config,
-            )
             step_error = _matrix_loss(
-                step_terms["stiffness_matrix"],
+                state["terms"]["stiffness_matrix"][idx : idx + 1],
                 raw_targets[idx : idx + 1],
             )
             writer.add_scalar(
@@ -738,30 +753,43 @@ def _log_canonical_evaluation(
             )
         plt = figure
         plt.clf()
+        _progress(
+            f"train:canonical case step={step} idx={idx} name={name} dt={time.perf_counter() - case_started_at:.2f}s"
+        )
 
     if animation_output_dir is not None and canonical_specs:
-        name, _ = canonical_specs[0]
+        animation_started_at = time.perf_counter()
+        animation_name = "canonical_grid"
+        _progress(f"train:animation start step={step} name={animation_name}")
         animation_rollout = []
         for state in rollout:
             animation_rollout.append(
                 {
-                    key: value[0]
+                    key: value
                     for key, value in state.items()
                     if isinstance(value, torch.Tensor)
                 }
             )
-        animation_path = export_rollout_animation(
-            animation_output_dir / f"step_{step:05d}_{name}.gif",
-            positions[0],
-            roles[0],
-            adjacency[0],
+        animation_path = export_canonical_animation(
+            animation_output_dir / f"step_{step:05d}_{animation_name}.gif",
+            positions,
+            roles,
+            adjacency,
             animation_rollout,
-            target_responses[0],
+            target_responses,
+            [name for name, _ in canonical_specs],
+            display_scale=config.display_animation_scale,
             threshold=_visualization_threshold(),
             frame_config=FrameFEMConfig(),
-            title=name,
+            final_positions=final_state["positions"],
+            final_adjacency=final_state["adjacency"],
         )
-        _progress(f"train:animation path={animation_path}")
+        _progress(
+            f"train:animation done step={step} dt={time.perf_counter() - animation_started_at:.2f}s path={animation_path}"
+        )
+    _progress(
+        f"train:canonical done step={step} dt={time.perf_counter() - started_at:.2f}s"
+    )
 
 
 def train(config: TrainConfig) -> tuple[Path, Path]:
@@ -796,6 +824,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "supervised_adjacency": 0.0,
         "max_von_mises_stress": 0.0,
         "max_stress_ratio": 0.0,
+        "mean_free_position_update": 0.0,
+        "max_free_position_update": 0.0,
+        "mean_connectivity_update": 0.0,
     }
     running_counts = {
         "total": 0,
@@ -807,10 +838,15 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "supervised_adjacency": 0,
         "max_von_mises_stress": 0,
         "max_stress_ratio": 0,
+        "mean_free_position_update": 0,
+        "max_free_position_update": 0,
+        "mean_connectivity_update": 0,
     }
     step_weights = _step_weights(config.rollout_steps, device)
+    gradient_accumulation_steps = max(config.gradient_accumulation_steps, 1)
 
     model.train()
+    optimizer.zero_grad(set_to_none=True)
     for step in range(1, train_steps + 1):
         scheduled_lr = _scheduled_learning_rate(
             step=step,
@@ -980,6 +1016,36 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 )
             monotonic_loss = _monotonic_improvement_loss(step_objectives)
             final_step_terms = rollout[-1]["terms"]
+            free_mask = roles == ROLE_FREE
+            free_update_means = []
+            free_update_maxes = []
+            connectivity_updates = []
+            edge_i, edge_j = torch.triu_indices(
+                roles.shape[1],
+                roles.shape[1],
+                offset=1,
+                device=device,
+            )
+            for state in rollout:
+                free_displacement_norm = torch.linalg.vector_norm(
+                    state["displacements"], dim=-1
+                )
+                masked_free_displacement = free_displacement_norm * free_mask.to(
+                    dtype=free_displacement_norm.dtype
+                )
+                free_counts = free_mask.to(dtype=free_displacement_norm.dtype).sum(
+                    dim=1
+                ).clamp_min(1.0)
+                free_update_means.append(
+                    masked_free_displacement.sum(dim=1) / free_counts
+                )
+                free_update_maxes.append(masked_free_displacement.max(dim=1).values)
+                connectivity_updates.append(
+                    state["delta_scores"].abs()[:, edge_i, edge_j].mean(dim=1)
+                )
+            mean_free_position_update = torch.stack(free_update_means, dim=0).mean()
+            max_free_position_update = torch.stack(free_update_maxes, dim=0).max()
+            mean_connectivity_update = torch.stack(connectivity_updates, dim=0).mean()
             thin_diameter_loss = final_step_terms["thin_diameter_penalty"].mean()
             thick_diameter_loss = final_step_terms["thick_diameter_penalty"].mean()
             total = (
@@ -1010,14 +1076,15 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 final_state["refined_adjacency"],
                 source_code=1,
             )
-        optimizer.zero_grad(set_to_none=True)
         if not torch.isfinite(total):
             _progress(
                 f"train:skip_nonfinite step={step} phase={phase} total={total.item()}"
             )
             continue
-        total.backward()
-        optimizer.step()
+        (total / gradient_accumulation_steps).backward()
+        if step % gradient_accumulation_steps == 0 or step == train_steps:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         running_totals["total"] += total.item()
         running_counts["total"] += 1
@@ -1038,11 +1105,23 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             running_totals["max_stress_ratio"] += final_step_terms[
                 "max_stress_ratio"
             ].mean().item()
+            running_totals["mean_free_position_update"] += (
+                mean_free_position_update.item()
+            )
+            running_totals["max_free_position_update"] += (
+                max_free_position_update.item()
+            )
+            running_totals["mean_connectivity_update"] += (
+                mean_connectivity_update.item()
+            )
             running_counts["property"] += 1
             running_counts["stress"] += 1
             running_counts["monotonic"] += 1
             running_counts["max_von_mises_stress"] += 1
             running_counts["max_stress_ratio"] += 1
+            running_counts["mean_free_position_update"] += 1
+            running_counts["max_free_position_update"] += 1
+            running_counts["mean_connectivity_update"] += 1
 
         if config.log_every_steps > 0 and (
             step % config.log_every_steps == 0 or step == train_steps
@@ -1096,6 +1175,24 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     "metrics/max_stress_ratio",
                     running_totals["max_stress_ratio"]
                     / running_counts["max_stress_ratio"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "metrics/mean_free_position_update",
+                    running_totals["mean_free_position_update"]
+                    / running_counts["mean_free_position_update"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "metrics/max_free_position_update",
+                    running_totals["max_free_position_update"]
+                    / running_counts["max_free_position_update"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "metrics/mean_connectivity_update",
+                    running_totals["mean_connectivity_update"]
+                    / running_counts["mean_connectivity_update"],
                     global_step,
                 )
         global_step += 1
@@ -1363,6 +1460,7 @@ def sample(
         adjacency[0],
         animation_rollout,
         target_responses[0],
+        display_scale=config.display_animation_scale,
         threshold=_visualization_threshold(),
         frame_config=FrameFEMConfig(),
         title=name,
@@ -1426,6 +1524,11 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--train-steps", type=int, default=defaults.train_steps)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=defaults.gradient_accumulation_steps,
+    )
     parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
     parser.add_argument(
         "--learning-rate-warmup-steps",
@@ -1605,6 +1708,11 @@ def _train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sample-threshold", type=float, default=defaults.sample_threshold
+    )
+    parser.add_argument(
+        "--display-animation-scale",
+        type=float,
+        default=defaults.display_animation_scale,
     )
     parser.add_argument("--device", default=defaults.device)
     parser.add_argument("--name", default=defaults.name)
