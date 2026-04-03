@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
+import random
+
+import matplotlib.pyplot as plt
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.common import (
     ROLE_FIXED,
@@ -28,6 +34,12 @@ from compliant_mechanism_synthesis.mechanics import (
     rigid_attachment_penalty,
     threshold_connectivity,
 )
+from compliant_mechanism_synthesis.viz import plot_graph_design
+
+
+def _test_run_dir(test_name: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path("runs") / f"{timestamp}-test-{test_name}"
 
 
 def test_global_stiffness_is_symmetric() -> None:
@@ -465,6 +477,112 @@ def test_noise_connectivity_gives_each_node_a_local_allowed_edge() -> None:
     _, _, adjacency = generate_noise_sample(10)
     incident = adjacency.sum(dim=1)
     assert torch.all(incident > 0.0)
+
+
+def test_noise_starting_configurations_have_reasonable_batch_quality() -> None:
+    random.seed(7)
+    torch.manual_seed(7)
+
+    batch_size = 24
+    log_dir = _test_run_dir("noise-starting-configurations")
+    writer = SummaryWriter(log_dir=str(log_dir))
+    min_incident_strengths: list[float] = []
+    sparsities: list[float] = []
+    fixed_mobile_penalties: list[float] = []
+    samples: list[dict[str, torch.Tensor | float]] = []
+
+    for _ in range(batch_size):
+        positions, roles, adjacency = generate_noise_sample(32)
+        terms = mechanical_terms(
+            positions.unsqueeze(0),
+            roles.unsqueeze(0),
+            adjacency.unsqueeze(0),
+        )
+
+        incident = adjacency.sum(dim=1)
+        min_incident_strengths.append(float(incident.min()))
+        sparsities.append(float(terms["sparsity"][0]))
+        fixed_mobile_penalties.append(
+            float(terms["fixed_mobile_connectivity_penalty"][0])
+        )
+        samples.append(
+            {
+                "positions": positions,
+                "roles": roles,
+                "adjacency": adjacency,
+                "min_incident_strength": float(incident.min()),
+                "sparsity": float(terms["sparsity"][0]),
+                "fixed_mobile_connectivity_penalty": float(
+                    terms["fixed_mobile_connectivity_penalty"][0]
+                ),
+            }
+        )
+
+        assert torch.all(incident > 0.0)
+        assert torch.isclose(terms["rigid_attachment_penalty"][0], torch.tensor(0.0))
+
+        for rigid_idx in range(4):
+            free_neighbors = adjacency[rigid_idx, 4:]
+            assert torch.count_nonzero(free_neighbors >= 0.75) >= 3
+
+    mean_min_incident = sum(min_incident_strengths) / batch_size
+    mean_sparsity = sum(sparsities) / batch_size
+    mean_fixed_mobile_penalty = sum(fixed_mobile_penalties) / batch_size
+
+    assert mean_min_incident >= 1.0
+    assert 0.06 <= mean_sparsity <= 0.09
+    assert mean_fixed_mobile_penalty <= 0.9
+
+    writer.add_scalar("starting/mean_min_incident_strength", mean_min_incident, 0)
+    writer.add_scalar("starting/mean_sparsity", mean_sparsity, 0)
+    writer.add_scalar(
+        "starting/mean_fixed_mobile_connectivity_penalty",
+        mean_fixed_mobile_penalty,
+        0,
+    )
+    writer.add_scalar(
+        "starting/min_min_incident_strength",
+        min(min_incident_strengths),
+        0,
+    )
+    writer.add_scalar(
+        "starting/max_fixed_mobile_connectivity_penalty",
+        max(fixed_mobile_penalties),
+        0,
+    )
+
+    ranked_samples = sorted(
+        samples,
+        key=lambda sample: (
+            sample["fixed_mobile_connectivity_penalty"],
+            -sample["min_incident_strength"],
+        ),
+    )
+    for idx, sample in enumerate(ranked_samples[:6]):
+        figure = plot_graph_design(
+            sample["positions"],
+            sample["roles"],
+            sample["adjacency"],
+            threshold=0.5,
+            title=(
+                f"start {idx} "
+                f"conn={sample['fixed_mobile_connectivity_penalty']:.3f} "
+                f"min_inc={sample['min_incident_strength']:.3f}"
+            ),
+        )
+        writer.add_figure(f"starting/examples/{idx:02d}", figure, global_step=0)
+        plt.close(figure)
+
+    torch.save(
+        {
+            "mean_min_incident_strength": mean_min_incident,
+            "mean_sparsity": mean_sparsity,
+            "mean_fixed_mobile_connectivity_penalty": mean_fixed_mobile_penalty,
+            "samples": ranked_samples,
+        },
+        log_dir / "starting_configurations.pt",
+    )
+    writer.close()
 
 
 def test_rigid_endpoint_scaffold_connects_each_rigid_node_to_three_nearest_free_nodes() -> (
