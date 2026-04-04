@@ -21,6 +21,9 @@ COMPONENT_LABELS = [
     "theta_theta",
 ]
 
+SOURCE_RANDOM_INITIALIZATION = 0
+SOURCE_RL = 1
+
 
 def _upper_triangular_components(matrices: torch.Tensor) -> torch.Tensor:
     return torch.stack(
@@ -177,10 +180,22 @@ class SimulationRepertoire:
         self,
         batch_size: int,
         device: torch.device,
+        source_codes: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(self) == 0:
             raise RuntimeError("cannot sample from an empty simulation repertoire")
-        indices = torch.randint(len(self), (batch_size,))
+        if source_codes is None:
+            candidate_indices = torch.arange(len(self))
+        else:
+            source_codes_tensor = torch.tensor(source_codes, dtype=self.source.dtype)
+            candidate_mask = (self.source[:, None] == source_codes_tensor[None, :]).any(
+                dim=1
+            )
+            candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+            if candidate_indices.numel() == 0:
+                candidate_indices = torch.arange(len(self))
+        selection = torch.randint(candidate_indices.shape[0], (batch_size,))
+        indices = candidate_indices.index_select(0, selection)
         return (
             self.positions.index_select(0, indices).to(device),
             self.roles.index_select(0, indices).to(device),
@@ -193,16 +208,35 @@ class SimulationRepertoire:
         batch_size: int,
         device: torch.device,
         frame_config: FrameFEMConfig | None = None,
+        source_codes: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         if len(self) == 0:
             raise RuntimeError("cannot sample target stiffness from an empty repertoire")
         finite_stiffness_mask = torch.isfinite(self.stiffness).all(dim=(1, 2))
+        if source_codes is not None:
+            source_codes_tensor = torch.tensor(source_codes, dtype=self.source.dtype)
+            source_mask = (self.source[:, None] == source_codes_tensor[None, :]).any(
+                dim=1
+            )
+            finite_stiffness_mask = finite_stiffness_mask & source_mask
         finite_stiffness = self.stiffness[finite_stiffness_mask]
         if finite_stiffness.shape[0] == 0:
-            raise RuntimeError("cannot sample target stiffness from a non-finite repertoire")
+            return self.sample_target_stiffness(
+                batch_size,
+                device,
+                frame_config,
+                source_codes=None,
+            )
         if finite_stiffness.shape[0] == 1:
             return finite_stiffness[:1].expand(batch_size, -1, -1).to(device)
-        components = self.normalized_components(frame_config)
+        if source_codes is None:
+            components = self.normalized_components(frame_config)
+        else:
+            normalized = normalize_generalized_stiffness_matrix(
+                finite_stiffness,
+                characteristic_scales(frame_config),
+            )
+            components = _upper_triangular_components(normalized)
         if components.shape[0] < 2 or not torch.isfinite(components).all():
             indices = torch.randint(finite_stiffness.shape[0], (batch_size,))
             return finite_stiffness.index_select(0, indices).to(device)

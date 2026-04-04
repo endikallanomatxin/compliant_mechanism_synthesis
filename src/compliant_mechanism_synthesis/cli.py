@@ -29,7 +29,11 @@ from compliant_mechanism_synthesis.mechanics import (
     threshold_connectivity,
 )
 from compliant_mechanism_synthesis.model import GraphRefinementModel
-from compliant_mechanism_synthesis.repertoire import SimulationRepertoire
+from compliant_mechanism_synthesis.repertoire import (
+    SimulationRepertoire,
+    SOURCE_RANDOM_INITIALIZATION,
+    SOURCE_RL,
+)
 from compliant_mechanism_synthesis.scaling import (
     normalize_generalized_stiffness_matrix,
 )
@@ -219,6 +223,64 @@ def _sample_target_stiffnesses(
     return repertoire.sample_target_stiffness(batch_size, device, FrameFEMConfig())
 
 
+def _sample_mixed_supervised_teachers(
+    fresh_positions: torch.Tensor,
+    fresh_roles: torch.Tensor,
+    fresh_adjacency: torch.Tensor,
+    repertoire: SimulationRepertoire,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = fresh_positions.shape[0]
+    rl_count = batch_size // 2
+    fresh_count = batch_size - rl_count
+    teacher_positions = [fresh_positions[:fresh_count]]
+    teacher_roles = [fresh_roles[:fresh_count]]
+    teacher_adjacency = [fresh_adjacency[:fresh_count]]
+    if rl_count > 0:
+        rl_positions, rl_roles, rl_adjacency, _ = repertoire.sample_cases(
+            rl_count,
+            device,
+            source_codes=(SOURCE_RL,),
+        )
+        teacher_positions.append(rl_positions)
+        teacher_roles.append(rl_roles)
+        teacher_adjacency.append(rl_adjacency)
+    return (
+        torch.cat(teacher_positions, dim=0),
+        torch.cat(teacher_roles, dim=0),
+        torch.cat(teacher_adjacency, dim=0),
+    )
+
+
+def _sample_mixed_rl_targets(
+    batch_size: int,
+    device: torch.device,
+    repertoire: SimulationRepertoire,
+) -> torch.Tensor:
+    random_initialization_count = batch_size // 2
+    rl_count = batch_size - random_initialization_count
+    targets = []
+    if random_initialization_count > 0:
+        targets.append(
+            repertoire.sample_target_stiffness(
+                random_initialization_count,
+                device,
+                FrameFEMConfig(),
+                source_codes=(SOURCE_RANDOM_INITIALIZATION,),
+            )
+        )
+    if rl_count > 0:
+        targets.append(
+            repertoire.sample_target_stiffness(
+                rl_count,
+                device,
+                FrameFEMConfig(),
+                source_codes=(SOURCE_RL,),
+            )
+        )
+    return torch.cat(targets, dim=0)
+
+
 def _bootstrap_repertoire(
     config: TrainConfig,
     device: torch.device,
@@ -243,7 +305,7 @@ def _bootstrap_repertoire(
             roles,
             adjacency,
             terms["stiffness_matrix"],
-            source_code=0,
+            source_code=SOURCE_RANDOM_INITIALIZATION,
         )
         remaining -= batch_size
     return repertoire
@@ -908,16 +970,25 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             fresh_positions,
             fresh_roles,
             fresh_adjacency,
-            source_code=0,
+            source_code=SOURCE_RANDOM_INITIALIZATION,
         )
 
         if phase == "supervised":
-            supervised_loss, supervised_position_loss, supervised_adjacency_loss = (
-                _supervised_training_step(
-                    model,
+            teacher_positions, teacher_roles, teacher_adjacency = (
+                _sample_mixed_supervised_teachers(
                     fresh_positions,
                     fresh_roles,
                     fresh_adjacency,
+                    repertoire,
+                    device,
+                )
+            )
+            supervised_loss, supervised_position_loss, supervised_adjacency_loss = (
+                _supervised_training_step(
+                    model,
+                    teacher_positions,
+                    teacher_roles,
+                    teacher_adjacency,
                     config,
                     device,
                     geometry_config,
@@ -926,7 +997,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             total = supervised_loss
         else:
             positions, roles, adjacency = fresh_positions, fresh_roles, fresh_adjacency
-            goal_targets = _sample_target_stiffnesses(
+            goal_targets = _sample_mixed_rl_targets(
                 config.batch_size,
                 device,
                 repertoire,
@@ -1104,7 +1175,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 final_state["refined_positions"],
                 roles,
                 final_state["refined_adjacency"],
-                source_code=1,
+                source_code=SOURCE_RL,
             )
         if not torch.isfinite(total):
             _progress(

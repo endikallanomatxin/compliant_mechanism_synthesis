@@ -14,6 +14,8 @@ from compliant_mechanism_synthesis.cli import (
     _pure_noise_batch,
     _resolve_sample_seed,
     _sample_target_stiffnesses,
+    _sample_mixed_rl_targets,
+    _sample_mixed_supervised_teachers,
     _scheduled_learning_rate,
     _scheduled_supervised_priority,
     _scheduled_training_phase,
@@ -35,7 +37,11 @@ from compliant_mechanism_synthesis.mechanics import (
     mechanical_terms,
 )
 from compliant_mechanism_synthesis.model import GraphRefinementModel
-from compliant_mechanism_synthesis.repertoire import SimulationRepertoire
+from compliant_mechanism_synthesis.repertoire import (
+    SimulationRepertoire,
+    SOURCE_RANDOM_INITIALIZATION,
+    SOURCE_RL,
+)
 from compliant_mechanism_synthesis.scaling import normalize_generalized_stiffness_matrix
 
 
@@ -205,6 +211,72 @@ def test_stiffness_target_sampling_falls_back_when_repertoire_has_nonfinite_comp
 
     assert sampled.shape == (4, 3, 3)
     assert torch.isfinite(sampled).all()
+
+
+def test_mixed_supervised_teachers_use_fresh_and_rl_repertoire_halves() -> None:
+    device = torch.device("cpu")
+    fresh_positions = torch.rand(4, 4, 2)
+    fresh_roles = torch.tensor(
+        [[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_FREE]] * 4,
+        dtype=torch.long,
+    )
+    fresh_adjacency = torch.rand(4, 4, 4)
+    repertoire = SimulationRepertoire.empty(num_nodes=4, max_cases=8)
+    rl_positions = torch.rand(4, 4, 2) + 10.0
+    rl_adjacency = torch.rand(4, 4, 4)
+    repertoire.add(
+        rl_positions,
+        fresh_roles,
+        rl_adjacency,
+        torch.eye(3).repeat(4, 1, 1),
+        source_code=SOURCE_RL,
+    )
+
+    teacher_positions, _, _ = _sample_mixed_supervised_teachers(
+        fresh_positions,
+        fresh_roles,
+        fresh_adjacency,
+        repertoire,
+        device,
+    )
+
+    assert torch.allclose(teacher_positions[:2], fresh_positions[:2])
+    assert torch.all(teacher_positions[2:] > 1.0)
+
+
+def test_mixed_rl_targets_use_random_initialization_and_rl_repertoire_halves() -> None:
+    device = torch.device("cpu")
+    repertoire = SimulationRepertoire.empty(num_nodes=4, max_cases=8)
+    positions = torch.rand(1, 4, 2)
+    roles = torch.tensor(
+        [[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_FREE]],
+        dtype=torch.long,
+    )
+    adjacency = torch.rand(1, 4, 4)
+    random_initialization_stiffness = torch.eye(3).repeat(1, 1, 1)
+    rl_stiffness = 2.0 * torch.eye(3).repeat(1, 1, 1)
+    repertoire.add(
+        positions,
+        roles,
+        adjacency,
+        random_initialization_stiffness,
+        source_code=SOURCE_RANDOM_INITIALIZATION,
+    )
+    repertoire.add(
+        positions + 1.0,
+        roles,
+        adjacency,
+        rl_stiffness,
+        source_code=SOURCE_RL,
+    )
+
+    targets = _sample_mixed_rl_targets(4, device, repertoire)
+
+    assert torch.allclose(
+        targets[:2],
+        random_initialization_stiffness.expand(2, -1, -1),
+    )
+    assert torch.allclose(targets[2:], rl_stiffness.expand(2, -1, -1))
 
 
 def test_matrix_loss_is_zero_for_exact_match_under_characteristic_scaling() -> None:
