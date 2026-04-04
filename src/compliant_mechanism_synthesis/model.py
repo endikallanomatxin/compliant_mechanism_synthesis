@@ -147,9 +147,13 @@ class GraphRefinementModel(nn.Module):
         self.displacement_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
             nn.Linear(d_model, 2),
         )
         self.node_latent_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, node_effect_dim),
