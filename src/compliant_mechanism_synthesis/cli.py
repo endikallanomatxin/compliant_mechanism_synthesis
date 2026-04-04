@@ -54,7 +54,7 @@ class TrainConfig:
     node_effect_dim: int = 64
 
     # Optimization.
-    batch_size: int = 128
+    batch_size: int = 64
     gradient_accumulation_steps: int = 4
     train_steps: int = 20_000
     learning_rate: float = 2e-5
@@ -63,7 +63,7 @@ class TrainConfig:
 
     # Rollout refinement.
     rollout_steps: int = 8
-    position_step_size: float = 0.05
+    position_step_size: float = 0.1
     connectivity_step_size: float = 0.1
     # Position noise is in normalized workspace units, where 1.0 is the full domain width.
     rollout_position_noise: float = 0.01
@@ -71,7 +71,7 @@ class TrainConfig:
     rollout_connectivity_noise: float = 0.04
 
     # Supervised denoising.
-    supervised_denoising_weight: float = 4.0
+    supervised_denoising_weight: float = 1.0
     supervised_position_weight: float = 1.0
     supervised_adjacency_weight: float = 1.0
     # Position noise is in normalized workspace units.
@@ -88,7 +88,7 @@ class TrainConfig:
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
     benchmark_case_count: int = 4
-    rl_target_noise_scale: float = 0.05
+    rl_target_noise_scale: float = 0.1
 
     # Loss weights.
     property_weight: float = 1.0
@@ -1106,7 +1106,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
     log_dir = Path(writer.log_dir)
     checkpoint_path = Path(config.checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    global_step = 0
+    optimizer_step = 0
     running_totals = {
         "total": 0.0,
         "property": 0.0,
@@ -1397,9 +1397,12 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             continue
         (total / gradient_accumulation_steps).backward()
+        did_optimizer_step = False
         if step % gradient_accumulation_steps == 0 or step == train_steps:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            optimizer_step += 1
+            did_optimizer_step = True
 
         running_totals["total"] += total.item()
         running_counts["total"] += 1
@@ -1440,84 +1443,88 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             running_counts["max_free_position_update"] += 1
             running_counts["mean_connectivity_update"] += 1
 
-        if config.log_every_steps > 0 and (
+        should_log_window = config.log_every_steps > 0 and (
             step % config.log_every_steps == 0 or step == train_steps
-        ):
+        )
+        if should_log_window:
             total_mean = running_totals["total"] / max(running_counts["total"], 1)
-            writer.add_scalar("train/total_loss", total_mean, global_step)
-            writer.add_scalar("train/learning_rate", scheduled_lr, global_step)
-            writer.add_text("train/phase", phase, global_step)
-            writer.add_scalar("train/repertoire_size", len(repertoire), global_step)
+            writer.add_scalar("train/total_loss", total_mean, step)
+            writer.add_scalar("train/learning_rate", scheduled_lr, step)
+            writer.add_text("train/phase", phase, step)
+            writer.add_scalar("train/repertoire_size", len(repertoire), step)
+            writer.add_scalar("train/micro_step", float(step), step)
+            writer.add_scalar(
+                "train/optimizer_step",
+                float(optimizer_step),
+                step,
+            )
             if running_counts["supervised"] > 0:
                 writer.add_scalar(
                     "train/supervised_loss",
                     running_totals["supervised"] / running_counts["supervised"],
-                    global_step,
+                    step,
                 )
                 writer.add_scalar(
                     "train/supervised_position_loss",
                     running_totals["supervised_position"]
                     / running_counts["supervised_position"],
-                    global_step,
+                    step,
                 )
                 writer.add_scalar(
                     "train/supervised_adjacency_loss",
                     running_totals["supervised_adjacency"]
                     / running_counts["supervised_adjacency"],
-                    global_step,
+                    step,
                 )
             if running_counts["property"] > 0:
                 writer.add_scalar(
                     "train/property_loss",
                     running_totals["property"] / running_counts["property"],
-                    global_step,
+                    step,
                 )
                 writer.add_scalar(
                     "train/rollout_continuous_improvement_loss",
                     running_totals["rollout_continuous_improvement"]
                     / running_counts["rollout_continuous_improvement"],
-                    global_step,
+                    step,
                 )
                 writer.add_scalar(
                     "train/stress_loss",
                     running_totals["stress"] / running_counts["stress"],
-                    global_step,
+                    step,
                 )
                 writer.add_scalar(
                     "metrics/max_von_mises_stress",
                     running_totals["max_von_mises_stress"]
                     / running_counts["max_von_mises_stress"],
-                    global_step,
+                    step,
                 )
                 writer.add_scalar(
                     "metrics/max_stress_ratio",
                     running_totals["max_stress_ratio"]
                     / running_counts["max_stress_ratio"],
-                    global_step,
+                    step,
                 )
                 writer.add_scalar(
                     "metrics/mean_free_position_update",
                     running_totals["mean_free_position_update"]
                     / running_counts["mean_free_position_update"],
-                    global_step,
+                    step,
                 )
                 writer.add_scalar(
                     "metrics/max_free_position_update",
                     running_totals["max_free_position_update"]
                     / running_counts["max_free_position_update"],
-                    global_step,
+                    step,
                 )
                 writer.add_scalar(
                     "metrics/mean_connectivity_update",
                     running_totals["mean_connectivity_update"]
                     / running_counts["mean_connectivity_update"],
-                    global_step,
+                    step,
                 )
-        global_step += 1
 
-        if config.log_every_steps > 0 and (
-            step % config.log_every_steps == 0 or step == train_steps
-        ):
+        if should_log_window:
             window = (
                 config.log_every_steps
                 if step % config.log_every_steps == 0
@@ -1526,7 +1533,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             if window == 0:
                 window = config.log_every_steps
             _progress(
-                f"train:step {step}/{train_steps} phase={phase} total={total.item():.4f} prop={property_loss.item():.4f} stress={stress_loss.item():.4f} sup={supervised_loss.item():.4f} rep={len(repertoire)}"
+                f"train:step {step}/{train_steps} opt={optimizer_step} phase={phase} total={total.item():.4f} prop={property_loss.item():.4f} stress={stress_loss.item():.4f} sup={supervised_loss.item():.4f} rep={len(repertoire)}"
             )
             for key in running_totals:
                 running_totals[key] = 0.0
@@ -1534,7 +1541,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
 
         if (
             config.canonical_eval_every_steps > 0
-            and global_step % config.canonical_eval_every_steps == 0
+            and step % config.canonical_eval_every_steps == 0
         ):
             model.eval()
             with torch.no_grad():
@@ -1542,13 +1549,13 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     writer,
                     model,
                     config,
-                    global_step,
+                    step,
                     device,
                     repertoire,
                     (
                         log_dir / "animations"
                         if config.animation_every_steps > 0
-                        and global_step % config.animation_every_steps == 0
+                        and step % config.animation_every_steps == 0
                         else None
                     ),
                 )
@@ -1556,7 +1563,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     writer,
                     model,
                     config,
-                    global_step,
+                    step,
                     device,
                     repertoire,
                 )
