@@ -176,6 +176,25 @@ def test_stiffness_target_sampling_from_repertoire_is_positive_definite() -> Non
     assert torch.all(eigenvalues > -5e-2)
 
 
+def test_stiffness_target_sampling_with_noise_stays_positive_definite() -> None:
+    random.seed(7)
+    torch.manual_seed(7)
+    repertoire = _bootstrap_repertoire(
+        TrainConfig(batch_size=8, repertoire_bootstrap_cases=24, repertoire_max_cases=32),
+        torch.device("cpu"),
+    )
+    sampled = repertoire.sample_target_stiffness(
+        8,
+        torch.device("cpu"),
+        target_noise_scale=0.1,
+    )
+    eigenvalues = torch.linalg.eigvalsh(sampled)
+
+    assert sampled.shape == (8, 3, 3)
+    assert torch.allclose(sampled, sampled.transpose(1, 2))
+    assert torch.all(eigenvalues > -5e-2)
+
+
 def test_repertoire_add_discards_nonfinite_cases() -> None:
     repertoire = SimulationRepertoire.empty(num_nodes=4, max_cases=8)
     positions = torch.rand(2, 4, 2)
@@ -270,13 +289,45 @@ def test_mixed_rl_targets_use_random_initialization_and_rl_repertoire_halves() -
         source_code=SOURCE_RL,
     )
 
-    targets = _sample_mixed_rl_targets(4, device, repertoire)
+    targets = _sample_mixed_rl_targets(4, device, repertoire, target_noise_scale=0.0)
 
     assert torch.allclose(
         targets[:2],
         random_initialization_stiffness.expand(2, -1, -1),
     )
     assert torch.allclose(targets[2:], rl_stiffness.expand(2, -1, -1))
+
+
+def test_mixed_rl_targets_apply_target_noise() -> None:
+    device = torch.device("cpu")
+    repertoire = SimulationRepertoire.empty(num_nodes=4, max_cases=8)
+    positions = torch.rand(2, 4, 2)
+    roles = torch.tensor(
+        [[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_FREE]] * 2,
+        dtype=torch.long,
+    )
+    adjacency = torch.rand(2, 4, 4)
+    repertoire.add(
+        positions[:1],
+        roles[:1],
+        adjacency[:1],
+        torch.eye(3).unsqueeze(0),
+        source_code=SOURCE_RANDOM_INITIALIZATION,
+    )
+    repertoire.add(
+        positions[1:],
+        roles[1:],
+        adjacency[1:],
+        (2.0 * torch.eye(3)).unsqueeze(0),
+        source_code=SOURCE_RL,
+    )
+
+    torch.manual_seed(7)
+    targets = _sample_mixed_rl_targets(4, device, repertoire, target_noise_scale=0.1)
+
+    assert torch.allclose(targets, targets.transpose(1, 2))
+    assert torch.all(torch.linalg.eigvalsh(targets) > -5e-2)
+    assert not torch.allclose(targets[:2], torch.eye(3).expand(2, -1, -1))
 
 
 def test_matrix_loss_is_zero_for_exact_match_under_characteristic_scaling() -> None:

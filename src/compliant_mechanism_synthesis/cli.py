@@ -87,6 +87,7 @@ class TrainConfig:
     repertoire_bootstrap_cases: int = 512
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
+    rl_target_noise_scale: float = 0.05
 
     # Loss weights.
     property_weight: float = 1.0
@@ -256,6 +257,7 @@ def _sample_mixed_rl_targets(
     batch_size: int,
     device: torch.device,
     repertoire: SimulationRepertoire,
+    target_noise_scale: float,
 ) -> torch.Tensor:
     random_initialization_count = batch_size // 2
     rl_count = batch_size - random_initialization_count
@@ -267,6 +269,7 @@ def _sample_mixed_rl_targets(
                 device,
                 FrameFEMConfig(),
                 source_codes=(SOURCE_RANDOM_INITIALIZATION,),
+                target_noise_scale=target_noise_scale,
             )
         )
     if rl_count > 0:
@@ -276,6 +279,7 @@ def _sample_mixed_rl_targets(
                 device,
                 FrameFEMConfig(),
                 source_codes=(SOURCE_RL,),
+                target_noise_scale=target_noise_scale,
             )
         )
     return torch.cat(targets, dim=0)
@@ -1001,6 +1005,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 config.batch_size,
                 device,
                 repertoire,
+                config.rl_target_noise_scale,
             )
             raw_targets = goal_targets
             base_time = torch.rand((positions.shape[0],), device=device)
@@ -1786,6 +1791,11 @@ def _train_parser() -> argparse.ArgumentParser:
         "--canonical-case-count",
         type=int,
         default=defaults.canonical_case_count,
+    )
+    parser.add_argument(
+        "--rl-target-noise-scale",
+        type=float,
+        default=defaults.rl_target_noise_scale,
     )
     parser.add_argument(
         "--min-beam-length", type=float, default=defaults.min_beam_length

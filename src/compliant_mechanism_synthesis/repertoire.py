@@ -39,6 +39,16 @@ def _upper_triangular_components(matrices: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _source_mask(
+    source: torch.Tensor,
+    source_codes: tuple[int, ...] | None,
+) -> torch.Tensor:
+    if source_codes is None:
+        return torch.ones_like(source, dtype=torch.bool)
+    source_codes_tensor = torch.tensor(source_codes, dtype=source.dtype)
+    return (source[:, None] == source_codes_tensor[None, :]).any(dim=1)
+
+
 def _project_positive_definite(matrices: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
     symmetric = 0.5 * (matrices + matrices.transpose(1, 2))
     eigenvalues, eigenvectors = torch.linalg.eigh(symmetric)
@@ -165,11 +175,15 @@ class SimulationRepertoire:
     def normalized_components(
         self,
         frame_config: FrameFEMConfig | None = None,
+        source_codes: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         if len(self) == 0:
             return torch.empty((0, 6), dtype=torch.float32)
+        source_mask = _source_mask(self.source, source_codes)
+        if not source_mask.any():
+            return torch.empty((0, 6), dtype=torch.float32)
         normalized = normalize_generalized_stiffness_matrix(
-            self.stiffness,
+            self.stiffness[source_mask],
             characteristic_scales(frame_config),
         )
         components = _upper_triangular_components(normalized)
@@ -184,16 +198,10 @@ class SimulationRepertoire:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(self) == 0:
             raise RuntimeError("cannot sample from an empty simulation repertoire")
-        if source_codes is None:
+        candidate_mask = _source_mask(self.source, source_codes)
+        candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+        if candidate_indices.numel() == 0:
             candidate_indices = torch.arange(len(self))
-        else:
-            source_codes_tensor = torch.tensor(source_codes, dtype=self.source.dtype)
-            candidate_mask = (self.source[:, None] == source_codes_tensor[None, :]).any(
-                dim=1
-            )
-            candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
-            if candidate_indices.numel() == 0:
-                candidate_indices = torch.arange(len(self))
         selection = torch.randint(candidate_indices.shape[0], (batch_size,))
         indices = candidate_indices.index_select(0, selection)
         return (
@@ -209,16 +217,12 @@ class SimulationRepertoire:
         device: torch.device,
         frame_config: FrameFEMConfig | None = None,
         source_codes: tuple[int, ...] | None = None,
+        target_noise_scale: float = 0.0,
     ) -> torch.Tensor:
         if len(self) == 0:
             raise RuntimeError("cannot sample target stiffness from an empty repertoire")
         finite_stiffness_mask = torch.isfinite(self.stiffness).all(dim=(1, 2))
-        if source_codes is not None:
-            source_codes_tensor = torch.tensor(source_codes, dtype=self.source.dtype)
-            source_mask = (self.source[:, None] == source_codes_tensor[None, :]).any(
-                dim=1
-            )
-            finite_stiffness_mask = finite_stiffness_mask & source_mask
+        finite_stiffness_mask = finite_stiffness_mask & _source_mask(self.source, source_codes)
         finite_stiffness = self.stiffness[finite_stiffness_mask]
         if finite_stiffness.shape[0] == 0:
             return self.sample_target_stiffness(
@@ -226,20 +230,53 @@ class SimulationRepertoire:
                 device,
                 frame_config,
                 source_codes=None,
+                target_noise_scale=target_noise_scale,
             )
         if finite_stiffness.shape[0] == 1:
-            return finite_stiffness[:1].expand(batch_size, -1, -1).to(device)
-        if source_codes is None:
-            components = self.normalized_components(frame_config)
-        else:
-            normalized = normalize_generalized_stiffness_matrix(
-                finite_stiffness,
+            sampled = finite_stiffness[:1].expand(batch_size, -1, -1).to(device)
+            if target_noise_scale <= 0.0:
+                return sampled
+            components = self.normalized_components(frame_config, source_codes)
+            component_std = components.std(dim=0, unbiased=False) if components.shape[0] > 0 else torch.ones((6,), dtype=sampled.dtype)
+            normalized_sampled = normalize_generalized_stiffness_matrix(
+                sampled,
                 characteristic_scales(frame_config),
             )
-            components = _upper_triangular_components(normalized)
+            sampled_components = _upper_triangular_components(normalized_sampled)
+            jitter = torch.randn_like(sampled_components) * (
+                target_noise_scale * component_std.to(device=sampled.device, dtype=sampled.dtype)
+            )
+            return _project_positive_definite(
+                denormalize_generalized_stiffness_matrix(
+                    unique_values_to_symmetric_matrix(sampled_components + jitter, size=3),
+                    characteristic_scales(frame_config),
+                )
+            )
+        components = self.normalized_components(frame_config, source_codes)
         if components.shape[0] < 2 or not torch.isfinite(components).all():
             indices = torch.randint(finite_stiffness.shape[0], (batch_size,))
-            return finite_stiffness.index_select(0, indices).to(device)
+            sampled = finite_stiffness.index_select(0, indices).to(device)
+            if target_noise_scale <= 0.0:
+                return sampled
+            components = self.normalized_components(frame_config)
+            if components.shape[0] == 0:
+                return sampled
+            normalized_sampled = normalize_generalized_stiffness_matrix(
+                sampled,
+                characteristic_scales(frame_config),
+            )
+            sampled_components = _upper_triangular_components(normalized_sampled)
+            component_std = components.std(dim=0, unbiased=False).to(
+                device=sampled.device,
+                dtype=sampled.dtype,
+            )
+            jitter = torch.randn_like(sampled_components) * (target_noise_scale * component_std)
+            return _project_positive_definite(
+                denormalize_generalized_stiffness_matrix(
+                    unique_values_to_symmetric_matrix(sampled_components + jitter, size=3),
+                    characteristic_scales(frame_config),
+                )
+            )
         mean = components.mean(dim=0)
         centered = components - mean
         covariance = centered.transpose(0, 1) @ centered / max(components.shape[0] - 1, 1)
@@ -254,6 +291,11 @@ class SimulationRepertoire:
             covariance_matrix=covariance.to(device),
         )
         sampled_components = distribution.sample((batch_size,))
+        if target_noise_scale > 0.0:
+            component_std = components.std(dim=0, unbiased=False).to(device)
+            sampled_components = sampled_components + torch.randn_like(sampled_components) * (
+                target_noise_scale * component_std
+            )
         normalized_targets = unique_values_to_symmetric_matrix(
             sampled_components,
             size=3,
