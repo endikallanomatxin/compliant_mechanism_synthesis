@@ -292,8 +292,14 @@ def test_mixed_supervised_teachers_use_fresh_and_rl_repertoire_halves() -> None:
         device,
     )
 
-    assert torch.allclose(teacher_positions[:2], fresh_positions[:2])
-    assert torch.all(teacher_positions[2:] > 1.0)
+    fresh_matches = torch.isclose(
+        teacher_positions[:, None, :, :],
+        fresh_positions[None, :2, :, :],
+    ).all(dim=-1).all(dim=-1).any(dim=1)
+    rl_matches = (teacher_positions > 1.0).all(dim=-1).all(dim=-1)
+
+    assert fresh_matches.sum().item() == 2
+    assert rl_matches.sum().item() == 2
 
 
 def test_mixed_rl_targets_use_random_initialization_and_rl_repertoire_halves() -> None:
@@ -324,11 +330,17 @@ def test_mixed_rl_targets_use_random_initialization_and_rl_repertoire_halves() -
 
     targets = _sample_mixed_rl_targets(4, device, repertoire, target_noise_scale=0.0)
 
-    assert torch.allclose(
-        targets[:2],
-        random_initialization_stiffness.expand(2, -1, -1),
-    )
-    assert torch.allclose(targets[2:], rl_stiffness.expand(2, -1, -1))
+    random_matches = torch.isclose(
+        targets,
+        random_initialization_stiffness.expand_as(targets),
+    ).all(dim=-1).all(dim=-1)
+    rl_matches = torch.isclose(
+        targets,
+        rl_stiffness.expand_as(targets),
+    ).all(dim=-1).all(dim=-1)
+
+    assert random_matches.sum().item() == 2
+    assert rl_matches.sum().item() == 2
 
 
 def test_mixed_rl_targets_apply_target_noise() -> None:
@@ -373,7 +385,7 @@ def test_mixed_rl_starts_use_fresh_random_init_and_rl_sources() -> None:
     fresh_adjacency = torch.rand(6, 4, 4)
     repertoire = SimulationRepertoire.empty(num_nodes=4, max_cases=8)
     repertoire.add(
-        torch.rand(2, 4, 2) + 10.0,
+        torch.rand(2, 4, 2) + 2.0,
         fresh_roles[:2],
         torch.rand(2, 4, 4),
         torch.eye(3).repeat(2, 1, 1),
@@ -400,9 +412,16 @@ def test_mixed_rl_starts_use_fresh_random_init_and_rl_sources() -> None:
     assert positions.shape == fresh_positions.shape
     assert roles.shape == fresh_roles.shape
     assert adjacency.shape == fresh_adjacency.shape
-    assert torch.allclose(positions[:2], fresh_positions[:2])
-    assert torch.all(positions[2:4] > 1.0)
-    assert torch.all(positions[4:] > 10.0)
+    fresh_matches = torch.isclose(
+        positions[:, None, :, :],
+        fresh_positions[None, :2, :, :],
+    ).all(dim=-1).all(dim=-1).any(dim=1)
+    random_matches = ((positions > 1.0) & (positions < 10.0)).all(dim=-1).all(dim=-1)
+    rl_matches = (positions > 10.0).all(dim=-1).all(dim=-1)
+
+    assert fresh_matches.sum().item() == 2
+    assert random_matches.sum().item() == 2
+    assert rl_matches.sum().item() == 2
 
 
 def test_matrix_loss_is_zero_for_exact_match_under_characteristic_scaling() -> None:

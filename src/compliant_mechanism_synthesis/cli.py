@@ -247,10 +247,14 @@ def _sample_mixed_supervised_teachers(
         teacher_positions.append(rl_positions)
         teacher_roles.append(rl_roles)
         teacher_adjacency.append(rl_adjacency)
+    positions = torch.cat(teacher_positions, dim=0)
+    roles = torch.cat(teacher_roles, dim=0)
+    adjacency = torch.cat(teacher_adjacency, dim=0)
+    permutation = torch.randperm(batch_size, device=device)
     return (
-        torch.cat(teacher_positions, dim=0),
-        torch.cat(teacher_roles, dim=0),
-        torch.cat(teacher_adjacency, dim=0),
+        positions.index_select(0, permutation),
+        roles.index_select(0, permutation),
+        adjacency.index_select(0, permutation),
     )
 
 
@@ -283,7 +287,9 @@ def _sample_mixed_rl_targets(
                 target_noise_scale=target_noise_scale,
             )
         )
-    return torch.cat(targets, dim=0)
+    targets_tensor = torch.cat(targets, dim=0)
+    permutation = torch.randperm(batch_size, device=device)
+    return targets_tensor.index_select(0, permutation)
 
 
 def _sample_mixed_rl_starts(
@@ -340,10 +346,14 @@ def _sample_mixed_rl_starts(
         start_roles.append(rl_roles)
         start_adjacency.append(rl_adjacency)
 
+    positions = torch.cat(start_positions, dim=0)
+    roles = torch.cat(start_roles, dim=0)
+    adjacency = torch.cat(start_adjacency, dim=0)
+    permutation = torch.randperm(batch_size, device=device)
     return (
-        torch.cat(start_positions, dim=0),
-        torch.cat(start_roles, dim=0),
-        torch.cat(start_adjacency, dim=0),
+        positions.index_select(0, permutation),
+        roles.index_select(0, permutation),
+        adjacency.index_select(0, permutation),
     )
 
 
