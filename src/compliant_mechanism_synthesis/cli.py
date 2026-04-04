@@ -59,25 +59,25 @@ class TrainConfig:
     train_steps: int = 20_000
     learning_rate: float = 2e-5
     learning_rate_warmup_steps: int = 100
-    learning_rate_min_scale: float = 0.05
+    learning_rate_min_scale: float = 0.01
 
     # Rollout refinement.
     rollout_steps: int = 4
     position_step_size: float = 0.1
     connectivity_step_size: float = 0.1
     # Position noise is in normalized workspace units, where 1.0 is the full domain width.
-    rollout_position_noise: float = 0.01
+    rollout_position_noise: float = 0.02
     # Connectivity noise is in continuous edge-activation units.
-    rollout_connectivity_noise: float = 0.04
+    rollout_connectivity_noise: float = 0.08
 
     # Supervised denoising.
     supervised_denoising_weight: float = 1.0
     supervised_position_weight: float = 1.0
     supervised_adjacency_weight: float = 1.0
     # Position noise is in normalized workspace units.
-    supervised_position_noise: float = 0.02
+    supervised_position_noise: float = 0.04
     # Connectivity noise is in continuous edge-activation units.
-    supervised_connectivity_noise: float = 0.08
+    supervised_connectivity_noise: float = 0.16
     supervised_every_steps: int = 1
     supervised_priority_start: int = 3
     supervised_priority_end: int = 1
@@ -88,7 +88,7 @@ class TrainConfig:
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
     benchmark_case_count: int = 4
-    rl_target_noise_scale: float = 0.1
+    rl_target_noise_scale: float = 0.2
 
     # Loss weights.
     property_weight: float = 1.0
@@ -983,6 +983,7 @@ def _log_benchmark_evaluation(
     step: int,
     device: torch.device,
     repertoire: SimulationRepertoire,
+    animation_output_dir: Path | None = None,
 ) -> None:
     started_at = time.perf_counter()
     benchmark_specs = _sample_benchmark_specs(
@@ -1004,6 +1005,7 @@ def _log_benchmark_evaluation(
     raw_targets = torch.stack([values for _, values in benchmark_specs], dim=0).to(
         device
     )
+    target_responses = _stiffness_to_response(raw_targets)
     base_time = torch.ones((len(benchmark_specs),), device=device)
     rollout = rollout_refinement(
         model,
@@ -1080,6 +1082,33 @@ def _log_benchmark_evaluation(
         torch.stack(benchmark_stress_losses).mean().item(),
         step,
     )
+    if animation_output_dir is not None:
+        animation_name = "benchmark_grid"
+        _progress(f"train:animation start step={step} name={animation_name}")
+        animation_rollout = []
+        for state in rollout:
+            animation_rollout.append(
+                {
+                    key: value
+                    for key, value in state.items()
+                    if isinstance(value, torch.Tensor)
+                }
+            )
+        animation_path = export_canonical_animation(
+            animation_output_dir / f"step_{step:05d}_{animation_name}.gif",
+            positions,
+            roles,
+            adjacency,
+            animation_rollout,
+            target_responses,
+            [name for name, _ in benchmark_specs],
+            display_scale=config.display_animation_scale,
+            threshold=_visualization_threshold(),
+            frame_config=FrameFEMConfig(),
+            final_positions=final_state["refined_positions"],
+            final_adjacency=final_state["refined_adjacency"],
+        )
+        _progress(f"train:animation done step={step} path={animation_path}")
     _progress(
         f"train:benchmark done step={step} dt={time.perf_counter() - started_at:.2f}s"
     )
@@ -1576,6 +1605,12 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     step,
                     device,
                     repertoire,
+                    (
+                        log_dir / "animations"
+                        if config.animation_every_steps > 0
+                        and step % config.animation_every_steps == 0
+                        else None
+                    ),
                 )
             model.train()
 
