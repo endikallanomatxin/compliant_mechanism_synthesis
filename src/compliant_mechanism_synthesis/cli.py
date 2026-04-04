@@ -285,6 +285,67 @@ def _sample_mixed_rl_targets(
     return torch.cat(targets, dim=0)
 
 
+def _sample_mixed_rl_starts(
+    fresh_positions: torch.Tensor,
+    fresh_roles: torch.Tensor,
+    fresh_adjacency: torch.Tensor,
+    repertoire: SimulationRepertoire,
+    device: torch.device,
+    position_noise_scale: float,
+    connectivity_noise_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = fresh_positions.shape[0]
+    fresh_count = batch_size // 3 + (1 if batch_size % 3 > 0 else 0)
+    random_initialization_count = batch_size // 3 + (1 if batch_size % 3 > 1 else 0)
+    rl_count = batch_size - fresh_count - random_initialization_count
+
+    start_positions = [fresh_positions[:fresh_count]]
+    start_roles = [fresh_roles[:fresh_count]]
+    start_adjacency = [fresh_adjacency[:fresh_count]]
+
+    if random_initialization_count > 0:
+        random_positions, random_roles, random_adjacency, _ = repertoire.sample_cases(
+            random_initialization_count,
+            device,
+            source_codes=(SOURCE_RANDOM_INITIALIZATION,),
+        )
+        random_positions, random_adjacency = _inject_rollout_noise(
+            random_positions,
+            random_roles,
+            random_adjacency,
+            torch.ones((random_initialization_count,), device=device),
+            position_noise_scale=position_noise_scale,
+            connectivity_noise_scale=connectivity_noise_scale,
+        )
+        start_positions.append(random_positions)
+        start_roles.append(random_roles)
+        start_adjacency.append(random_adjacency)
+
+    if rl_count > 0:
+        rl_positions, rl_roles, rl_adjacency, _ = repertoire.sample_cases(
+            rl_count,
+            device,
+            source_codes=(SOURCE_RL,),
+        )
+        rl_positions, rl_adjacency = _inject_rollout_noise(
+            rl_positions,
+            rl_roles,
+            rl_adjacency,
+            torch.ones((rl_count,), device=device),
+            position_noise_scale=position_noise_scale,
+            connectivity_noise_scale=connectivity_noise_scale,
+        )
+        start_positions.append(rl_positions)
+        start_roles.append(rl_roles)
+        start_adjacency.append(rl_adjacency)
+
+    return (
+        torch.cat(start_positions, dim=0),
+        torch.cat(start_roles, dim=0),
+        torch.cat(start_adjacency, dim=0),
+    )
+
+
 def _bootstrap_repertoire(
     config: TrainConfig,
     device: torch.device,
@@ -1000,7 +1061,15 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             total = supervised_loss
         else:
-            positions, roles, adjacency = fresh_positions, fresh_roles, fresh_adjacency
+            positions, roles, adjacency = _sample_mixed_rl_starts(
+                fresh_positions,
+                fresh_roles,
+                fresh_adjacency,
+                repertoire,
+                device,
+                position_noise_scale=config.rollout_position_noise,
+                connectivity_noise_scale=config.rollout_connectivity_noise,
+            )
             goal_targets = _sample_mixed_rl_targets(
                 config.batch_size,
                 device,

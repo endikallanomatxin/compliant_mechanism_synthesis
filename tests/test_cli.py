@@ -15,6 +15,7 @@ from compliant_mechanism_synthesis.cli import (
     _resolve_sample_seed,
     _sample_target_stiffnesses,
     _sample_mixed_rl_targets,
+    _sample_mixed_rl_starts,
     _sample_mixed_supervised_teachers,
     _scheduled_learning_rate,
     _scheduled_supervised_priority,
@@ -328,6 +329,48 @@ def test_mixed_rl_targets_apply_target_noise() -> None:
     assert torch.allclose(targets, targets.transpose(1, 2))
     assert torch.all(torch.linalg.eigvalsh(targets) > -5e-2)
     assert not torch.allclose(targets[:2], torch.eye(3).expand(2, -1, -1))
+
+
+def test_mixed_rl_starts_use_fresh_random_init_and_rl_sources() -> None:
+    device = torch.device("cpu")
+    fresh_positions = torch.rand(6, 4, 2)
+    fresh_roles = torch.tensor(
+        [[ROLE_FIXED, ROLE_FIXED, ROLE_MOBILE, ROLE_FREE]] * 6,
+        dtype=torch.long,
+    )
+    fresh_adjacency = torch.rand(6, 4, 4)
+    repertoire = SimulationRepertoire.empty(num_nodes=4, max_cases=8)
+    repertoire.add(
+        torch.rand(2, 4, 2) + 10.0,
+        fresh_roles[:2],
+        torch.rand(2, 4, 4),
+        torch.eye(3).repeat(2, 1, 1),
+        source_code=SOURCE_RANDOM_INITIALIZATION,
+    )
+    repertoire.add(
+        torch.rand(2, 4, 2) + 20.0,
+        fresh_roles[:2],
+        torch.rand(2, 4, 4),
+        2.0 * torch.eye(3).repeat(2, 1, 1),
+        source_code=SOURCE_RL,
+    )
+
+    positions, roles, adjacency = _sample_mixed_rl_starts(
+        fresh_positions,
+        fresh_roles,
+        fresh_adjacency,
+        repertoire,
+        device,
+        position_noise_scale=0.0,
+        connectivity_noise_scale=0.0,
+    )
+
+    assert positions.shape == fresh_positions.shape
+    assert roles.shape == fresh_roles.shape
+    assert adjacency.shape == fresh_adjacency.shape
+    assert torch.allclose(positions[:2], fresh_positions[:2])
+    assert torch.all(positions[2:4] > 1.0)
+    assert torch.all(positions[4:] > 10.0)
 
 
 def test_matrix_loss_is_zero_for_exact_match_under_characteristic_scaling() -> None:
