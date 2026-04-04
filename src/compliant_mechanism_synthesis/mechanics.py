@@ -34,8 +34,8 @@ class FrameFEMConfig:
     r_max: float = 1.5e-3
     stiffness_regularization: float = 1e-4
     yield_stress: float = 250e6
-    reference_force: float = 40.0
-    reference_moment: float = 20.0
+    reference_force: float = 20.0
+    reference_moment: float = 10.0
 
 
 @dataclass(frozen=True)
