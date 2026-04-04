@@ -62,7 +62,7 @@ class TrainConfig:
     learning_rate_min_scale: float = 0.05
 
     # Rollout refinement.
-    rollout_steps: int = 8
+    rollout_steps: int = 4
     position_step_size: float = 0.1
     connectivity_step_size: float = 0.1
     # Position noise is in normalized workspace units, where 1.0 is the full domain width.
@@ -93,8 +93,8 @@ class TrainConfig:
     # Loss weights.
     property_weight: float = 1.0
     stress_weight: float = 0.3
-    rollout_continuous_improvement_weight: float = 0.02
-    rollout_continuous_improvement_scale: float = 1e-4
+    rollout_continuous_improvement_weight: float = 0.0005
+    rollout_continuous_improvement_scale: float = 1e-3
     material_weight: float = 0.0
     sparsity_weight: float = 0.0
     connectivity_weight: float = 0.0
