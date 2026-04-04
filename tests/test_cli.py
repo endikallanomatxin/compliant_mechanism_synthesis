@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from compliant_mechanism_synthesis.cli import (
+    _blend_rl_targets_with_start_stiffness,
     _bootstrap_repertoire,
     _inject_rollout_noise,
     _mechanics_condition_matrices,
@@ -149,6 +150,28 @@ def test_rollout_continuous_improvement_loss_rewards_larger_improvements() -> No
 
     assert large_improvement < small_improvement
     assert regression > small_improvement
+
+
+def test_blend_rl_targets_with_start_stiffness_interpolates_convexly() -> None:
+    start_stiffness = torch.tensor(
+        [[[2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 4.0]]]
+    )
+    sampled_targets = torch.tensor(
+        [[[10.0, 1.0, 0.0], [1.0, 20.0, 0.0], [0.0, 0.0, 30.0]]]
+    )
+
+    assert torch.allclose(
+        _blend_rl_targets_with_start_stiffness(start_stiffness, sampled_targets, 0.0),
+        sampled_targets,
+    )
+    assert torch.allclose(
+        _blend_rl_targets_with_start_stiffness(start_stiffness, sampled_targets, 1.0),
+        start_stiffness,
+    )
+    assert torch.allclose(
+        _blend_rl_targets_with_start_stiffness(start_stiffness, sampled_targets, 0.25),
+        0.25 * start_stiffness + 0.75 * sampled_targets,
+    )
 
 
 def test_bootstrap_repertoire_contains_positive_definite_stiffness_cases() -> None:

@@ -57,7 +57,7 @@ class TrainConfig:
     batch_size: int = 64
     gradient_accumulation_steps: int = 4
     train_steps: int = 20_000
-    learning_rate: float = 2e-5
+    learning_rate: float = 2e-4
     learning_rate_warmup_steps: int = 100
     learning_rate_min_scale: float = 0.01
 
@@ -69,9 +69,14 @@ class TrainConfig:
     rollout_position_noise: float = 0.02
     # Connectivity noise is in continuous edge-activation units.
     rollout_connectivity_noise: float = 0.08
+    # Additional one-shot perturbation applied to all RL starts before the rollout begins.
+    # Position noise is in normalized workspace units.
+    rl_start_position_noise: float = 0.03
+    # Connectivity noise is in continuous edge-activation units.
+    rl_start_connectivity_noise: float = 0.12
 
     # Supervised denoising.
-    supervised_denoising_weight: float = 1.0
+    supervised_denoising_weight: float = 0.2
     supervised_position_weight: float = 1.0
     supervised_adjacency_weight: float = 1.0
     # Position noise is in normalized workspace units.
@@ -89,6 +94,7 @@ class TrainConfig:
     canonical_case_count: int = 6
     benchmark_case_count: int = 4
     rl_target_noise_scale: float = 0.2
+    rl_target_start_blend: float = 0.5
 
     # Loss weights.
     property_weight: float = 1.0
@@ -292,6 +298,25 @@ def _sample_mixed_rl_targets(
     return targets_tensor.index_select(0, permutation)
 
 
+def _blend_rl_targets_with_start_stiffness(
+    start_stiffness: torch.Tensor,
+    sampled_targets: torch.Tensor,
+    blend: float,
+) -> torch.Tensor:
+    blend = float(min(max(blend, 0.0), 1.0))
+    if blend <= 0.0:
+        return sampled_targets
+    if blend >= 1.0:
+        return start_stiffness
+    blended_targets = blend * start_stiffness + (1.0 - blend) * sampled_targets
+    finite_mask = torch.isfinite(blended_targets).all(dim=(1, 2))
+    if finite_mask.all():
+        return blended_targets
+    safe_targets = sampled_targets.clone()
+    safe_targets[finite_mask] = blended_targets[finite_mask]
+    return safe_targets
+
+
 def _sample_mixed_rl_starts(
     fresh_positions: torch.Tensor,
     fresh_roles: torch.Tensor,
@@ -300,6 +325,8 @@ def _sample_mixed_rl_starts(
     device: torch.device,
     position_noise_scale: float,
     connectivity_noise_scale: float,
+    rl_start_position_noise: float = 0.0,
+    rl_start_connectivity_noise: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = fresh_positions.shape[0]
     fresh_count = batch_size // 3 + (1 if batch_size % 3 > 0 else 0)
@@ -349,6 +376,15 @@ def _sample_mixed_rl_starts(
     positions = torch.cat(start_positions, dim=0)
     roles = torch.cat(start_roles, dim=0)
     adjacency = torch.cat(start_adjacency, dim=0)
+    if rl_start_position_noise > 0.0 or rl_start_connectivity_noise > 0.0:
+        positions, adjacency = _inject_rollout_noise(
+            positions,
+            roles,
+            adjacency,
+            torch.ones((batch_size,), device=device),
+            position_noise_scale=rl_start_position_noise,
+            connectivity_noise_scale=rl_start_connectivity_noise,
+        )
     permutation = torch.randperm(batch_size, device=device)
     return (
         positions.index_select(0, permutation),
@@ -1238,6 +1274,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 device,
                 position_noise_scale=config.rollout_position_noise,
                 connectivity_noise_scale=config.rollout_connectivity_noise,
+                rl_start_position_noise=config.rl_start_position_noise,
+                rl_start_connectivity_noise=config.rl_start_connectivity_noise,
             )
             goal_targets = _sample_mixed_rl_targets(
                 config.batch_size,
@@ -1245,7 +1283,13 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                 repertoire,
                 config.rl_target_noise_scale,
             )
-            raw_targets = goal_targets
+            with torch.no_grad():
+                start_terms = mechanical_terms(positions, roles, adjacency)
+            raw_targets = _blend_rl_targets_with_start_stiffness(
+                start_terms["stiffness_matrix"],
+                goal_targets,
+                config.rl_target_start_blend,
+            )
             base_time = torch.rand((positions.shape[0],), device=device)
             rollout = rollout_refinement(
                 model,
