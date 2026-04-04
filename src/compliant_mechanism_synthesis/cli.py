@@ -874,9 +874,9 @@ def _log_canonical_evaluation(
     stage_started_at = time.perf_counter()
     final_state = rollout[-1]
     final_terms = mechanical_terms(
-        final_state["positions"],
+        final_state["refined_positions"],
         roles,
-        final_state["adjacency"],
+        final_state["refined_adjacency"],
         geometry_config=geometry_config,
     )
     _progress(
@@ -886,9 +886,9 @@ def _log_canonical_evaluation(
     for idx, (name, _) in enumerate(canonical_specs):
         case_started_at = time.perf_counter()
         figure = plot_graph_design(
-            final_state["positions"][idx],
+            final_state["refined_positions"][idx],
             roles[idx],
-            final_state["adjacency"][idx],
+            final_state["refined_adjacency"][idx],
             threshold=_visualization_threshold(),
             title=name,
         )
@@ -945,8 +945,8 @@ def _log_canonical_evaluation(
             display_scale=config.display_animation_scale,
             threshold=_visualization_threshold(),
             frame_config=FrameFEMConfig(),
-            final_positions=final_state["positions"],
-            final_adjacency=final_state["adjacency"],
+            final_positions=final_state["refined_positions"],
+            final_adjacency=final_state["refined_adjacency"],
         )
         _progress(
             f"train:animation done step={step} dt={time.perf_counter() - animation_started_at:.2f}s path={animation_path}"
@@ -1021,9 +1021,9 @@ def _log_benchmark_evaluation(
     )
     final_state = rollout[-1]
     final_terms = mechanical_terms(
-        final_state["positions"],
+        final_state["refined_positions"],
         roles,
-        final_state["adjacency"],
+        final_state["refined_adjacency"],
         geometry_config=geometry_config,
     )
 
@@ -1031,9 +1031,9 @@ def _log_benchmark_evaluation(
     benchmark_stress_losses = []
     for idx, (name, _) in enumerate(benchmark_specs):
         figure = plot_graph_design(
-            final_state["positions"][idx],
+            final_state["refined_positions"][idx],
             roles[idx],
-            final_state["adjacency"][idx],
+            final_state["refined_adjacency"][idx],
             threshold=_visualization_threshold(),
             title=name,
         )
