@@ -67,7 +67,7 @@ class TrainConfig:
     rollout_connectivity_noise: float = 0.04
 
     # Supervised denoising.
-    supervised_denoising_weight: float = 0.4
+    supervised_denoising_weight: float = 1.2
     supervised_position_weight: float = 1.0
     supervised_adjacency_weight: float = 1.0
     # Position noise is in normalized workspace units.
@@ -87,7 +87,8 @@ class TrainConfig:
     # Loss weights.
     property_weight: float = 1.0
     stress_weight: float = 0.3
-    monotonic_improvement_weight: float = 0.2
+    rollout_continuous_improvement_weight: float = 0.02
+    rollout_continuous_improvement_scale: float = 1e-4
     material_weight: float = 0.0
     sparsity_weight: float = 0.0
     connectivity_weight: float = 0.0
@@ -502,11 +503,15 @@ def _inject_rollout_noise(
     return positions, adjacency
 
 
-def _monotonic_improvement_loss(step_errors: list[torch.Tensor]) -> torch.Tensor:
+def _rollout_continuous_improvement_loss(
+    step_errors: list[torch.Tensor],
+    scale: float,
+) -> torch.Tensor:
     if len(step_errors) < 2:
         return torch.zeros((), device=step_errors[0].device)
+    scale = max(scale, 1e-8)
     penalties = [
-        (current - previous).clamp_min(0.0)
+        F.softplus((current - previous) / scale)
         for previous, current in zip(step_errors[:-1], step_errors[1:])
     ]
     return torch.stack(penalties, dim=0).mean()
@@ -839,7 +844,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "total": 0.0,
         "property": 0.0,
         "stress": 0.0,
-        "monotonic": 0.0,
+        "rollout_continuous_improvement": 0.0,
         "supervised": 0.0,
         "supervised_position": 0.0,
         "supervised_adjacency": 0.0,
@@ -853,7 +858,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         "total": 0,
         "property": 0,
         "stress": 0,
-        "monotonic": 0,
+        "rollout_continuous_improvement": 0,
         "supervised": 0,
         "supervised_position": 0,
         "supervised_adjacency": 0,
@@ -883,7 +888,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         supervised_adjacency_loss = torch.zeros((), device=device)
         supervised_loss = torch.zeros((), device=device)
         stress_loss = torch.zeros((), device=device)
-        monotonic_loss = torch.zeros((), device=device)
+        rollout_continuous_improvement_loss = torch.zeros((), device=device)
         phase = _scheduled_training_phase(
             step,
             config.supervised_priority_start,
@@ -1035,7 +1040,10 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     + config.spread_weight * step_spread
                     + config.soft_domain_weight * step_soft_domain
                 )
-            monotonic_loss = _monotonic_improvement_loss(step_objectives)
+            rollout_continuous_improvement_loss = _rollout_continuous_improvement_loss(
+                step_objectives,
+                config.rollout_continuous_improvement_scale,
+            )
             final_step_terms = rollout[-1]["terms"]
             free_mask = roles == ROLE_FREE
             free_update_means = []
@@ -1072,7 +1080,8 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             total = (
                 config.property_weight * property_loss
                 + config.stress_weight * stress_loss
-                + config.monotonic_improvement_weight * monotonic_loss
+                + config.rollout_continuous_improvement_weight
+                * rollout_continuous_improvement_loss
                 + config.material_weight * material_loss
                 + config.sparsity_weight * sparsity_loss
                 + config.connectivity_weight * connectivity_loss
@@ -1119,7 +1128,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         else:
             running_totals["property"] += property_loss.item()
             running_totals["stress"] += stress_loss.item()
-            running_totals["monotonic"] += monotonic_loss.item()
+            running_totals["rollout_continuous_improvement"] += (
+                rollout_continuous_improvement_loss.item()
+            )
             running_totals["max_von_mises_stress"] += final_step_terms[
                 "max_von_mises_stress"
             ].mean().item()
@@ -1137,7 +1148,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             )
             running_counts["property"] += 1
             running_counts["stress"] += 1
-            running_counts["monotonic"] += 1
+            running_counts["rollout_continuous_improvement"] += 1
             running_counts["max_von_mises_stress"] += 1
             running_counts["max_stress_ratio"] += 1
             running_counts["mean_free_position_update"] += 1
@@ -1177,8 +1188,9 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                     global_step,
                 )
                 writer.add_scalar(
-                    "train/monotonic_improvement_loss",
-                    running_totals["monotonic"] / running_counts["monotonic"],
+                    "train/rollout_continuous_improvement_loss",
+                    running_totals["rollout_continuous_improvement"]
+                    / running_counts["rollout_continuous_improvement"],
                     global_step,
                 )
                 writer.add_scalar(
@@ -1634,9 +1646,14 @@ def _train_parser() -> argparse.ArgumentParser:
         default=defaults.stress_weight,
     )
     parser.add_argument(
-        "--monotonic-improvement-weight",
+        "--rollout-continuous-improvement-weight",
         type=float,
-        default=defaults.monotonic_improvement_weight,
+        default=defaults.rollout_continuous_improvement_weight,
+    )
+    parser.add_argument(
+        "--rollout-continuous-improvement-scale",
+        type=float,
+        default=defaults.rollout_continuous_improvement_scale,
     )
     parser.add_argument(
         "--material-weight", type=float, default=defaults.material_weight

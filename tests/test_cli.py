@@ -3,13 +3,14 @@ from __future__ import annotations
 import random
 
 import torch
+import torch.nn.functional as F
 
 from compliant_mechanism_synthesis.cli import (
     _bootstrap_repertoire,
     _inject_rollout_noise,
     _mechanics_condition_matrices,
     _matrix_loss,
-    _monotonic_improvement_loss,
+    _rollout_continuous_improvement_loss,
     _pure_noise_batch,
     _resolve_sample_seed,
     _sample_target_stiffnesses,
@@ -106,15 +107,40 @@ def test_apply_free_node_update_does_not_clamp_free_nodes() -> None:
     assert updated[0, 4, 1] > -0.15
 
 
-def test_monotonic_improvement_loss_penalizes_regressions_only() -> None:
+def test_rollout_continuous_improvement_loss_penalizes_regressions_more_than_improvements() -> None:
     errors = [
         torch.tensor(3.0),
         torch.tensor(2.0),
         torch.tensor(2.5),
         torch.tensor(1.0),
     ]
-    loss = _monotonic_improvement_loss(errors)
-    assert torch.isclose(loss, torch.tensor((0.0 + 0.5 + 0.0) / 3.0))
+    loss = _rollout_continuous_improvement_loss(errors, scale=0.1)
+    expected = torch.stack(
+        [
+            F.softplus(torch.tensor(-1.0 / 0.1)),
+            F.softplus(torch.tensor(0.5 / 0.1)),
+            F.softplus(torch.tensor(-1.5 / 0.1)),
+        ]
+    ).mean()
+    assert torch.isclose(loss, expected)
+
+
+def test_rollout_continuous_improvement_loss_rewards_larger_improvements() -> None:
+    small_improvement = _rollout_continuous_improvement_loss(
+        [torch.tensor(3.0), torch.tensor(2.9)],
+        scale=0.1,
+    )
+    large_improvement = _rollout_continuous_improvement_loss(
+        [torch.tensor(3.0), torch.tensor(2.0)],
+        scale=0.1,
+    )
+    regression = _rollout_continuous_improvement_loss(
+        [torch.tensor(3.0), torch.tensor(3.2)],
+        scale=0.1,
+    )
+
+    assert large_improvement < small_improvement
+    assert regression > small_improvement
 
 
 def test_bootstrap_repertoire_contains_positive_definite_stiffness_cases() -> None:
