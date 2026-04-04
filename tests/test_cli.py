@@ -17,6 +17,7 @@ from compliant_mechanism_synthesis.cli import (
     _sample_mixed_rl_targets,
     _sample_mixed_rl_starts,
     _sample_mixed_supervised_teachers,
+    _sample_benchmark_specs,
     _scheduled_learning_rate,
     _scheduled_supervised_priority,
     _scheduled_training_phase,
@@ -210,6 +211,21 @@ def test_repertoire_case_sampling_with_rarity_weights_returns_valid_shapes() -> 
     assert roles.shape == (6, repertoire.roles.shape[1])
     assert adjacency.shape == (6, repertoire.adjacency.shape[1], repertoire.adjacency.shape[2])
     assert stiffness.shape == (6, 3, 3)
+
+
+def test_sample_benchmark_specs_is_reproducible_for_fixed_seed() -> None:
+    repertoire = _bootstrap_repertoire(
+        TrainConfig(batch_size=8, repertoire_bootstrap_cases=24, repertoire_max_cases=32),
+        torch.device("cpu"),
+    )
+    specs_a = _sample_benchmark_specs(repertoire, torch.device("cpu"), 4, seed=123)
+    specs_b = _sample_benchmark_specs(repertoire, torch.device("cpu"), 4, seed=123)
+
+    assert [name for name, _ in specs_a] == [name for name, _ in specs_b]
+    assert torch.allclose(
+        torch.stack([matrix for _, matrix in specs_a]),
+        torch.stack([matrix for _, matrix in specs_b]),
+    )
 
 
 def test_repertoire_add_discards_nonfinite_cases() -> None:

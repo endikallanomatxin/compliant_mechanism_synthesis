@@ -71,7 +71,7 @@ class TrainConfig:
     rollout_connectivity_noise: float = 0.04
 
     # Supervised denoising.
-    supervised_denoising_weight: float = 1.2
+    supervised_denoising_weight: float = 4.0
     supervised_position_weight: float = 1.0
     supervised_adjacency_weight: float = 1.0
     # Position noise is in normalized workspace units.
@@ -87,6 +87,7 @@ class TrainConfig:
     repertoire_bootstrap_cases: int = 512
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
+    benchmark_case_count: int = 4
     rl_target_noise_scale: float = 0.05
 
     # Loss weights.
@@ -945,6 +946,135 @@ def _log_canonical_evaluation(
     )
 
 
+def _sample_benchmark_specs(
+    repertoire: SimulationRepertoire,
+    device: torch.device,
+    batch_size: int,
+    seed: int,
+) -> list[tuple[str, torch.Tensor]]:
+    if len(repertoire) == 0 or batch_size <= 0:
+        return []
+    torch_state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        _, _, _, stiffness = repertoire.sample_cases(batch_size, device)
+    finally:
+        torch.random.set_rng_state(torch_state)
+    return [
+        (f"{idx + 1:02d}_sampled", stiffness[idx])
+        for idx in range(stiffness.shape[0])
+    ]
+
+
+def _log_benchmark_evaluation(
+    writer: SummaryWriter,
+    model: GraphRefinementModel,
+    config: TrainConfig,
+    step: int,
+    device: torch.device,
+    repertoire: SimulationRepertoire,
+) -> None:
+    started_at = time.perf_counter()
+    benchmark_specs = _sample_benchmark_specs(
+        repertoire,
+        device,
+        config.benchmark_case_count,
+        seed=config.seed + 303,
+    )
+    if not benchmark_specs:
+        return
+    _progress(f"train:benchmark start step={step} cases={len(benchmark_specs)}")
+    geometry_config = _geometry_regularization_config(config)
+    positions, roles, adjacency = _pure_noise_batch(
+        len(benchmark_specs),
+        config.num_nodes,
+        device,
+        seed=config.seed + 304,
+    )
+    raw_targets = torch.stack([values for _, values in benchmark_specs], dim=0).to(
+        device
+    )
+    base_time = torch.ones((len(benchmark_specs),), device=device)
+    rollout = rollout_refinement(
+        model,
+        positions,
+        roles,
+        adjacency,
+        raw_targets,
+        steps=config.rollout_steps,
+        position_step_size=config.position_step_size,
+        connectivity_step_size=config.connectivity_step_size,
+        base_time=base_time,
+        position_noise_scale=0.0,
+        connectivity_noise_scale=0.0,
+        geometry_config=geometry_config,
+    )
+    final_state = rollout[-1]
+    final_terms = mechanical_terms(
+        final_state["positions"],
+        roles,
+        final_state["adjacency"],
+        geometry_config=geometry_config,
+    )
+
+    benchmark_property_errors = []
+    benchmark_stress_losses = []
+    for idx, (name, _) in enumerate(benchmark_specs):
+        figure = plot_graph_design(
+            final_state["positions"][idx],
+            roles[idx],
+            final_state["adjacency"][idx],
+            threshold=_visualization_threshold(),
+            title=name,
+        )
+        writer.add_figure(f"benchmark/00_designs/{name}", figure, global_step=step)
+        _log_matrix(
+            writer,
+            f"benchmark/10_achieved_stiffness/{name}",
+            final_terms["stiffness_matrix"][idx],
+            step,
+        )
+        _log_matrix(
+            writer,
+            f"benchmark/20_achieved_response/{name}",
+            final_terms["response_matrix"][idx],
+            step,
+        )
+        for rollout_idx, state in enumerate(rollout, start=1):
+            step_error = _matrix_loss(
+                state["terms"]["stiffness_matrix"][idx : idx + 1],
+                raw_targets[idx : idx + 1],
+            )
+            writer.add_scalar(
+                f"benchmark/30_property_error/{name}/step_{rollout_idx}",
+                step_error.item(),
+                step,
+            )
+        benchmark_property_errors.append(
+            _matrix_loss(
+                final_terms["stiffness_matrix"][idx : idx + 1],
+                raw_targets[idx : idx + 1],
+            )
+        )
+        benchmark_stress_losses.append(final_terms["stress_loss"][idx])
+        plt = figure
+        plt.clf()
+
+    writer.add_scalar(
+        "benchmark/40_mean_property_error",
+        torch.stack(benchmark_property_errors).mean().item(),
+        step,
+    )
+    writer.add_scalar(
+        "benchmark/40_mean_stress_loss",
+        torch.stack(benchmark_stress_losses).mean().item(),
+        step,
+    )
+    _progress(
+        f"train:benchmark done step={step} dt={time.perf_counter() - started_at:.2f}s"
+    )
+
+
 def train(config: TrainConfig) -> tuple[Path, Path]:
     _seed_everything(config.seed)
     device = _device(config.device)
@@ -1412,6 +1542,14 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
                         else None
                     ),
                 )
+                _log_benchmark_evaluation(
+                    writer,
+                    model,
+                    config,
+                    global_step,
+                    device,
+                    repertoire,
+                )
             model.train()
 
     payload = {
@@ -1860,6 +1998,11 @@ def _train_parser() -> argparse.ArgumentParser:
         "--canonical-case-count",
         type=int,
         default=defaults.canonical_case_count,
+    )
+    parser.add_argument(
+        "--benchmark-case-count",
+        type=int,
+        default=defaults.benchmark_case_count,
     )
     parser.add_argument(
         "--rl-target-noise-scale",
