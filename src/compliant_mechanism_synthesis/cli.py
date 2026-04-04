@@ -53,13 +53,13 @@ class TrainConfig:
     batch_size: int = 128
     gradient_accumulation_steps: int = 4
     train_steps: int = 20_000
-    learning_rate: float = 4e-5
+    learning_rate: float = 2e-5
     learning_rate_warmup_steps: int = 100
-    learning_rate_min_scale: float = 0.1
+    learning_rate_min_scale: float = 0.05
 
     # Rollout refinement.
     rollout_steps: int = 8
-    position_step_size: float = 0.2
+    position_step_size: float = 0.05
     connectivity_step_size: float = 0.1
     # Position noise is in normalized workspace units, where 1.0 is the full domain width.
     rollout_position_noise: float = 0.01
@@ -73,7 +73,7 @@ class TrainConfig:
     # Position noise is in normalized workspace units.
     supervised_position_noise: float = 0.02
     # Connectivity noise is in continuous edge-activation units.
-    supervised_connectivity_noise: float = 0.06
+    supervised_connectivity_noise: float = 0.08
     supervised_every_steps: int = 1
     supervised_priority_start: int = 3
     supervised_priority_end: int = 1
