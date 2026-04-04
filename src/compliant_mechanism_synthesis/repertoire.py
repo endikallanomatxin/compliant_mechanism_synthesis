@@ -61,6 +61,19 @@ def _project_positive_definite(matrices: torch.Tensor, eps: float = 1e-3) -> tor
     return projected + (min_eigenvalue + eps).view(-1, 1, 1) * eye.unsqueeze(0)
 
 
+def _rarity_weights(components: torch.Tensor, k: int = 8) -> torch.Tensor:
+    if components.shape[0] <= 1:
+        return torch.ones((components.shape[0],), dtype=components.dtype)
+    k = min(max(k, 1), components.shape[0] - 1)
+    distances = torch.cdist(components, components)
+    inf = torch.tensor(float("inf"), dtype=distances.dtype, device=distances.device)
+    distances = distances + torch.diag_embed(torch.full((components.shape[0],), inf, device=distances.device, dtype=distances.dtype))
+    neighbor_distances = distances.topk(k=k, largest=False).values
+    density_proxy = neighbor_distances[:, -1].clamp_min(1e-6)
+    weights = density_proxy / density_proxy.mean().clamp_min(1e-6)
+    return weights
+
+
 def _select_best_index(
     candidate_mask: torch.Tensor,
     component_sum: torch.Tensor,
@@ -202,7 +215,15 @@ class SimulationRepertoire:
         candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
         if candidate_indices.numel() == 0:
             candidate_indices = torch.arange(len(self))
-        selection = torch.randint(candidate_indices.shape[0], (batch_size,))
+        components = self.normalized_components(
+            FrameFEMConfig(),
+            source_codes=source_codes,
+        )
+        if components.shape[0] == candidate_indices.shape[0] and components.shape[0] > 1:
+            weights = _rarity_weights(components)
+            selection = torch.multinomial(weights, batch_size, replacement=True)
+        else:
+            selection = torch.randint(candidate_indices.shape[0], (batch_size,))
         indices = candidate_indices.index_select(0, selection)
         return (
             self.positions.index_select(0, indices).to(device),
@@ -254,7 +275,16 @@ class SimulationRepertoire:
             )
         components = self.normalized_components(frame_config, source_codes)
         if components.shape[0] < 2 or not torch.isfinite(components).all():
-            indices = torch.randint(finite_stiffness.shape[0], (batch_size,))
+            if finite_stiffness.shape[0] > 1:
+                normalized = normalize_generalized_stiffness_matrix(
+                    finite_stiffness,
+                    characteristic_scales(frame_config),
+                )
+                fallback_components = _upper_triangular_components(normalized)
+                weights = _rarity_weights(fallback_components)
+                indices = torch.multinomial(weights, batch_size, replacement=True)
+            else:
+                indices = torch.randint(finite_stiffness.shape[0], (batch_size,))
             sampled = finite_stiffness.index_select(0, indices).to(device)
             if target_noise_scale <= 0.0:
                 return sampled
@@ -286,11 +316,18 @@ class SimulationRepertoire:
         if not torch.isfinite(mean).all() or not torch.isfinite(covariance).all():
             indices = torch.randint(finite_stiffness.shape[0], (batch_size,))
             return finite_stiffness.index_select(0, indices).to(device)
-        distribution = torch.distributions.MultivariateNormal(
-            mean.to(device),
+        rarity_weights = _rarity_weights(components).to(device)
+        source_indices = torch.multinomial(
+            rarity_weights,
+            batch_size,
+            replacement=True,
+        )
+        sampled_components = components.to(device).index_select(0, source_indices)
+        gaussian = torch.distributions.MultivariateNormal(
+            torch.zeros_like(mean).to(device),
             covariance_matrix=covariance.to(device),
         )
-        sampled_components = distribution.sample((batch_size,))
+        sampled_components = sampled_components + gaussian.sample((batch_size,))
         if target_noise_scale > 0.0:
             component_std = components.std(dim=0, unbiased=False).to(device)
             sampled_components = sampled_components + torch.randn_like(sampled_components) * (

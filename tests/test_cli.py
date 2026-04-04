@@ -196,6 +196,22 @@ def test_stiffness_target_sampling_with_noise_stays_positive_definite() -> None:
     assert torch.all(eigenvalues > -5e-2)
 
 
+def test_repertoire_case_sampling_with_rarity_weights_returns_valid_shapes() -> None:
+    repertoire = _bootstrap_repertoire(
+        TrainConfig(batch_size=8, repertoire_bootstrap_cases=24, repertoire_max_cases=32),
+        torch.device("cpu"),
+    )
+    positions, roles, adjacency, stiffness = repertoire.sample_cases(
+        6,
+        torch.device("cpu"),
+    )
+
+    assert positions.shape == (6, repertoire.positions.shape[1], 2)
+    assert roles.shape == (6, repertoire.roles.shape[1])
+    assert adjacency.shape == (6, repertoire.adjacency.shape[1], repertoire.adjacency.shape[2])
+    assert stiffness.shape == (6, 3, 3)
+
+
 def test_repertoire_add_discards_nonfinite_cases() -> None:
     repertoire = SimulationRepertoire.empty(num_nodes=4, max_cases=8)
     positions = torch.rand(2, 4, 2)
