@@ -1408,15 +1408,25 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         running_counts["total"] += 1
         if phase == "supervised":
             running_totals["supervised"] += supervised_loss.item()
-            running_totals["supervised_position"] += supervised_position_loss.item()
-            running_totals["supervised_adjacency"] += supervised_adjacency_loss.item()
+            running_totals["supervised_position"] += (
+                config.supervised_denoising_weight
+                * config.supervised_position_weight
+                * supervised_position_loss.item()
+            )
+            running_totals["supervised_adjacency"] += (
+                config.supervised_denoising_weight
+                * config.supervised_adjacency_weight
+                * supervised_adjacency_loss.item()
+            )
             running_counts["supervised"] += 1
             running_counts["supervised_position"] += 1
             running_counts["supervised_adjacency"] += 1
         else:
-            running_totals["property"] += property_loss.item()
-            running_totals["stress"] += stress_loss.item()
+            running_totals["property"] += config.property_weight * property_loss.item()
+            running_totals["stress"] += config.stress_weight * stress_loss.item()
             running_totals["rollout_continuous_improvement"] += (
+                config.rollout_continuous_improvement_weight
+                *
                 rollout_continuous_improvement_loss.item()
             )
             running_totals["max_von_mises_stress"] += final_step_terms[
