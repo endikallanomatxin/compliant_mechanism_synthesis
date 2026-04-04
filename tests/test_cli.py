@@ -20,6 +20,7 @@ from compliant_mechanism_synthesis.cli import (
     _sample_mixed_supervised_teachers,
     _sample_benchmark_specs,
     _scheduled_learning_rate,
+    _scheduled_rl_target_sampled_blend,
     _scheduled_supervised_priority,
     _scheduled_training_phase,
     _stiffness_to_response,
@@ -172,6 +173,13 @@ def test_blend_rl_targets_with_start_stiffness_interpolates_convexly() -> None:
         _blend_rl_targets_with_start_stiffness(start_stiffness, sampled_targets, 0.25),
         0.25 * start_stiffness + 0.75 * sampled_targets,
     )
+
+
+def test_scheduled_rl_target_sampled_blend_interpolates_linearly() -> None:
+    assert _scheduled_rl_target_sampled_blend(1, 1000, 0.0, 0.8) == 0.0
+    assert _scheduled_rl_target_sampled_blend(1000, 1000, 0.0, 0.8) == 0.8
+    mid = _scheduled_rl_target_sampled_blend(500, 1000, 0.0, 0.8)
+    assert 0.39 < mid < 0.41
 
 
 def test_bootstrap_repertoire_contains_positive_definite_stiffness_cases() -> None:

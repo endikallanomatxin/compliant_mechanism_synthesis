@@ -66,23 +66,23 @@ class TrainConfig:
     position_step_size: float = 0.1
     connectivity_step_size: float = 0.1
     # Position noise is in normalized workspace units, where 1.0 is the full domain width.
-    rollout_position_noise: float = 0.02
+    rollout_position_noise: float = 0.04
     # Connectivity noise is in continuous edge-activation units.
-    rollout_connectivity_noise: float = 0.08
+    rollout_connectivity_noise: float = 0.16
     # Additional one-shot perturbation applied to all RL starts before the rollout begins.
     # Position noise is in normalized workspace units.
-    rl_start_position_noise: float = 0.03
+    rl_start_position_noise: float = 0.08
     # Connectivity noise is in continuous edge-activation units.
-    rl_start_connectivity_noise: float = 0.12
+    rl_start_connectivity_noise: float = 0.32
 
     # Supervised denoising.
-    supervised_denoising_weight: float = 0.2
+    supervised_denoising_weight: float = 0.02
     supervised_position_weight: float = 1.0
     supervised_adjacency_weight: float = 1.0
     # Position noise is in normalized workspace units.
-    supervised_position_noise: float = 0.04
+    supervised_position_noise: float = 0.06
     # Connectivity noise is in continuous edge-activation units.
-    supervised_connectivity_noise: float = 0.16
+    supervised_connectivity_noise: float = 0.24
     supervised_every_steps: int = 1
     supervised_priority_start: int = 3
     supervised_priority_end: int = 1
@@ -93,13 +93,15 @@ class TrainConfig:
     repertoire_max_cases: int = 4_096
     canonical_case_count: int = 6
     benchmark_case_count: int = 4
-    rl_target_noise_scale: float = 0.2
-    rl_target_start_blend: float = 0.5
+    rl_target_noise_scale: float = 0.4
+    rl_target_sampled_blend_start: float = 0.2
+    rl_target_sampled_blend_end: float = 0.8
+    rl_target_sampled_blend_duration: int = 10_000
 
     # Loss weights.
     property_weight: float = 1.0
-    stress_weight: float = 0.3
-    rollout_continuous_improvement_weight: float = 0.0005
+    stress_weight: float = 0.2
+    rollout_continuous_improvement_weight: float = 0.0001
     rollout_continuous_improvement_scale: float = 1e-3
     material_weight: float = 0.0
     sparsity_weight: float = 0.0
@@ -455,6 +457,19 @@ def _scheduled_supervised_priority(
     progress = min(max((step - 1) / max(duration - 1, 1), 0.0), 1.0)
     value = start + progress * (end - start)
     return max(int(round(value)), 1)
+
+
+def _scheduled_rl_target_sampled_blend(
+    step: int,
+    duration: int,
+    start: float,
+    end: float,
+) -> float:
+    if duration <= 1:
+        return float(min(max(end, 0.0), 1.0))
+    progress = min(max((step - 1) / max(duration - 1, 1), 0.0), 1.0)
+    value = start + progress * (end - start)
+    return float(min(max(value, 0.0), 1.0))
 
 
 def _scheduled_training_phase(
@@ -1221,6 +1236,12 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
         supervised_loss = torch.zeros((), device=device)
         stress_loss = torch.zeros((), device=device)
         rollout_continuous_improvement_loss = torch.zeros((), device=device)
+        rl_target_sampled_blend = _scheduled_rl_target_sampled_blend(
+            step,
+            config.rl_target_sampled_blend_duration,
+            config.rl_target_sampled_blend_start,
+            config.rl_target_sampled_blend_end,
+        )
         phase = _scheduled_training_phase(
             step,
             config.supervised_priority_start,
@@ -1288,7 +1309,7 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             raw_targets = _blend_rl_targets_with_start_stiffness(
                 start_terms["stiffness_matrix"],
                 goal_targets,
-                config.rl_target_start_blend,
+                1.0 - rl_target_sampled_blend,
             )
             base_time = torch.rand((positions.shape[0],), device=device)
             rollout = rollout_refinement(
@@ -1533,6 +1554,11 @@ def train(config: TrainConfig) -> tuple[Path, Path]:
             total_mean = running_totals["total"] / max(running_counts["total"], 1)
             writer.add_scalar("train/total_loss", total_mean, step)
             writer.add_scalar("train/learning_rate", scheduled_lr, step)
+            writer.add_scalar(
+                "train/rl_target_sampled_blend",
+                rl_target_sampled_blend,
+                step,
+            )
             writer.add_text("train/phase", phase, step)
             writer.add_scalar("train/repertoire_size", len(repertoire), step)
             writer.add_scalar("train/micro_step", float(step), step)
