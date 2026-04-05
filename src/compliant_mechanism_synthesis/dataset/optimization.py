@@ -8,7 +8,13 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.design import GraphDesign
-from compliant_mechanism_synthesis.mechanics import Frame3DConfig, GeometryPenaltyConfig, mechanical_terms
+from compliant_mechanism_synthesis.mechanics import (
+    Frame3DConfig,
+    GeometryPenaltyConfig,
+    denormalize_generalized_stiffness,
+    mechanical_terms,
+    normalize_generalized_stiffness,
+)
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.tensor_ops import symmetrize_matrix, upper_triangle_edge_index
 
@@ -96,19 +102,21 @@ def sample_target_stiffness(
         frame_config=config.mechanics,
         penalty_config=config.geometry,
     )["generalized_stiffness"][0]
+    normalized_base = normalize_generalized_stiffness(base, config=config.mechanics)
     jitter = torch.tensor(
         [[rng.gauss(0.0, 1.0) for _ in range(6)] for _ in range(6)],
-        dtype=base.dtype,
+        dtype=normalized_base.dtype,
     )
     symmetric_jitter = symmetrize_matrix(jitter)
-    scale = base.abs().mean().clamp_min(1.0)
-    proposal = base + config.stiffness_perturbation_scale * scale * symmetric_jitter
+    scale = normalized_base.abs().mean().clamp_min(1e-3)
+    proposal = normalized_base + config.stiffness_perturbation_scale * scale * symmetric_jitter
     eigenvalues, eigenvectors = torch.linalg.eigh(proposal)
     # The offline stage should teach marginal improvements from plausible starts,
     # so targets stay near the current mechanism but are projected back to SPD.
-    minimum_eigenvalue = max(float(base.diagonal().mean().item()) * 0.05, 1.0)
+    minimum_eigenvalue = max(float(normalized_base.diagonal().mean().item()) * 0.05, 1e-4)
     clamped = eigenvalues.clamp_min(minimum_eigenvalue)
-    return eigenvectors @ torch.diag(clamped) @ eigenvectors.transpose(0, 1)
+    normalized_target = eigenvectors @ torch.diag(clamped) @ eigenvectors.transpose(0, 1)
+    return denormalize_generalized_stiffness(normalized_target, config=config.mechanics)
 
 
 def _domain_penalty(positions: torch.Tensor, roles: torch.Tensor) -> torch.Tensor:
@@ -133,12 +141,14 @@ def _anchor_attachment_penalty(adjacency: torch.Tensor, roles: torch.Tensor) -> 
 
 
 def _stiffness_loss(current: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    scale = target.abs().amax().clamp_min(1.0)
-    return ((current - target) / scale).square().mean()
+    normalized_current = normalize_generalized_stiffness(current)
+    normalized_target = normalize_generalized_stiffness(target)
+    scale = normalized_target.abs().amax().clamp_min(1e-3)
+    return ((normalized_current - normalized_target) / scale).square().mean()
 
 
 def _psd_penalty(matrix: torch.Tensor) -> torch.Tensor:
-    eigenvalues = torch.linalg.eigvalsh(matrix)
+    eigenvalues = torch.linalg.eigvalsh(normalize_generalized_stiffness(matrix))
     return (-eigenvalues).clamp_min(0.0).square().mean()
 
 

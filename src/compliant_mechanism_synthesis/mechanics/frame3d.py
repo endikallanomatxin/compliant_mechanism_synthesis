@@ -33,6 +33,40 @@ class GeometryPenaltyConfig:
     min_free_spacing: float = 4.0e-3
 
 
+def normalize_generalized_stiffness(
+    matrix: torch.Tensor,
+    config: Frame3DConfig | None = None,
+) -> torch.Tensor:
+    config = config or Frame3DConfig()
+    length_scale = config.workspace_size
+    force_scale = config.young_modulus * math.pi * config.radius_max**2
+    energy_scale = force_scale * length_scale
+    coordinate_scale = torch.tensor(
+        [length_scale, length_scale, length_scale, 1.0, 1.0, 1.0],
+        device=matrix.device,
+        dtype=matrix.dtype,
+    )
+    scale_matrix = coordinate_scale[:, None] * coordinate_scale[None, :]
+    return matrix * scale_matrix / energy_scale
+
+
+def denormalize_generalized_stiffness(
+    matrix: torch.Tensor,
+    config: Frame3DConfig | None = None,
+) -> torch.Tensor:
+    config = config or Frame3DConfig()
+    length_scale = config.workspace_size
+    force_scale = config.young_modulus * math.pi * config.radius_max**2
+    energy_scale = force_scale * length_scale
+    coordinate_scale = torch.tensor(
+        [length_scale, length_scale, length_scale, 1.0, 1.0, 1.0],
+        device=matrix.device,
+        dtype=matrix.dtype,
+    )
+    scale_matrix = coordinate_scale[:, None] * coordinate_scale[None, :]
+    return matrix * energy_scale / scale_matrix
+
+
 def beam_radii(adjacency: torch.Tensor, config: Frame3DConfig) -> torch.Tensor:
     return adjacency.clamp_min(0.0) * config.radius_max
 
