@@ -1,4 +1,4 @@
-"""Compliant mechanism synthesis prototype."""
+"""Compliant mechanism synthesis."""
 
 __all__ = ["__version__"]
 
