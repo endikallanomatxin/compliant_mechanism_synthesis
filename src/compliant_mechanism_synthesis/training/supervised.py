@@ -12,6 +12,6 @@ class SupervisedTrainingConfig:
 
 def run_supervised_training(config: SupervisedTrainingConfig) -> None:
     raise NotImplementedError(
-        "Supervised training is intentionally deferred until the offline dataset "
-        "pipeline is in place."
+        "Supervised training is still intentionally deferred until we validate "
+        "that the offline dataset produced by the explicit case optimizer is good enough."
     )

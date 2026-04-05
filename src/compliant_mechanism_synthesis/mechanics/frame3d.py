@@ -259,6 +259,8 @@ def _reduction_transform(positions: torch.Tensor, roles: torch.Tensor) -> tuple[
         dtype=positions.dtype,
     )
     rigid_map[..., :3, :3] = torch.eye(3, device=positions.device, dtype=positions.dtype)
+    # A rigid body's nodal translations are the body translation plus the
+    # infinitesimal rotation crossed with each node's offset from the centroid.
     rigid_map[..., :3, 3:] = -_skew(offsets)
     rigid_map[..., 3:, 3:] = torch.eye(3, device=positions.device, dtype=positions.dtype)
 
