@@ -55,8 +55,8 @@ class TrainConfig:
 
     # Optimization.
     batch_size: int = 64
-    gradient_accumulation_steps: int = 4
-    train_steps: int = 20_000
+    gradient_accumulation_steps: int = 8
+    train_steps: int = 100_000
     learning_rate: float = 2e-4
     learning_rate_warmup_steps: int = 100
     learning_rate_min_scale: float = 0.01
@@ -84,7 +84,7 @@ class TrainConfig:
     # Connectivity noise is in continuous edge-activation units.
     supervised_connectivity_noise: float = 0.24
     supervised_every_steps: int = 1
-    supervised_priority_start: int = 3
+    supervised_priority_start: int = 7
     supervised_priority_end: int = 1
     supervised_priority_duration: int = 2_000
 
@@ -126,10 +126,10 @@ class TrainConfig:
     min_free_node_spacing: float = 1.2e-2
 
     # Logging / visualization.
-    display_animation_scale: float = 4.0
-    animation_every_steps: int = 1000
+    display_animation_scale: float = 10.0
+    animation_every_steps: int = 2000
     log_every_steps: int = 1
-    canonical_eval_every_steps: int = 200
+    canonical_eval_every_steps: int = 1000
     sample_threshold: float = 0.5
 
     # Runtime.
