@@ -182,3 +182,62 @@ Cuando el modelo ya sepa refinar razonablemente bien en supervisado, entonces s�
 introducir RL / online refinement.
 
 
+## Etapa 4. Unión -> Mecanismo
+
+### `mobile` -> `input` y `output`
+
+Hasta ahora solo habíamos planteado como un solido `mobile` se mueve en relación
+a un sólido `fixed` bajo la influencia de unas fuerzas, optimizando los nodos
+`free` y sus conexiones.
+
+Ahora el objetivo sería pasar a especificar la relación entre un solido `input`
+y un sólido `output`, y poder definir relaciones más ricas como trayectorias.
+
+Cada uno de los sólidos tiene un conjunto de nodos con movimiento solidario.
+
+
+### Lineal -> No lineal
+
+Si queremos modelar mecanismos de verdad, habrá que salir de la lógica
+puramente lineal alrededor de un estado, y hacer un análisis no lineal del
+comportamiento a lo largo del recorrido.
+
+
+### Especificar trayectorias
+
+Ahora el target es una matriz de rigidez global, para poder definir un
+mecanismo, deberíamos definir un mapa entre trayectorias de entrada y de
+salida, y de rigideces a lo largo de esa trayectoria.
+
+Definimos:
+- Posición de reposo del mecanismo.
+- `t_deformación` a lo largo de la trayectoria física del mecanismo.
+  - Va de -1 a 1. En 0, el mecanismo puede no estar en su posición de reposo,
+  llegará a la posición del instante 0 linealmente.
+  - 2 gdl? podríamos abrir la puerta a más?
+- Puntos de control:
+  - En cada instante de `t_deformación`, el input y el output tienen
+  posiciones (6D) determinadas.
+  - En esas posiciones, el mecanismo tiene una matriz de rigidez global
+  determinada. (Igual deberíamos considerar que la matriz de rigidez global
+  se exprese en las coordenadas locales del sistema de referencia de input).
+
+Aun así, la idea es seguir usando la misma arquitectura, con el mismo número de
+tokens. Los tokens toman un carácter multi-instante.
+
+I/O:
+- La consigna de los t_d de input y output puede ir en los tokens que
+pertenecen a los nodos de los sólidos input y output. O igual es mejor que sea
+algo más global?
+- La rigidez en cada punto de la trayectoria puede ir en un embedding global
+que se suma a todos los tokens.
+- Las magnitudes pueden representarse con dimensiones crudas o codificadas
+sinusoidalmente/Fourier, o una combinación de ambas. Pensarlo bien.
+
+### Ponderación de prioridades del recorrido
+
+La capacidad de definir la importancia de cada requisito se vuelve importante.
+Querríamos poder definir indiferencia en ciertos requisitos.
+
+Igual un peso por cada instante y componente de posición y rigidez.
+
