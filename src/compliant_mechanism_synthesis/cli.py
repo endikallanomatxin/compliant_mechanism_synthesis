@@ -8,7 +8,7 @@ from compliant_mechanism_synthesis.dataset import (
     OfflineDatasetConfig,
     PrimitiveConfig,
     generate_offline_dataset,
-    optimize_case,
+    optimize_cases,
     sample_primitive_design,
     sample_target_stiffness,
 )
@@ -22,9 +22,7 @@ from compliant_mechanism_synthesis.visualization import (
 def _build_generate_dataset_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cms-generate-dataset",
-        description=(
-            "Generate and refine an offline dataset of 3D compliant-mechanism cases."
-        ),
+        description="Generate and refine an offline dataset of 3D compliant-mechanism cases.",
     )
     parser.add_argument("--num-cases", type=int, default=32)
     parser.add_argument("--num-free-nodes", type=int, default=18)
@@ -51,9 +49,7 @@ def _build_visualize_dataset_parser() -> argparse.ArgumentParser:
 def _build_sample_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cms-sample",
-        description=(
-            "Inspect and optimize a single starting point from the offline case generator."
-        ),
+        description="Inspect and optimize a single starting point from the offline case generator.",
     )
     parser.add_argument("--primitive", default="curved_lattice_sheet")
     parser.add_argument("--num-free-nodes", type=int, default=18)
@@ -109,31 +105,30 @@ def sample_main(argv: list[str] | None = None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     primitive = PrimitiveConfig(num_free_nodes=args.num_free_nodes)
     optimization = CaseOptimizationConfig(num_steps=args.optimization_steps)
-    initial_design = sample_primitive_design(args.primitive, config=primitive, seed=args.seed)
-    target = sample_target_stiffness(initial_design, config=optimization, seed=args.seed + 1)
-    result = optimize_case(
-        primitive_kind=args.primitive,
-        initial_design=initial_design,
-        target_stiffness=target,
+    initial_structures = sample_primitive_design(args.primitive, config=primitive, seed=args.seed)
+    target = sample_target_stiffness(initial_structures, config=optimization, seed=args.seed + 1)
+    result = optimize_cases(
+        structures=initial_structures,
+        target_stiffness=target.unsqueeze(0),
         config=optimization,
-        logdir=output_dir / "tensorboard",
+        logdir=output_dir / "tensorboard_cases",
     )
 
     initial_figure = plot_design_3d(
-        result.initial_design.positions,
-        result.initial_design.roles,
-        result.initial_design.adjacency,
+        result.raw_structures.positions[0],
+        result.raw_structures.roles[0],
+        result.raw_structures.adjacency[0],
         title=f"initial-{args.primitive}",
     )
     optimized_figure = plot_design_3d(
-        result.optimized_design.positions,
-        result.optimized_design.roles,
-        result.optimized_design.adjacency,
+        result.optimized_structures.positions[0],
+        result.optimized_structures.roles[0],
+        result.optimized_structures.adjacency[0],
         title=f"optimized-{args.primitive}",
     )
     initial_figure.savefig(output_dir / "initial.png", dpi=160, bbox_inches="tight")
     optimized_figure.savefig(output_dir / "optimized.png", dpi=160, bbox_inches="tight")
 
-    print(f"primitive={result.primitive_kind}")
-    print(f"initial_loss={result.initial_loss:.6f}")
-    print(f"best_loss={result.best_loss:.6f}")
+    print(f"primitive={args.primitive}")
+    print(f"initial_loss={float(result.initial_loss[0].item()):.6f}")
+    print(f"best_loss={float(result.best_loss[0].item()):.6f}")

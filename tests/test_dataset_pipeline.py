@@ -9,40 +9,39 @@ from compliant_mechanism_synthesis.dataset import (
     OfflineDatasetConfig,
     PrimitiveConfig,
     generate_offline_dataset,
-    optimize_case,
+    optimize_cases,
     sample_primitive_design,
     sample_target_stiffness,
 )
 
 
 def test_sample_primitive_design_is_valid_in_3d() -> None:
-    design = sample_primitive_design(
+    structures = sample_primitive_design(
         "curved_lattice_sheet",
         config=PrimitiveConfig(num_free_nodes=8),
         seed=7,
     )
-    design.validate()
-    assert design.positions.shape == (14, 3)
-    assert torch.count_nonzero(design.adjacency) > 0
+    structures.validate()
+    assert structures.positions.shape == (1, 14, 3)
+    assert torch.count_nonzero(structures.adjacency) > 0
 
 
 def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) -> None:
-    initial_design = sample_primitive_design(
+    initial_structures = sample_primitive_design(
         "straight_beam",
         config=PrimitiveConfig(num_free_nodes=6),
         seed=3,
     )
     optimization = CaseOptimizationConfig(num_steps=6)
-    target = sample_target_stiffness(initial_design, config=optimization, seed=11)
-    result = optimize_case(
-        primitive_kind="straight_beam",
-        initial_design=initial_design,
-        target_stiffness=target,
+    target = sample_target_stiffness(initial_structures, config=optimization, seed=11)
+    result = optimize_cases(
+        structures=initial_structures,
+        target_stiffness=target.unsqueeze(0),
         config=optimization,
         logdir=tmp_path / "tb",
     )
 
-    assert result.best_loss <= result.initial_loss
+    assert result.best_loss[0] <= result.initial_loss[0]
 
 
 def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
@@ -56,5 +55,6 @@ def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
         )
     )
 
-    assert payload["optimized_adjacency"].shape == (2, 12, 12)
+    assert payload["optimized_structures"]["adjacency"].shape == (2, 12, 12)
+    assert payload["last_analyses"]["generalized_stiffness"].shape == (2, 6, 6)
     assert (tmp_path / "dataset.pt").exists()

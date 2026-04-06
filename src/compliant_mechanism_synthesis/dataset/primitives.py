@@ -6,7 +6,7 @@ import random
 
 import torch
 
-from compliant_mechanism_synthesis.design import GraphDesign
+from compliant_mechanism_synthesis.dataset.types import Structures
 from compliant_mechanism_synthesis.roles import NodeRole
 from compliant_mechanism_synthesis.tensor_ops import symmetrize_matrix
 
@@ -148,7 +148,7 @@ def sample_primitive_design(
     kind: str,
     config: PrimitiveConfig | None = None,
     seed: int | None = None,
-) -> GraphDesign:
+) -> Structures:
     config = config or PrimitiveConfig()
     rng = random.Random(seed)
     free_positions = _sample_free_positions(kind, config, rng)
@@ -199,10 +199,10 @@ def sample_primitive_design(
                 adjacency[anchor_index, node_index] = 0.55
                 adjacency[node_index, anchor_index] = 0.55
 
-    design = GraphDesign(
-        positions=positions,
-        roles=roles,
-        adjacency=symmetrize_matrix(adjacency),
+    design = Structures(
+        positions=positions.unsqueeze(0),
+        roles=roles.unsqueeze(0),
+        adjacency=symmetrize_matrix(adjacency).unsqueeze(0),
     )
     design.validate()
     return design
@@ -211,7 +211,7 @@ def sample_primitive_design(
 def sample_random_primitive(
     config: PrimitiveConfig | None = None,
     seed: int | None = None,
-) -> tuple[str, GraphDesign]:
+) -> tuple[str, Structures]:
     rng = random.Random(seed)
     kind = rng.choice(PRIMITIVE_LIBRARY)
     kind_seed = None if seed is None else rng.randrange(0, 2**31)

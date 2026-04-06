@@ -8,7 +8,7 @@ import torch
 
 from compliant_mechanism_synthesis.dataset.optimization import (
     CaseOptimizationConfig,
-    optimize_case,
+    optimize_cases,
     sample_target_stiffness,
 )
 from compliant_mechanism_synthesis.dataset.primitives import (
@@ -16,6 +16,7 @@ from compliant_mechanism_synthesis.dataset.primitives import (
     PrimitiveConfig,
     sample_primitive_design,
 )
+from compliant_mechanism_synthesis.dataset.types import OptimizedCases, Structures
 from compliant_mechanism_synthesis.visualization import write_dataset_visualizations
 
 
@@ -38,43 +39,39 @@ def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> dict
     Path(config.logdir).mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(config.seed)
-    cases = []
+    primitive_kinds: list[str] = []
+    structure_batches: list[Structures] = []
+    target_batches = []
     for case_index in range(config.num_cases):
         primitive_kind = PRIMITIVE_LIBRARY[case_index % len(PRIMITIVE_LIBRARY)]
         primitive_seed = rng.randrange(0, 2**31)
         target_seed = rng.randrange(0, 2**31)
-        initial_design = sample_primitive_design(
+        initial_structures = sample_primitive_design(
             primitive_kind,
             config=config.primitive,
             seed=primitive_seed,
         )
         target = sample_target_stiffness(
-            initial_design,
+            initial_structures,
             config=config.optimization,
             seed=target_seed,
         )
-        result = optimize_case(
-            primitive_kind=primitive_kind,
-            initial_design=initial_design,
-            target_stiffness=target,
-            config=config.optimization,
-            logdir=Path(config.logdir) / f"case_{case_index:04d}",
-        )
-        cases.append(result)
+        primitive_kinds.append(primitive_kind)
+        structure_batches.append(initial_structures)
+        target_batches.append(target.unsqueeze(0))
 
-    payload = {
-        "primitive_kind": [case.primitive_kind for case in cases],
-        "target_stiffness": torch.stack([case.target_stiffness for case in cases], dim=0),
-        "initial_positions": torch.stack([case.initial_design.positions for case in cases], dim=0),
-        "initial_roles": torch.stack([case.initial_design.roles for case in cases], dim=0),
-        "initial_adjacency": torch.stack([case.initial_design.adjacency for case in cases], dim=0),
-        "optimized_positions": torch.stack([case.optimized_design.positions for case in cases], dim=0),
-        "optimized_roles": torch.stack([case.optimized_design.roles for case in cases], dim=0),
-        "optimized_adjacency": torch.stack([case.optimized_design.adjacency for case in cases], dim=0),
-        "initial_loss": torch.tensor([case.initial_loss for case in cases], dtype=torch.float32),
-        "best_loss": torch.tensor([case.best_loss for case in cases], dtype=torch.float32),
-        "config": asdict(config),
-    }
+    raw_structures = Structures(
+        positions=torch.cat([item.positions for item in structure_batches], dim=0),
+        roles=torch.cat([item.roles for item in structure_batches], dim=0),
+        adjacency=torch.cat([item.adjacency for item in structure_batches], dim=0),
+    )
+    optimized_cases = optimize_cases(
+        structures=raw_structures,
+        target_stiffness=torch.cat(target_batches, dim=0),
+        config=config.optimization,
+        logdir=Path(config.logdir),
+    )
+    payload = _serialize_optimized_cases(optimized_cases, primitive_kinds, config)
     torch.save(payload, output_path)
     preview_dir = (
         Path(config.preview_dir)
@@ -83,3 +80,37 @@ def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> dict
     )
     write_dataset_visualizations(payload, preview_dir, max_cases=config.preview_cases)
     return payload
+
+
+def _serialize_optimized_cases(
+    optimized_cases: OptimizedCases,
+    primitive_kinds: list[str],
+    config: OfflineDatasetConfig,
+) -> dict[str, object]:
+    optimized_cases.validate()
+    return {
+        "primitive_kinds": list(primitive_kinds),
+        "raw_structures": {
+            "positions": optimized_cases.raw_structures.positions,
+            "roles": optimized_cases.raw_structures.roles,
+            "adjacency": optimized_cases.raw_structures.adjacency,
+        },
+        "target_stiffness": optimized_cases.target_stiffness,
+        "optimized_structures": {
+            "positions": optimized_cases.optimized_structures.positions,
+            "roles": optimized_cases.optimized_structures.roles,
+            "adjacency": optimized_cases.optimized_structures.adjacency,
+        },
+        "initial_loss": optimized_cases.initial_loss,
+        "best_loss": optimized_cases.best_loss,
+        "last_analyses": {
+            "generalized_stiffness": optimized_cases.last_analyses.generalized_stiffness,
+            "material_usage": optimized_cases.last_analyses.material_usage,
+            "short_beam_penalty": optimized_cases.last_analyses.short_beam_penalty,
+            "long_beam_penalty": optimized_cases.last_analyses.long_beam_penalty,
+            "thin_beam_penalty": optimized_cases.last_analyses.thin_beam_penalty,
+            "thick_beam_penalty": optimized_cases.last_analyses.thick_beam_penalty,
+            "free_node_spacing_penalty": optimized_cases.last_analyses.free_node_spacing_penalty,
+        },
+        "config": asdict(config),
+    }

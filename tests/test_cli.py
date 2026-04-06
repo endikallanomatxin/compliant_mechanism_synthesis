@@ -34,7 +34,7 @@ def test_generate_dataset_main_generates_offline_dataset_and_preview(tmp_path: P
     )
 
     payload = torch.load(output_path)
-    assert payload["optimized_positions"].shape == (2, 12, 3)
+    assert payload["optimized_structures"]["positions"].shape == (2, 12, 3)
     assert (preview_dir / "summary.txt").exists()
 
 

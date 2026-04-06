@@ -21,13 +21,13 @@ def write_dataset_visualizations(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    primitive_kind = payload["primitive_kind"]
-    initial_positions = payload["initial_positions"]
-    initial_roles = payload["initial_roles"]
-    initial_adjacency = payload["initial_adjacency"]
-    optimized_positions = payload["optimized_positions"]
-    optimized_roles = payload["optimized_roles"]
-    optimized_adjacency = payload["optimized_adjacency"]
+    primitive_kind = payload["primitive_kinds"]
+    initial_positions = payload["raw_structures"]["positions"]
+    initial_roles = payload["raw_structures"]["roles"]
+    initial_adjacency = payload["raw_structures"]["adjacency"]
+    optimized_positions = payload["optimized_structures"]["positions"]
+    optimized_roles = payload["optimized_structures"]["roles"]
+    optimized_adjacency = payload["optimized_structures"]["adjacency"]
     initial_loss = payload["initial_loss"]
     best_loss = payload["best_loss"]
     target_stiffness = payload["target_stiffness"]
