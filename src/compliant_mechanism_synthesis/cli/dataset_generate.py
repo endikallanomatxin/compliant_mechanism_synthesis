@@ -24,7 +24,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-cases", type=int, default=32)
     parser.add_argument("--num-free-nodes", type=int, default=18)
     parser.add_argument("--optimization-steps", type=int, default=120)
-    parser.add_argument("--output-path", default="artifacts/offline_dataset.pt")
+    parser.add_argument("--output-path", default="datasets/offline_dataset.pt")
     parser.add_argument("--logdir", default="runs/offline_dataset")
     parser.add_argument("--preview-dir", default=None)
     parser.add_argument("--preview-cases", type=int, default=6)

@@ -95,12 +95,12 @@ uv run cms-dataset-generate \
   --num-cases 32 \
   --num-free-nodes 18 \
   --optimization-steps 120 \
-  --output-path artifacts/offline_dataset.pt \
+  --output-path datasets/offline_dataset.pt \
   --logdir runs/offline_dataset
 ```
 
 By default this also writes preview images and a `summary.txt` file under
-`artifacts/offline_dataset_preview/`.
+`datasets/offline_dataset_preview/`.
 
 Render previews again from an existing dataset:
 
