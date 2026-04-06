@@ -22,7 +22,7 @@ def visualize_dataset_main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
     dataset_path = Path(args.dataset_path)
-    optimized_cases, primitive_kinds, _ = load_offline_dataset(dataset_path)
+    optimized_cases, _ = load_offline_dataset(dataset_path)
     output_dir = (
         Path(args.output_dir)
         if args.output_dir is not None
@@ -30,7 +30,6 @@ def visualize_dataset_main(argv: list[str] | None = None) -> None:
     )
     write_dataset_visualizations(
         optimized_cases=optimized_cases,
-        primitive_kinds=primitive_kinds,
         output_dir=output_dir,
         max_cases=args.max_cases,
     )

@@ -8,7 +8,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.dataset import load_offline_dataset
-from compliant_mechanism_synthesis.dataset.types import Analyses, OptimizedCases, Structures
+from compliant_mechanism_synthesis.dataset.types import Analyses, OptimizedCases, Scaffolds, Structures
 from compliant_mechanism_synthesis.mechanics import (
     Frame3DConfig,
     GeometryPenaltyConfig,
@@ -82,7 +82,7 @@ def _difficulty_fraction(step: int, total_steps: int) -> float:
 
 
 def load_supervised_cases(dataset_path: str) -> OptimizedCases:
-    optimized_cases, _, _ = load_offline_dataset(dataset_path)
+    optimized_cases, _ = load_offline_dataset(dataset_path)
     return optimized_cases
 
 
@@ -275,6 +275,16 @@ def select_batch(
             thin_beam_penalty=optimized_cases.last_analyses.thin_beam_penalty.index_select(0, batch_indices),
             thick_beam_penalty=optimized_cases.last_analyses.thick_beam_penalty.index_select(0, batch_indices),
             free_node_spacing_penalty=optimized_cases.last_analyses.free_node_spacing_penalty.index_select(0, batch_indices),
+        ),
+        scaffolds=(
+            None
+            if optimized_cases.scaffolds is None
+            else Scaffolds(
+                positions=optimized_cases.scaffolds.positions.index_select(0, batch_indices),
+                roles=optimized_cases.scaffolds.roles.index_select(0, batch_indices),
+                adjacency=optimized_cases.scaffolds.adjacency.index_select(0, batch_indices),
+                edge_primitive_types=optimized_cases.scaffolds.edge_primitive_types.index_select(0, batch_indices),
+            )
         ),
     )
 

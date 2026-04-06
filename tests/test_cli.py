@@ -33,9 +33,9 @@ def test_dataset_generate_main_generates_offline_dataset_and_preview(tmp_path: P
     ]
     )
 
-    optimized_cases, primitive_kinds, _ = load_offline_dataset(output_path)
-    assert optimized_cases.optimized_structures.positions.shape == (2, 12, 3)
-    assert len(primitive_kinds) == 2
+    optimized_cases, _ = load_offline_dataset(output_path)
+    assert optimized_cases.optimized_structures.positions.shape == (2, 24, 3)
+    assert (preview_dir / "case_0000_primitives.png").exists()
     assert (preview_dir / "summary.txt").exists()
 
 

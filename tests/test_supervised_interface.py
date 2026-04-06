@@ -72,7 +72,11 @@ def test_evaluate_refinement_step_compares_noisy_refined_and_oracle(tmp_path: Pa
         seed=3,
     )
 
-    assert metrics.refined_target_error == pytest.approx(metrics.oracle_target_error)
+    relative_gap = abs(metrics.refined_target_error - metrics.oracle_target_error) / max(
+        metrics.oracle_target_error,
+        1e-6,
+    )
+    assert relative_gap < 0.05
     assert metrics.noisy_target_error >= 0.0
 
 

@@ -66,6 +66,71 @@ class Structures:
 
 
 @dataclass(frozen=True)
+class Scaffolds:
+    positions: torch.Tensor
+    roles: torch.Tensor
+    adjacency: torch.Tensor
+    edge_primitive_types: torch.Tensor
+
+    def validate(self) -> None:
+        _require_rank("positions", self.positions, 3)
+        _require_rank("roles", self.roles, 2)
+        _require_rank("adjacency", self.adjacency, 3)
+        _require_rank("edge_primitive_types", self.edge_primitive_types, 3)
+
+        batch_size, num_nodes, spatial_dim = self.positions.shape
+        if spatial_dim != 3:
+            raise ValueError("scaffold positions must contain 3D coordinates")
+        if self.roles.shape != (batch_size, num_nodes):
+            raise ValueError("scaffold roles must have shape [batch, nodes]")
+        if self.adjacency.shape != (batch_size, num_nodes, num_nodes):
+            raise ValueError("scaffold adjacency must have shape [batch, nodes, nodes]")
+        if self.edge_primitive_types.shape != (batch_size, num_nodes, num_nodes):
+            raise ValueError("edge_primitive_types must have shape [batch, nodes, nodes]")
+        if not torch.allclose(self.adjacency, self.adjacency.transpose(1, 2)):
+            raise ValueError("scaffold adjacency must be symmetric")
+        if not torch.equal(self.edge_primitive_types, self.edge_primitive_types.transpose(1, 2)):
+            raise ValueError("edge_primitive_types must be symmetric")
+
+        adjacency_diagonal = torch.diagonal(self.adjacency, dim1=1, dim2=2)
+        if not torch.allclose(adjacency_diagonal, torch.zeros_like(adjacency_diagonal)):
+            raise ValueError("scaffold adjacency diagonal must be zero")
+        primitive_diagonal = torch.diagonal(self.edge_primitive_types, dim1=1, dim2=2)
+        if not torch.equal(primitive_diagonal, -torch.ones_like(primitive_diagonal)):
+            raise ValueError("edge_primitive_types diagonal must be -1")
+
+        role_values = {int(role) for role in self.roles.unique().tolist()}
+        valid_roles = {int(NodeRole.FIXED), int(NodeRole.MOBILE), int(NodeRole.FREE)}
+        if not role_values.issubset(valid_roles):
+            raise ValueError("scaffold roles contain unknown values")
+
+        fixed_count = (self.roles == int(NodeRole.FIXED)).sum(dim=1)
+        mobile_count = (self.roles == int(NodeRole.MOBILE)).sum(dim=1)
+        if torch.any(fixed_count < 1):
+            raise ValueError("scaffolds need at least one fixed node per structure")
+        if torch.any(mobile_count < 1):
+            raise ValueError("scaffolds need at least one mobile node per structure")
+
+        edge_mask = self.adjacency > 0.0
+        if torch.any(self.edge_primitive_types[edge_mask] < 0):
+            raise ValueError("every scaffold edge must have an assigned primitive type")
+        if torch.any(self.edge_primitive_types[~edge_mask] != -1):
+            raise ValueError("non-edges must use primitive type -1")
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.positions.shape[0])
+
+    def slice(self, index: int) -> Scaffolds:
+        return Scaffolds(
+            positions=self.positions[index : index + 1],
+            roles=self.roles[index : index + 1],
+            adjacency=self.adjacency[index : index + 1],
+            edge_primitive_types=self.edge_primitive_types[index : index + 1],
+        )
+
+
+@dataclass(frozen=True)
 class Analyses:
     generalized_stiffness: torch.Tensor
     material_usage: torch.Tensor
@@ -101,6 +166,7 @@ class OptimizedCases:
     initial_loss: torch.Tensor
     best_loss: torch.Tensor
     last_analyses: Analyses
+    scaffolds: Scaffolds | None = None
 
     def validate(self) -> None:
         self.raw_structures.validate()
@@ -115,6 +181,10 @@ class OptimizedCases:
             if value.shape[0] != batch_size:
                 raise ValueError(f"{name} must have shape [batch]")
         self.last_analyses.validate(batch_size=batch_size)
+        if self.scaffolds is not None:
+            self.scaffolds.validate()
+            if self.scaffolds.batch_size != batch_size:
+                raise ValueError("scaffolds must match optimized case batch size")
 
     def slice(self, index: int) -> OptimizedCases:
         return OptimizedCases(
@@ -132,4 +202,5 @@ class OptimizedCases:
                 thick_beam_penalty=self.last_analyses.thick_beam_penalty[index : index + 1],
                 free_node_spacing_penalty=self.last_analyses.free_node_spacing_penalty[index : index + 1],
             ),
+            scaffolds=None if self.scaffolds is None else self.scaffolds.slice(index),
         )

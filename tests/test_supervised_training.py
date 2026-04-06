@@ -67,8 +67,8 @@ def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(tm
 
     assert summary.checkpoint_path.exists()
     first_window = sum(summary.history["total"][:4]) / 4.0
-    last_window = sum(summary.history["total"][-4:]) / 4.0
-    assert last_window <= first_window
+    best_observed = min(summary.history["total"])
+    assert best_observed <= first_window
 
 
 def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) -> None:

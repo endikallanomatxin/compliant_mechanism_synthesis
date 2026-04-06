@@ -23,7 +23,7 @@ def test_sample_primitive_design_is_valid_in_3d() -> None:
         seed=7,
     )
     structures.validate()
-    assert structures.positions.shape == (1, 14, 3)
+    assert structures.positions.shape == (1, 30, 3)
     assert torch.count_nonzero(structures.adjacency) > 0
 
 
@@ -35,11 +35,22 @@ def test_sample_primitive_design_places_fixed_anchors_below_mobile_anchors() -> 
     )
 
     fixed_z = structures.positions[0, :3, 2]
-    mobile_z = structures.positions[0, 3:6, 2]
-    free_z = structures.positions[0, 6:, 2]
+    mobile_z = structures.positions[0, -3:, 2]
+    free_z = structures.positions[0, 3:-3, 2]
     assert torch.max(fixed_z) < torch.min(free_z)
     assert torch.max(free_z) < torch.min(mobile_z)
     assert torch.max(fixed_z) < torch.min(mobile_z)
+
+
+def test_sample_primitive_design_materializes_triplets_with_no_dangling_nodes() -> None:
+    structures = sample_primitive_design(
+        "path_truss",
+        config=PrimitiveConfig(num_free_nodes=8),
+        seed=11,
+    )
+
+    degree = structures.adjacency[0].sum(dim=1)
+    assert torch.all(degree >= 2.0)
 
 
 def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) -> None:
@@ -71,9 +82,10 @@ def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
         )
     )
 
-    loaded_cases, primitive_kinds, loaded_config = load_offline_dataset(tmp_path / "dataset.pt")
-    assert optimized_cases.optimized_structures.adjacency.shape == (2, 12, 12)
+    loaded_cases, loaded_config = load_offline_dataset(tmp_path / "dataset.pt")
+    assert optimized_cases.optimized_structures.adjacency.shape == (2, 24, 24)
     assert loaded_cases.last_analyses.generalized_stiffness.shape == (2, 6, 6)
-    assert len(primitive_kinds) == 2
+    assert loaded_cases.scaffolds is not None
+    assert loaded_cases.scaffolds.positions.shape == (2, 8, 3)
     assert loaded_config.num_cases == 2
     assert (tmp_path / "dataset.pt").exists()

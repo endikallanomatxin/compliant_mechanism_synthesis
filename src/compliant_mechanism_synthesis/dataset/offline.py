@@ -12,11 +12,10 @@ from compliant_mechanism_synthesis.dataset.optimization import (
     sample_target_stiffness,
 )
 from compliant_mechanism_synthesis.dataset.primitives import (
-    PRIMITIVE_LIBRARY,
     PrimitiveConfig,
-    sample_primitive_design,
+    sample_random_primitive,
 )
-from compliant_mechanism_synthesis.dataset.types import Analyses, OptimizedCases, Structures
+from compliant_mechanism_synthesis.dataset.types import Analyses, OptimizedCases, Scaffolds, Structures
 from compliant_mechanism_synthesis.visualization import write_dataset_visualizations
 
 
@@ -24,7 +23,7 @@ from compliant_mechanism_synthesis.visualization import write_dataset_visualizat
 class OfflineDatasetConfig:
     num_cases: int = 32
     seed: int = 7
-    output_path: str = "artifacts/offline_dataset.pt"
+    output_path: str = "datasets/offline_dataset.pt"
     logdir: str = "runs/offline_dataset"
     preview_dir: str | None = None
     preview_cases: int = 6
@@ -39,15 +38,13 @@ def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> Opti
     Path(config.logdir).mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(config.seed)
-    primitive_kinds: list[str] = []
     structure_batches: list[Structures] = []
+    scaffold_batches: list[Scaffolds] = []
     target_batches = []
-    for case_index in range(config.num_cases):
-        primitive_kind = PRIMITIVE_LIBRARY[case_index % len(PRIMITIVE_LIBRARY)]
+    for _case_index in range(config.num_cases):
         primitive_seed = rng.randrange(0, 2**31)
         target_seed = rng.randrange(0, 2**31)
-        initial_structures = sample_primitive_design(
-            primitive_kind,
+        initial_structures, scaffold = sample_random_primitive(
             config=config.primitive,
             seed=primitive_seed,
         )
@@ -56,8 +53,8 @@ def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> Opti
             config=config.optimization,
             seed=target_seed,
         )
-        primitive_kinds.append(primitive_kind)
         structure_batches.append(initial_structures)
+        scaffold_batches.append(scaffold)
         target_batches.append(target.unsqueeze(0))
 
     raw_structures = Structures(
@@ -71,7 +68,25 @@ def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> Opti
         config=config.optimization,
         logdir=Path(config.logdir),
     )
-    save_offline_dataset(output_path, optimized_cases, primitive_kinds, config)
+    optimized_cases = OptimizedCases(
+        raw_structures=optimized_cases.raw_structures,
+        target_stiffness=optimized_cases.target_stiffness,
+        optimized_structures=optimized_cases.optimized_structures,
+        initial_loss=optimized_cases.initial_loss,
+        best_loss=optimized_cases.best_loss,
+        last_analyses=optimized_cases.last_analyses,
+        scaffolds=Scaffolds(
+            positions=torch.cat([item.positions for item in scaffold_batches], dim=0),
+            roles=torch.cat([item.roles for item in scaffold_batches], dim=0),
+            adjacency=torch.cat([item.adjacency for item in scaffold_batches], dim=0),
+            edge_primitive_types=torch.cat(
+                [item.edge_primitive_types for item in scaffold_batches],
+                dim=0,
+            ),
+        ),
+    )
+    optimized_cases.validate()
+    save_offline_dataset(output_path, optimized_cases, config)
     preview_dir = (
         Path(config.preview_dir)
         if config.preview_dir is not None
@@ -79,7 +94,6 @@ def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> Opti
     )
     write_dataset_visualizations(
         optimized_cases=optimized_cases,
-        primitive_kinds=primitive_kinds,
         output_dir=preview_dir,
         max_cases=config.preview_cases,
     )
@@ -89,23 +103,19 @@ def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> Opti
 def save_offline_dataset(
     path: str | Path,
     optimized_cases: OptimizedCases,
-    primitive_kinds: list[str],
     config: OfflineDatasetConfig,
 ) -> Path:
     optimized_cases.validate()
-    if len(primitive_kinds) != optimized_cases.raw_structures.batch_size:
-        raise ValueError("primitive_kinds must contain one label per structure")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(_serialize_optimized_cases(optimized_cases, primitive_kinds, config), path)
+    torch.save(_serialize_optimized_cases(optimized_cases, config), path)
     return path
 
 
 def load_offline_dataset(
     path: str | Path,
-) -> tuple[OptimizedCases, list[str], OfflineDatasetConfig]:
+) -> tuple[OptimizedCases, OfflineDatasetConfig]:
     payload = torch.load(Path(path), map_location="cpu")
-    primitive_kinds = [str(kind) for kind in payload["primitive_kinds"]]
     optimized_cases = OptimizedCases(
         raw_structures=Structures(
             positions=payload["raw_structures"]["positions"],
@@ -129,19 +139,25 @@ def load_offline_dataset(
             thick_beam_penalty=payload["last_analyses"]["thick_beam_penalty"],
             free_node_spacing_penalty=payload["last_analyses"]["free_node_spacing_penalty"],
         ),
+        scaffolds=Scaffolds(
+            positions=payload["scaffolds"]["positions"],
+            roles=payload["scaffolds"]["roles"],
+            adjacency=payload["scaffolds"]["adjacency"],
+            edge_primitive_types=payload["scaffolds"]["edge_primitive_types"],
+        ),
     )
     optimized_cases.validate()
-    return optimized_cases, primitive_kinds, OfflineDatasetConfig(**payload["config"])
+    return optimized_cases, OfflineDatasetConfig(**payload["config"])
 
 
 def _serialize_optimized_cases(
     optimized_cases: OptimizedCases,
-    primitive_kinds: list[str],
     config: OfflineDatasetConfig,
 ) -> dict[str, object]:
     optimized_cases.validate()
+    if optimized_cases.scaffolds is None:
+        raise ValueError("offline datasets require scaffold metadata for primitive previews")
     return {
-        "primitive_kinds": list(primitive_kinds),
         "raw_structures": {
             "positions": optimized_cases.raw_structures.positions,
             "roles": optimized_cases.raw_structures.roles,
@@ -163,6 +179,12 @@ def _serialize_optimized_cases(
             "thin_beam_penalty": optimized_cases.last_analyses.thin_beam_penalty,
             "thick_beam_penalty": optimized_cases.last_analyses.thick_beam_penalty,
             "free_node_spacing_penalty": optimized_cases.last_analyses.free_node_spacing_penalty,
+        },
+        "scaffolds": {
+            "positions": optimized_cases.scaffolds.positions,
+            "roles": optimized_cases.scaffolds.roles,
+            "adjacency": optimized_cases.scaffolds.adjacency,
+            "edge_primitive_types": optimized_cases.scaffolds.edge_primitive_types,
         },
         "config": asdict(config),
     }

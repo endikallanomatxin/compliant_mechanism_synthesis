@@ -48,6 +48,7 @@ def evaluate_refinement_step(
 
     noisy_analyses = analyze_structures(batch.noisy_structures)
     refined_analyses = analyze_structures(refined_structures)
+    oracle_analyses = analyze_structures(batch.oracle_structures)
 
     noisy_target_error = generalized_stiffness_error(
         noisy_analyses.generalized_stiffness,
@@ -58,7 +59,7 @@ def evaluate_refinement_step(
         batch.target_stiffness,
     ).mean()
     oracle_target_error = generalized_stiffness_error(
-        batch.oracle_analyses.generalized_stiffness,
+        oracle_analyses.generalized_stiffness,
         batch.target_stiffness,
     ).mean()
     return RefinementMetrics(
