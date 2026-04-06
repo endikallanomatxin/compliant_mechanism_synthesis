@@ -62,18 +62,19 @@ _LOGGED_BREAKDOWN_NAMES = (
 
 
 def _allowed_edge_mask(roles: torch.Tensor) -> torch.Tensor:
-    fixed_mask, mobile_mask, _ = role_masks(roles.unsqueeze(0))
-    fixed_mask = fixed_mask[0]
-    mobile_mask = mobile_mask[0]
+    if roles.ndim == 1:
+        roles = roles.unsqueeze(0)
+    fixed_mask, mobile_mask, _ = role_masks(roles)
     forbidden = (
-        (fixed_mask[:, None] & fixed_mask[None, :])
-        | (mobile_mask[:, None] & mobile_mask[None, :])
-        | (fixed_mask[:, None] & mobile_mask[None, :])
-        | (mobile_mask[:, None] & fixed_mask[None, :])
+        (fixed_mask.unsqueeze(-1) & fixed_mask.unsqueeze(-2))
+        | (mobile_mask.unsqueeze(-1) & mobile_mask.unsqueeze(-2))
+        | (fixed_mask.unsqueeze(-1) & mobile_mask.unsqueeze(-2))
+        | (mobile_mask.unsqueeze(-1) & fixed_mask.unsqueeze(-2))
     )
     allowed = ~forbidden
-    allowed.fill_diagonal_(False)
-    return allowed
+    diagonal = torch.eye(allowed.shape[-1], device=allowed.device, dtype=torch.bool).unsqueeze(0)
+    allowed = allowed & ~diagonal
+    return allowed[0] if allowed.shape[0] == 1 else allowed
 
 
 def _logits_from_adjacency(adjacency: torch.Tensor) -> torch.Tensor:
@@ -87,10 +88,15 @@ def _build_adjacency(
     num_nodes: int,
 ) -> torch.Tensor:
     edge_i, edge_j = upper_triangle_edge_index(num_nodes, edge_logits.device)
-    allowed_mask = _allowed_edge_mask(roles)
-    upper_mask = allowed_mask[edge_i, edge_j]
-    adjacency = torch.zeros((num_nodes, num_nodes), device=edge_logits.device, dtype=edge_logits.dtype)
-    adjacency[edge_i[upper_mask], edge_j[upper_mask]] = torch.sigmoid(edge_logits)
+    if roles.ndim == 1:
+        upper_mask = _allowed_edge_mask(roles)[edge_i, edge_j]
+        adjacency = torch.zeros((num_nodes, num_nodes), device=edge_logits.device, dtype=edge_logits.dtype)
+        adjacency[edge_i[upper_mask], edge_j[upper_mask]] = torch.sigmoid(edge_logits)
+        return symmetrize_matrix(adjacency)
+
+    upper_mask = _allowed_edge_mask(roles[0])[edge_i, edge_j]
+    adjacency = torch.zeros((roles.shape[0], num_nodes, num_nodes), device=edge_logits.device, dtype=edge_logits.dtype)
+    adjacency[:, edge_i[upper_mask], edge_j[upper_mask]] = torch.sigmoid(edge_logits)
     return symmetrize_matrix(adjacency)
 
 
@@ -127,36 +133,55 @@ def sample_target_stiffness(
 
 
 def _domain_penalty(positions: torch.Tensor, roles: torch.Tensor) -> torch.Tensor:
-    _, _, free_mask = role_masks(roles.unsqueeze(0))
-    free_mask = free_mask[0]
-    violations = positions[free_mask].clamp_max(0.0).square().sum()
-    violations = violations + (positions[free_mask] - 1.0).clamp_min(0.0).square().sum()
-    if not int(free_mask.sum().item()):
-        return torch.tensor(0.0, device=positions.device, dtype=positions.dtype)
-    return violations / int(free_mask.sum().item())
+    squeeze = False
+    if positions.ndim == 2:
+        positions = positions.unsqueeze(0)
+        roles = roles.unsqueeze(0)
+        squeeze = True
+    _, _, free_mask = role_masks(roles)
+    below = positions.clamp_max(0.0).square().sum(dim=-1)
+    above = (positions - 1.0).clamp_min(0.0).square().sum(dim=-1)
+    violations = (below + above) * free_mask.to(dtype=positions.dtype)
+    free_count = free_mask.sum(dim=1).clamp_min(1)
+    penalty = violations.sum(dim=1) / free_count.to(dtype=positions.dtype)
+    return penalty[0] if squeeze else penalty
 
 
 def _anchor_attachment_penalty(adjacency: torch.Tensor, roles: torch.Tensor) -> torch.Tensor:
-    fixed_mask, mobile_mask, free_mask = role_masks(roles.unsqueeze(0))
-    anchor_mask = (fixed_mask | mobile_mask)[0]
-    free_mask = free_mask[0]
-    anchor_to_free = adjacency[anchor_mask][:, free_mask]
-    if anchor_to_free.numel() == 0:
-        return torch.tensor(0.0, device=adjacency.device, dtype=adjacency.dtype)
-    attachment = anchor_to_free.sum(dim=1)
-    return (1.5 - attachment).clamp_min(0.0).square().mean()
+    squeeze = False
+    if adjacency.ndim == 2:
+        adjacency = adjacency.unsqueeze(0)
+        roles = roles.unsqueeze(0)
+        squeeze = True
+    fixed_mask, mobile_mask, free_mask = role_masks(roles)
+    penalties = []
+    for batch_index in range(adjacency.shape[0]):
+        anchor_mask = fixed_mask[batch_index] | mobile_mask[batch_index]
+        anchor_to_free = adjacency[batch_index][anchor_mask][:, free_mask[batch_index]]
+        if anchor_to_free.numel() == 0:
+            penalties.append(torch.tensor(0.0, device=adjacency.device, dtype=adjacency.dtype))
+            continue
+        attachment = anchor_to_free.sum(dim=1)
+        penalties.append((1.5 - attachment).clamp_min(0.0).square().mean())
+    penalty = torch.stack(penalties)
+    return penalty[0] if squeeze else penalty
 
 
 def _stiffness_loss(current: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     normalized_current = normalize_generalized_stiffness(current)
     normalized_target = normalize_generalized_stiffness(target)
-    scale = normalized_target.abs().amax().clamp_min(1e-3)
-    return ((normalized_current - normalized_target) / scale).square().mean()
+    if normalized_target.ndim == 2:
+        scale = normalized_target.abs().amax().clamp_min(1e-3)
+        return ((normalized_current - normalized_target) / scale).square().mean()
+    scale = normalized_target.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1e-3)
+    return ((normalized_current - normalized_target) / scale).square().mean(dim=(-2, -1))
 
 
 def _psd_penalty(matrix: torch.Tensor) -> torch.Tensor:
     eigenvalues = torch.linalg.eigvalsh(normalize_generalized_stiffness(matrix))
-    return (-eigenvalues).clamp_min(0.0).square().mean()
+    if eigenvalues.ndim == 1:
+        return (-eigenvalues).clamp_min(0.0).square().mean()
+    return (-eigenvalues).clamp_min(0.0).square().mean(dim=-1)
 
 
 def _loss_breakdown(
@@ -172,129 +197,32 @@ def _loss_breakdown(
         frame_config=config.mechanics,
         penalty_config=config.geometry,
     )
-    generalized_stiffness = terms["generalized_stiffness"][0]
+    generalized_stiffness = terms["generalized_stiffness"]
     weights = config.weights
-    sparsity = structures.adjacency[0].mean()
+    sparsity = structures.adjacency.mean(dim=(-2, -1))
     breakdown = {
         "stiffness_loss": weights.stiffness * _stiffness_loss(generalized_stiffness, target_stiffness),
-        "material_loss": weights.material * terms["material_usage"][0],
+        "material_loss": weights.material * terms["material_usage"],
         "sparsity_loss": weights.sparsity * sparsity,
-        "short_beam_loss": weights.short_beam * terms["short_beam_penalty"][0],
-        "long_beam_loss": weights.long_beam * terms["long_beam_penalty"][0],
-        "thin_beam_loss": weights.thin_beam * terms["thin_beam_penalty"][0],
-        "thick_beam_loss": weights.thick_beam * terms["thick_beam_penalty"][0],
-        "free_spacing_loss": weights.free_spacing * terms["free_node_spacing_penalty"][0],
-        "domain_loss": weights.domain * _domain_penalty(structures.positions[0], structures.roles[0]),
-        "anchor_attachment_loss": weights.anchor_attachment * _anchor_attachment_penalty(structures.adjacency[0], structures.roles[0]),
+        "short_beam_loss": weights.short_beam * terms["short_beam_penalty"],
+        "long_beam_loss": weights.long_beam * terms["long_beam_penalty"],
+        "thin_beam_loss": weights.thin_beam * terms["thin_beam_penalty"],
+        "thick_beam_loss": weights.thick_beam * terms["thick_beam_penalty"],
+        "free_spacing_loss": weights.free_spacing * terms["free_node_spacing_penalty"],
+        "domain_loss": weights.domain * _domain_penalty(structures.positions, structures.roles),
+        "anchor_attachment_loss": weights.anchor_attachment * _anchor_attachment_penalty(structures.adjacency, structures.roles),
         "psd_loss": weights.psd * _psd_penalty(generalized_stiffness),
     }
-    breakdown["total_loss"] = torch.stack(tuple(breakdown.values())).sum()
+    breakdown["total_loss_per_case"] = torch.stack(tuple(breakdown.values())).sum(dim=0)
+    breakdown["total_loss"] = breakdown["total_loss_per_case"].mean()
     breakdown["generalized_stiffness"] = generalized_stiffness
-    breakdown["material_usage"] = terms["material_usage"][0]
-    breakdown["short_beam_penalty"] = terms["short_beam_penalty"][0]
-    breakdown["long_beam_penalty"] = terms["long_beam_penalty"][0]
-    breakdown["thin_beam_penalty"] = terms["thin_beam_penalty"][0]
-    breakdown["thick_beam_penalty"] = terms["thick_beam_penalty"][0]
-    breakdown["free_node_spacing_penalty"] = terms["free_node_spacing_penalty"][0]
+    breakdown["material_usage"] = terms["material_usage"]
+    breakdown["short_beam_penalty"] = terms["short_beam_penalty"]
+    breakdown["long_beam_penalty"] = terms["long_beam_penalty"]
+    breakdown["thin_beam_penalty"] = terms["thin_beam_penalty"]
+    breakdown["thick_beam_penalty"] = terms["thick_beam_penalty"]
+    breakdown["free_node_spacing_penalty"] = terms["free_node_spacing_penalty"]
     return breakdown
-
-
-def _optimize_single_case(
-    structures: Structures,
-    target_stiffness: torch.Tensor,
-    config: CaseOptimizationConfig | None = None,
-    log_callback=None,
-) -> OptimizedCases:
-    config = config or CaseOptimizationConfig()
-    structures.validate()
-    if structures.batch_size != 1:
-        raise ValueError("_optimize_single_case expects a single-case batch")
-    if target_stiffness.shape != (1, 6, 6):
-        raise ValueError("target_stiffness must have shape [1, 6, 6] for single-case optimization")
-
-    initial_structures = structures
-    target_stiffness_single = target_stiffness[0].detach().clone()
-    _, _, free_mask = role_masks(initial_structures.roles)
-    free_mask = free_mask[0]
-    free_positions = torch.nn.Parameter(initial_structures.positions[0][free_mask].clone())
-    edge_i, edge_j = upper_triangle_edge_index(initial_structures.num_nodes, initial_structures.positions.device)
-    allowed = _allowed_edge_mask(initial_structures.roles[0])
-    active_upper = allowed[edge_i, edge_j]
-    edge_logits = torch.nn.Parameter(
-        _logits_from_adjacency(initial_structures.adjacency[0][edge_i[active_upper], edge_j[active_upper]])
-    )
-    optimizer = torch.optim.Adam([free_positions, edge_logits], lr=config.learning_rate)
-
-    best_loss = None
-    best_structures = initial_structures
-    initial_loss = None
-    best_breakdown: dict[str, torch.Tensor] | None = None
-
-    for step in range(config.num_steps):
-        optimizer.zero_grad()
-        positions = initial_structures.positions[0].clone()
-        positions[free_mask] = free_positions
-        adjacency = _build_adjacency(
-            edge_logits=edge_logits,
-            roles=initial_structures.roles[0],
-            num_nodes=initial_structures.num_nodes,
-        )
-        current_structures = Structures(
-            positions=positions.unsqueeze(0),
-            roles=initial_structures.roles.clone(),
-            adjacency=adjacency.unsqueeze(0),
-        )
-        breakdown = _loss_breakdown(current_structures, target_stiffness_single, config)
-        loss = breakdown["total_loss"]
-        loss.backward()
-        optimizer.step()
-
-        current_loss = float(loss.detach().item())
-        if initial_loss is None:
-            initial_loss = current_loss
-        if best_loss is None or current_loss < best_loss:
-            best_loss = current_loss
-            best_structures = Structures(
-                positions=current_structures.positions.detach().clone(),
-                roles=current_structures.roles.detach().clone(),
-                adjacency=current_structures.adjacency.detach().clone(),
-            )
-            best_breakdown = {name: value.detach().clone() for name, value in breakdown.items()}
-
-        if log_callback is not None and (step % config.log_every == 0 or step == config.num_steps - 1):
-            log_callback(
-                step,
-                {
-                    name: float(breakdown[name].detach().item())
-                    for name in _LOGGED_BREAKDOWN_NAMES
-                },
-            )
-
-    if best_breakdown is None:
-        best_breakdown = _loss_breakdown(best_structures, target_stiffness_single, config)
-
-    result = OptimizedCases(
-        raw_structures=Structures(
-            positions=initial_structures.positions.detach().clone(),
-            roles=initial_structures.roles.detach().clone(),
-            adjacency=initial_structures.adjacency.detach().clone(),
-        ),
-        target_stiffness=target_stiffness.detach().clone(),
-        optimized_structures=best_structures,
-        initial_loss=torch.tensor([float(initial_loss if initial_loss is not None else 0.0)], dtype=torch.float32),
-        best_loss=torch.tensor([float(best_loss if best_loss is not None else 0.0)], dtype=torch.float32),
-        last_analyses=Analyses(
-            generalized_stiffness=best_breakdown["generalized_stiffness"].unsqueeze(0),
-            material_usage=best_breakdown["material_usage"].reshape(1),
-            short_beam_penalty=best_breakdown["short_beam_penalty"].reshape(1),
-            long_beam_penalty=best_breakdown["long_beam_penalty"].reshape(1),
-            thin_beam_penalty=best_breakdown["thin_beam_penalty"].reshape(1),
-            thick_beam_penalty=best_breakdown["thick_beam_penalty"].reshape(1),
-            free_node_spacing_penalty=best_breakdown["free_node_spacing_penalty"].reshape(1),
-        ),
-    )
-    result.validate()
-    return result
 
 
 def optimize_cases(
@@ -309,61 +237,86 @@ def optimize_cases(
         raise ValueError("target_stiffness must have shape [batch, 6, 6]")
 
     writer = SummaryWriter(log_dir=str(logdir)) if logdir is not None else None
-    aggregate_sums = {
-        step: {name: 0.0 for name in _LOGGED_BREAKDOWN_NAMES}
-        for step in range(config.num_steps)
-        if step % config.log_every == 0 or step == config.num_steps - 1
-    }
-    aggregate_counts = {step: 0 for step in aggregate_sums}
-    optimized_items = []
-    try:
-        for case_index in range(structures.batch_size):
-            def _log_case_step(step: int, values: dict[str, float]) -> None:
-                aggregate_counts[step] += 1
-                for name, value in values.items():
-                    aggregate_sums[step][name] += value
-                    if writer is not None:
-                        writer.add_scalar(
-                            f"dataset/optimization/{name}",
-                            aggregate_sums[step][name] / aggregate_counts[step],
-                            step,
-                        )
-                if writer is not None:
-                    writer.flush()
+    initial_structures = structures
+    free_mask = role_masks(initial_structures.roles)[2]
+    free_positions = torch.nn.Parameter(initial_structures.positions.clone())
+    edge_i, edge_j = upper_triangle_edge_index(initial_structures.num_nodes, initial_structures.positions.device)
+    active_upper = _allowed_edge_mask(initial_structures.roles[0])[edge_i, edge_j]
+    initial_edge_values = initial_structures.adjacency[:, edge_i[active_upper], edge_j[active_upper]]
+    edge_logits = torch.nn.Parameter(_logits_from_adjacency(initial_edge_values))
+    optimizer = torch.optim.Adam([free_positions, edge_logits], lr=config.learning_rate)
 
-            optimized_item = _optimize_single_case(
-                structures=structures.slice(case_index),
-                target_stiffness=target_stiffness[case_index : case_index + 1],
-                config=config,
-                log_callback=_log_case_step,
+    best_loss = torch.full((structures.batch_size,), float("inf"), dtype=torch.float32, device=structures.positions.device)
+    best_positions = initial_structures.positions.detach().clone()
+    best_adjacency = initial_structures.adjacency.detach().clone()
+    initial_loss: torch.Tensor | None = None
+    try:
+        for step in range(config.num_steps):
+            optimizer.zero_grad()
+            positions = initial_structures.positions.clone()
+            clamped_free_positions = free_positions.clamp(0.0, 1.0)
+            positions[free_mask] = clamped_free_positions[free_mask]
+            adjacency = _build_adjacency(
+                edge_logits=edge_logits,
+                roles=initial_structures.roles,
+                num_nodes=initial_structures.num_nodes,
             )
-            optimized_items.append(optimized_item)
+            current_structures = Structures(
+                positions=positions,
+                roles=initial_structures.roles,
+                adjacency=adjacency,
+            )
+            breakdown = _loss_breakdown(current_structures, target_stiffness, config)
+            breakdown["total_loss"].backward()
+            optimizer.step()
+
+            current_loss = breakdown["total_loss_per_case"].detach()
+            if initial_loss is None:
+                initial_loss = current_loss.clone()
+            improved = current_loss < best_loss
+            best_loss = torch.minimum(best_loss, current_loss)
+            improved_positions = improved.unsqueeze(-1).unsqueeze(-1)
+            improved_adjacency = improved.unsqueeze(-1).unsqueeze(-1)
+            best_positions = torch.where(improved_positions, current_structures.positions.detach(), best_positions)
+            best_adjacency = torch.where(improved_adjacency, current_structures.adjacency.detach(), best_adjacency)
+
+            if writer is not None and (step % config.log_every == 0 or step == config.num_steps - 1):
+                for name in _LOGGED_BREAKDOWN_NAMES:
+                    value = breakdown[name]
+                    mean_value = float(value.detach().mean().item()) if value.ndim > 0 else float(value.detach().item())
+                    writer.add_scalar(f"dataset/optimization/{name}", mean_value, step)
+                writer.flush()
     finally:
         if writer is not None:
             writer.close()
 
+    if initial_loss is None:
+        initial_loss = torch.zeros((structures.batch_size,), dtype=torch.float32, device=structures.positions.device)
+
+    best_structures = Structures(
+        positions=best_positions,
+        roles=initial_structures.roles.detach().clone(),
+        adjacency=best_adjacency,
+    )
+    best_breakdown = _loss_breakdown(best_structures, target_stiffness, config)
     result = OptimizedCases(
         raw_structures=Structures(
-            positions=torch.cat([item.raw_structures.positions for item in optimized_items], dim=0),
-            roles=torch.cat([item.raw_structures.roles for item in optimized_items], dim=0),
-            adjacency=torch.cat([item.raw_structures.adjacency for item in optimized_items], dim=0),
+            positions=initial_structures.positions.detach().clone(),
+            roles=initial_structures.roles.detach().clone(),
+            adjacency=initial_structures.adjacency.detach().clone(),
         ),
-        target_stiffness=torch.cat([item.target_stiffness for item in optimized_items], dim=0),
-        optimized_structures=Structures(
-            positions=torch.cat([item.optimized_structures.positions for item in optimized_items], dim=0),
-            roles=torch.cat([item.optimized_structures.roles for item in optimized_items], dim=0),
-            adjacency=torch.cat([item.optimized_structures.adjacency for item in optimized_items], dim=0),
-        ),
-        initial_loss=torch.cat([item.initial_loss for item in optimized_items], dim=0),
-        best_loss=torch.cat([item.best_loss for item in optimized_items], dim=0),
+        target_stiffness=target_stiffness.detach().clone(),
+        optimized_structures=best_structures,
+        initial_loss=initial_loss.detach().cpu(),
+        best_loss=best_loss.detach().cpu(),
         last_analyses=Analyses(
-            generalized_stiffness=torch.cat([item.last_analyses.generalized_stiffness for item in optimized_items], dim=0),
-            material_usage=torch.cat([item.last_analyses.material_usage for item in optimized_items], dim=0),
-            short_beam_penalty=torch.cat([item.last_analyses.short_beam_penalty for item in optimized_items], dim=0),
-            long_beam_penalty=torch.cat([item.last_analyses.long_beam_penalty for item in optimized_items], dim=0),
-            thin_beam_penalty=torch.cat([item.last_analyses.thin_beam_penalty for item in optimized_items], dim=0),
-            thick_beam_penalty=torch.cat([item.last_analyses.thick_beam_penalty for item in optimized_items], dim=0),
-            free_node_spacing_penalty=torch.cat([item.last_analyses.free_node_spacing_penalty for item in optimized_items], dim=0),
+            generalized_stiffness=best_breakdown["generalized_stiffness"].detach().cpu(),
+            material_usage=best_breakdown["material_usage"].detach().cpu(),
+            short_beam_penalty=best_breakdown["short_beam_penalty"].detach().cpu(),
+            long_beam_penalty=best_breakdown["long_beam_penalty"].detach().cpu(),
+            thin_beam_penalty=best_breakdown["thin_beam_penalty"].detach().cpu(),
+            thick_beam_penalty=best_breakdown["thick_beam_penalty"].detach().cpu(),
+            free_node_spacing_penalty=best_breakdown["free_node_spacing_penalty"].detach().cpu(),
         ),
     )
     result.validate()
