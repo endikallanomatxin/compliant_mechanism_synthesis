@@ -27,8 +27,8 @@ def test_generate_dataset_main_generates_offline_dataset_and_preview(tmp_path: P
             str(output_path),
             "--logdir",
             str(tmp_path / "runs"),
-            "--preview-dir",
-            str(preview_dir),
+        "--preview-dir",
+        str(preview_dir),
             "--preview-cases",
             "2",
         ]
@@ -38,6 +38,32 @@ def test_generate_dataset_main_generates_offline_dataset_and_preview(tmp_path: P
     assert optimized_cases.optimized_structures.positions.shape == (2, 12, 3)
     assert len(primitive_kinds) == 2
     assert (preview_dir / "summary.txt").exists()
+
+
+def test_generate_dataset_main_names_run(tmp_path: Path) -> None:
+    output_path = tmp_path / "dataset.pt"
+    runs_dir = tmp_path / "runs_named"
+    create_logdir = runs_dir
+    name = "fancygen"
+    generate_dataset_main(
+        [
+            "--num-cases",
+            "1",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(create_logdir),
+            "--name",
+            name,
+        ]
+    )
+    entries = [entry for entry in create_logdir.iterdir() if entry.is_dir()]
+    assert len(entries) == 1
+    assert entries[0].name.endswith(f"-{name}")
 
 
 def test_sample_main_writes_images(tmp_path: Path) -> None:

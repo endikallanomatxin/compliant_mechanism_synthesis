@@ -36,6 +36,7 @@ def _build_generate_dataset_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logdir", default="runs/offline_dataset")
     parser.add_argument("--preview-dir", default=None)
     parser.add_argument("--preview-cases", type=int, default=6)
+    parser.add_argument("--name", "-n", default="generated_dataset")
     parser.add_argument("--seed", type=int, default=7)
     return parser
 
@@ -83,12 +84,20 @@ def _build_sample_parser() -> argparse.ArgumentParser:
 def generate_dataset_main(argv: list[str] | None = None) -> None:
     parser = _build_generate_dataset_parser()
     args = parser.parse_args(argv)
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    logdir_path = Path(args.logdir) / f"{timestamp}-{args.name}"
+    logdir_path.mkdir(parents=True, exist_ok=True)
+    preview_path = (
+        args.preview_dir
+        if args.preview_dir is not None
+        else str(logdir_path / "preview")
+    )
     config = OfflineDatasetConfig(
         num_cases=args.num_cases,
         seed=args.seed,
         output_path=args.output_path,
-        logdir=args.logdir,
-        preview_dir=args.preview_dir,
+        logdir=str(logdir_path),
+        preview_dir=preview_path,
         preview_cases=args.preview_cases,
         primitive=PrimitiveConfig(num_free_nodes=args.num_free_nodes),
         optimization=CaseOptimizationConfig(num_steps=args.optimization_steps),
@@ -99,8 +108,10 @@ def generate_dataset_main(argv: list[str] | None = None) -> None:
         if args.preview_dir is not None
         else Path(args.output_path).parent / f"{Path(args.output_path).stem}_preview"
     )
+    preview_dir_path = Path(preview_path)
     print(f"dataset={args.output_path}")
-    print(f"visualizations={preview_dir}")
+    print(f"visualizations={preview_dir_path}")
+    print(f"logs={logdir_path}")
 
 
 def visualize_dataset_main(argv: list[str] | None = None) -> None:
