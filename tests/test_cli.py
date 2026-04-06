@@ -3,8 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from compliant_mechanism_synthesis.cli import (
-    generate_dataset_main,
-    sample_main,
+    dataset_generate_main,
     train_supervised_main,
     visualize_dataset_main,
 )
@@ -12,10 +11,10 @@ from compliant_mechanism_synthesis.dataset import load_offline_dataset
 import pytest
 
 
-def test_generate_dataset_main_generates_offline_dataset_and_preview(tmp_path: Path) -> None:
+def test_dataset_generate_main_generates_offline_dataset_and_preview(tmp_path: Path) -> None:
     output_path = tmp_path / "dataset.pt"
     preview_dir = tmp_path / "preview"
-    generate_dataset_main(
+    dataset_generate_main(
         [
             "--num-cases",
             "2",
@@ -25,13 +24,13 @@ def test_generate_dataset_main_generates_offline_dataset_and_preview(tmp_path: P
             "3",
             "--output-path",
             str(output_path),
-            "--logdir",
-            str(tmp_path / "runs"),
+        "--logdir",
+        str(tmp_path / "runs"),
         "--preview-dir",
         str(preview_dir),
-            "--preview-cases",
-            "2",
-        ]
+        "--preview-cases",
+        "2",
+    ]
     )
 
     optimized_cases, primitive_kinds, _ = load_offline_dataset(output_path)
@@ -40,12 +39,12 @@ def test_generate_dataset_main_generates_offline_dataset_and_preview(tmp_path: P
     assert (preview_dir / "summary.txt").exists()
 
 
-def test_generate_dataset_main_names_run(tmp_path: Path) -> None:
+def test_dataset_generate_main_names_run(tmp_path: Path) -> None:
     output_path = tmp_path / "dataset.pt"
     runs_dir = tmp_path / "runs_named"
     create_logdir = runs_dir
     name = "fancygen"
-    generate_dataset_main(
+    dataset_generate_main(
         [
             "--num-cases",
             "1",
@@ -66,27 +65,29 @@ def test_generate_dataset_main_names_run(tmp_path: Path) -> None:
     assert entries[0].name.endswith(f"-{name}")
 
 
-def test_sample_main_writes_images(tmp_path: Path) -> None:
-    sample_main(
+def test_dataset_generate_can_run_sample_check(tmp_path: Path) -> None:
+    sample_dir = tmp_path / "sample"
+    dataset_generate_main(
         [
-            "--primitive",
+            "--just-check-sample",
+            "--sample-primitive",
             "straight_beam",
-            "--num-free-nodes",
+            "--sample-num-free-nodes",
             "6",
-            "--optimization-steps",
+            "--sample-optimization-steps",
             "3",
-            "--output-dir",
-            str(tmp_path),
+            "--sample-output-dir",
+            str(sample_dir),
         ]
     )
 
-    assert (tmp_path / "initial.png").exists()
-    assert (tmp_path / "optimized.png").exists()
+    assert (sample_dir / "initial.png").exists()
+    assert (sample_dir / "optimized.png").exists()
 
 
 def test_visualize_dataset_main_renders_existing_dataset(tmp_path: Path) -> None:
     output_path = tmp_path / "dataset.pt"
-    generate_dataset_main(
+    dataset_generate_main(
         [
             "--num-cases",
             "2",
@@ -119,7 +120,7 @@ def test_visualize_dataset_main_renders_existing_dataset(tmp_path: Path) -> None
 
 def test_train_supervised_main_writes_checkpoint(tmp_path: Path) -> None:
     output_path = tmp_path / "dataset.pt"
-    generate_dataset_main(
+    dataset_generate_main(
         [
             "--num-cases",
             "2",

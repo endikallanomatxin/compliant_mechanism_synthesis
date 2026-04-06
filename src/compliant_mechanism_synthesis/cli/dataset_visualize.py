@@ -9,7 +9,7 @@ from compliant_mechanism_synthesis.visualization import write_dataset_visualizat
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="cms-visualize-dataset",
+        prog="cms-dataset-visualize",
         description="Render dataset previews and a summary from an existing offline dataset.",
     )
     parser.add_argument("--dataset-path", required=True)

@@ -13,10 +13,9 @@ dependencies = [
 ]
 
 [project.scripts]
-cms-generate-dataset = "compliant_mechanism_synthesis.cli:generate_dataset_main"
-cms-sample = "compliant_mechanism_synthesis.cli:sample_main"
+cms-dataset-generate = "compliant_mechanism_synthesis.cli:dataset_generate_main"
 cms-train-supervised = "compliant_mechanism_synthesis.cli:train_supervised_main"
-cms-visualize-dataset = "compliant_mechanism_synthesis.cli:visualize_dataset_main"
+cms-dataset-visualize = "compliant_mechanism_synthesis.cli:visualize_dataset_main"
 
 [build-system]
 requires = ["setuptools>=68"]

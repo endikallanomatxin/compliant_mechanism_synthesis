@@ -91,7 +91,7 @@ uv sync
 Generate an offline dataset:
 
 ```bash
-uv run cms-generate-dataset \
+uv run cms-dataset-generate \
   --num-cases 32 \
   --num-free-nodes 18 \
   --optimization-steps 120 \
@@ -105,22 +105,23 @@ By default this also writes preview images and a `summary.txt` file under
 Render previews again from an existing dataset:
 
 ```bash
-uv run cms-visualize-dataset \
+uv run cms-dataset-visualize \
   --dataset-path artifacts/offline_dataset.pt \
   --output-dir artifacts/offline_dataset_preview
 ```
 
-Inspect a single optimized case:
+Inspect a single optimized case via `cms-dataset-generate`:
 
 ```bash
-uv run cms-sample \
-  --primitive curved_lattice_sheet \
-  --num-free-nodes 18 \
-  --optimization-steps 120 \
-  --output-dir artifacts/sample_case
+uv run cms-dataset-generate \
+  --just-check-sample \
+  --sample-primitive curved_lattice_sheet \
+  --sample-num-free-nodes 18 \
+  --sample-optimization-steps 120 \
+  --sample-output-dir artifacts/sample_case
 ```
 
-The sample command writes:
+The check writes:
 
 - `initial.png`
 - `optimized.png`
