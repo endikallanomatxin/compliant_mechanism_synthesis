@@ -9,6 +9,7 @@ from compliant_mechanism_synthesis.dataset import (
     OfflineDatasetConfig,
     PrimitiveConfig,
     generate_offline_dataset,
+    load_offline_dataset,
     optimize_cases,
     sample_primitive_design,
     sample_target_stiffness,
@@ -45,7 +46,7 @@ def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) 
 
 
 def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
-    payload = generate_offline_dataset(
+    optimized_cases = generate_offline_dataset(
         OfflineDatasetConfig(
             num_cases=2,
             output_path=str(tmp_path / "dataset.pt"),
@@ -55,6 +56,9 @@ def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
         )
     )
 
-    assert payload["optimized_structures"]["adjacency"].shape == (2, 12, 12)
-    assert payload["last_analyses"]["generalized_stiffness"].shape == (2, 6, 6)
+    loaded_cases, primitive_kinds, loaded_config = load_offline_dataset(tmp_path / "dataset.pt")
+    assert optimized_cases.optimized_structures.adjacency.shape == (2, 12, 12)
+    assert loaded_cases.last_analyses.generalized_stiffness.shape == (2, 6, 6)
+    assert len(primitive_kinds) == 2
+    assert loaded_config.num_cases == 2
     assert (tmp_path / "dataset.pt").exists()

@@ -8,12 +8,12 @@ from compliant_mechanism_synthesis.dataset import (
     OfflineDatasetConfig,
     PrimitiveConfig,
     generate_offline_dataset,
+    load_offline_dataset,
     optimize_cases,
     sample_primitive_design,
     sample_target_stiffness,
 )
 from compliant_mechanism_synthesis.visualization import (
-    load_dataset_payload,
     plot_design_3d,
     write_dataset_visualizations,
 )
@@ -86,13 +86,18 @@ def visualize_dataset_main(argv: list[str] | None = None) -> None:
     parser = _build_visualize_dataset_parser()
     args = parser.parse_args(argv)
     dataset_path = Path(args.dataset_path)
-    payload = load_dataset_payload(dataset_path)
+    optimized_cases, primitive_kinds, _ = load_offline_dataset(dataset_path)
     output_dir = (
         Path(args.output_dir)
         if args.output_dir is not None
         else dataset_path.parent / f"{dataset_path.stem}_preview"
     )
-    write_dataset_visualizations(payload, output_dir, max_cases=args.max_cases)
+    write_dataset_visualizations(
+        optimized_cases=optimized_cases,
+        primitive_kinds=primitive_kinds,
+        output_dir=output_dir,
+        max_cases=args.max_cases,
+    )
     print(f"dataset={dataset_path}")
     print(f"visualizations={output_dir}")
 

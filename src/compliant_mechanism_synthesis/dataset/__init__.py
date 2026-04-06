@@ -1,6 +1,11 @@
 """Offline dataset generation and case optimization."""
 
-from compliant_mechanism_synthesis.dataset.offline import OfflineDatasetConfig, generate_offline_dataset
+from compliant_mechanism_synthesis.dataset.offline import (
+    OfflineDatasetConfig,
+    generate_offline_dataset,
+    load_offline_dataset,
+    save_offline_dataset,
+)
 from compliant_mechanism_synthesis.dataset.optimization import (
     CaseOptimizationConfig,
     OptimizationLossWeights,
@@ -25,7 +30,9 @@ __all__ = [
     "PrimitiveConfig",
     "Structures",
     "generate_offline_dataset",
+    "load_offline_dataset",
     "optimize_cases",
+    "save_offline_dataset",
     "sample_primitive_design",
     "sample_random_primitive",
     "sample_target_stiffness",

@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import torch
-
 from compliant_mechanism_synthesis.cli import (
     generate_dataset_main,
     sample_main,
     visualize_dataset_main,
 )
+from compliant_mechanism_synthesis.dataset import load_offline_dataset
 
 
 def test_generate_dataset_main_generates_offline_dataset_and_preview(tmp_path: Path) -> None:
@@ -33,8 +32,9 @@ def test_generate_dataset_main_generates_offline_dataset_and_preview(tmp_path: P
         ]
     )
 
-    payload = torch.load(output_path)
-    assert payload["optimized_structures"]["positions"].shape == (2, 12, 3)
+    optimized_cases, primitive_kinds, _ = load_offline_dataset(output_path)
+    assert optimized_cases.optimized_structures.positions.shape == (2, 12, 3)
+    assert len(primitive_kinds) == 2
     assert (preview_dir / "summary.txt").exists()
 
 
