@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import torch
+
+from compliant_mechanism_synthesis.visualization.plots import plot_design_3d
+
+
+def _loss_improvement(initial_loss: torch.Tensor, best_loss: torch.Tensor) -> torch.Tensor:
+    safe_scale = initial_loss.abs().clamp_min(1e-6)
+    return (initial_loss - best_loss) / safe_scale
+
+
+def write_dataset_visualizations(
+    payload: dict[str, object],
+    output_dir: str | Path,
+    max_cases: int = 6,
+) -> Path:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    primitive_kind = payload["primitive_kind"]
+    initial_positions = payload["initial_positions"]
+    initial_roles = payload["initial_roles"]
+    initial_adjacency = payload["initial_adjacency"]
+    optimized_positions = payload["optimized_positions"]
+    optimized_roles = payload["optimized_roles"]
+    optimized_adjacency = payload["optimized_adjacency"]
+    initial_loss = payload["initial_loss"]
+    best_loss = payload["best_loss"]
+    target_stiffness = payload["target_stiffness"]
+
+    improvement = _loss_improvement(initial_loss, best_loss)
+    case_count = min(int(initial_positions.shape[0]), max_cases)
+    summary_lines = [
+        f"cases={int(initial_positions.shape[0])}",
+        f"preview_cases={case_count}",
+        f"mean_initial_loss={float(initial_loss.mean().item()):.6f}",
+        f"mean_best_loss={float(best_loss.mean().item()):.6f}",
+        f"mean_relative_improvement={float(improvement.mean().item()):.6f}",
+    ]
+
+    for case_index in range(case_count):
+        title_prefix = f"case_{case_index:04d}_{primitive_kind[case_index]}"
+        initial_figure = plot_design_3d(
+            initial_positions[case_index],
+            initial_roles[case_index],
+            initial_adjacency[case_index],
+            title=f"{title_prefix}_initial",
+        )
+        optimized_figure = plot_design_3d(
+            optimized_positions[case_index],
+            optimized_roles[case_index],
+            optimized_adjacency[case_index],
+            title=f"{title_prefix}_optimized",
+        )
+        initial_figure.savefig(output_path / f"{title_prefix}_initial.png", dpi=160, bbox_inches="tight")
+        optimized_figure.savefig(output_path / f"{title_prefix}_optimized.png", dpi=160, bbox_inches="tight")
+        plt.close(initial_figure)
+        plt.close(optimized_figure)
+
+        summary_lines.extend(
+            [
+                f"[case_{case_index:04d}]",
+                f"primitive={primitive_kind[case_index]}",
+                f"initial_loss={float(initial_loss[case_index].item()):.6f}",
+                f"best_loss={float(best_loss[case_index].item()):.6f}",
+                f"relative_improvement={float(improvement[case_index].item()):.6f}",
+                f"target_trace={float(torch.trace(target_stiffness[case_index]).item()):.6f}",
+            ]
+        )
+
+    (output_path / "summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    return output_path
+
+
+def load_dataset_payload(dataset_path: str | Path) -> dict[str, object]:
+    return torch.load(dataset_path)

@@ -12,15 +12,18 @@ from compliant_mechanism_synthesis.dataset import (
     sample_primitive_design,
     sample_target_stiffness,
 )
-from compliant_mechanism_synthesis.visualization import plot_design_3d
+from compliant_mechanism_synthesis.visualization import (
+    load_dataset_payload,
+    plot_design_3d,
+    write_dataset_visualizations,
+)
 
 
-def _build_train_parser() -> argparse.ArgumentParser:
+def _build_generate_dataset_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="cms-train",
+        prog="cms-generate-dataset",
         description=(
-            "Generate and refine an offline dataset of 3D compliant-mechanism "
-            "cases. This is the first stage of the refactor and replaces the old RL-first loop."
+            "Generate and refine an offline dataset of 3D compliant-mechanism cases."
         ),
     )
     parser.add_argument("--num-cases", type=int, default=32)
@@ -28,7 +31,20 @@ def _build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimization-steps", type=int, default=120)
     parser.add_argument("--output-path", default="artifacts/offline_dataset.pt")
     parser.add_argument("--logdir", default="runs/offline_dataset")
+    parser.add_argument("--preview-dir", default=None)
+    parser.add_argument("--preview-cases", type=int, default=6)
     parser.add_argument("--seed", type=int, default=7)
+    return parser
+
+
+def _build_visualize_dataset_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cms-visualize-dataset",
+        description="Render dataset previews and a summary from an existing offline dataset.",
+    )
+    parser.add_argument("--dataset-path", required=True)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--max-cases", type=int, default=6)
     return parser
 
 
@@ -47,18 +63,42 @@ def _build_sample_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def train_main(argv: list[str] | None = None) -> None:
-    parser = _build_train_parser()
+def generate_dataset_main(argv: list[str] | None = None) -> None:
+    parser = _build_generate_dataset_parser()
     args = parser.parse_args(argv)
     config = OfflineDatasetConfig(
         num_cases=args.num_cases,
         seed=args.seed,
         output_path=args.output_path,
         logdir=args.logdir,
+        preview_dir=args.preview_dir,
+        preview_cases=args.preview_cases,
         primitive=PrimitiveConfig(num_free_nodes=args.num_free_nodes),
         optimization=CaseOptimizationConfig(num_steps=args.optimization_steps),
     )
     generate_offline_dataset(config)
+    preview_dir = (
+        Path(args.preview_dir)
+        if args.preview_dir is not None
+        else Path(args.output_path).parent / f"{Path(args.output_path).stem}_preview"
+    )
+    print(f"dataset={args.output_path}")
+    print(f"visualizations={preview_dir}")
+
+
+def visualize_dataset_main(argv: list[str] | None = None) -> None:
+    parser = _build_visualize_dataset_parser()
+    args = parser.parse_args(argv)
+    dataset_path = Path(args.dataset_path)
+    payload = load_dataset_payload(dataset_path)
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir is not None
+        else dataset_path.parent / f"{dataset_path.stem}_preview"
+    )
+    write_dataset_visualizations(payload, output_dir, max_cases=args.max_cases)
+    print(f"dataset={dataset_path}")
+    print(f"visualizations={output_dir}")
 
 
 def sample_main(argv: list[str] | None = None) -> None:

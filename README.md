@@ -91,12 +91,23 @@ uv sync
 Generate an offline dataset:
 
 ```bash
-uv run cms-train \
+uv run cms-generate-dataset \
   --num-cases 32 \
   --num-free-nodes 18 \
   --optimization-steps 120 \
   --output-path artifacts/offline_dataset.pt \
   --logdir runs/offline_dataset
+```
+
+By default this also writes preview images and a `summary.txt` file under
+`artifacts/offline_dataset_preview/`.
+
+Render previews again from an existing dataset:
+
+```bash
+uv run cms-visualize-dataset \
+  --dataset-path artifacts/offline_dataset.pt \
+  --output-dir artifacts/offline_dataset_preview
 ```
 
 Inspect a single optimized case:

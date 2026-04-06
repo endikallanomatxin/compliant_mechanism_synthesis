@@ -16,6 +16,7 @@ from compliant_mechanism_synthesis.dataset.primitives import (
     PrimitiveConfig,
     sample_primitive_design,
 )
+from compliant_mechanism_synthesis.visualization import write_dataset_visualizations
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,8 @@ class OfflineDatasetConfig:
     seed: int = 7
     output_path: str = "artifacts/offline_dataset.pt"
     logdir: str = "runs/offline_dataset"
+    preview_dir: str | None = None
+    preview_cases: int = 6
     primitive: PrimitiveConfig = PrimitiveConfig()
     optimization: CaseOptimizationConfig = field(default_factory=CaseOptimizationConfig)
 
@@ -73,4 +76,10 @@ def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> dict
         "config": asdict(config),
     }
     torch.save(payload, output_path)
+    preview_dir = (
+        Path(config.preview_dir)
+        if config.preview_dir is not None
+        else output_path.parent / f"{output_path.stem}_preview"
+    )
+    write_dataset_visualizations(payload, preview_dir, max_cases=config.preview_cases)
     return payload
