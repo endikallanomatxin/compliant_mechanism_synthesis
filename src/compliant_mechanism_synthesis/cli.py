@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 from compliant_mechanism_synthesis.dataset import (
@@ -62,6 +63,7 @@ def _build_train_supervised_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-steps", type=int, default=10_000)
     parser.add_argument("--checkpoint-path", default="artifacts/supervised_refiner.pt")
     parser.add_argument("--logdir", default="runs/supervised")
+    parser.add_argument("--name", "-n", default="supervised")
     return parser
 
 
@@ -124,15 +126,19 @@ def visualize_dataset_main(argv: list[str] | None = None) -> None:
 def train_supervised_main(argv: list[str] | None = None) -> None:
     parser = _build_train_supervised_parser()
     args = parser.parse_args(argv)
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    logdir_path = Path(args.logdir) / f"{timestamp}-{args.name}"
+    logdir_path.mkdir(parents=True, exist_ok=True)
     run_supervised_training(
         SupervisedTrainingConfig(
             dataset_path=args.dataset_path,
             batch_size=args.batch_size,
             num_steps=args.num_steps,
             checkpoint_path=args.checkpoint_path,
-            logdir=args.logdir,
+            logdir=str(logdir_path),
         )
     )
+    print(f"logs={logdir_path}")
 
 
 def sample_main(argv: list[str] | None = None) -> None:
