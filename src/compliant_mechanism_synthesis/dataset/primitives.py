@@ -29,6 +29,10 @@ class PrimitiveConfig:
     thickness: float = 0.10
     anchor_radius: float = 0.04
     neighbor_count: int = 3
+    free_z_min: float = 0.28
+    free_z_max: float = 0.72
+    fixed_anchor_z: float = 0.10
+    mobile_anchor_z: float = 0.90
 
 
 def _orthonormal_frame(direction: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -42,15 +46,18 @@ def _orthonormal_frame(direction: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return direction, normal_1, normal_2
 
 
-def _anchor_triangle(center: torch.Tensor, direction: torch.Tensor, radius: float) -> torch.Tensor:
-    _, normal_1, normal_2 = _orthonormal_frame(direction)
+def _anchor_triangle(center: torch.Tensor, radius: float, anchor_z: float) -> torch.Tensor:
     angles = [0.0, 2.0 * math.pi / 3.0, 4.0 * math.pi / 3.0]
     anchors = []
+    anchor_center = center.clone()
+    anchor_center[2] = anchor_z
     for angle in angles:
+        planar_offset = torch.tensor(
+            [radius * math.cos(angle), radius * math.sin(angle), 0.0],
+            dtype=center.dtype,
+        )
         anchors.append(
-            center
-            + radius
-            * (math.cos(angle) * normal_1 + math.sin(angle) * normal_2)
+            anchor_center + planar_offset
         )
     return torch.stack(anchors, dim=0)
 
@@ -136,6 +143,22 @@ def _sample_free_positions(
     return positions.clamp(0.05, 0.95)
 
 
+def _remap_free_positions_z(
+    positions: torch.Tensor,
+    config: PrimitiveConfig,
+) -> torch.Tensor:
+    remapped = positions.clone()
+    z_values = remapped[:, 2]
+    z_min = float(z_values.min().item())
+    z_max = float(z_values.max().item())
+    if z_max - z_min < 1e-6:
+        remapped[:, 2] = 0.5 * (config.free_z_min + config.free_z_max)
+        return remapped
+    normalized_z = (z_values - z_min) / (z_max - z_min)
+    remapped[:, 2] = config.free_z_min + normalized_z * (config.free_z_max - config.free_z_min)
+    return remapped
+
+
 def _connect_local_neighbors(positions: torch.Tensor, adjacency: torch.Tensor, neighbor_count: int) -> None:
     pairwise = torch.linalg.vector_norm(positions[:, None, :] - positions[None, :, :], dim=-1)
     for node_index in range(positions.shape[0]):
@@ -151,14 +174,11 @@ def sample_primitive_design(
 ) -> Structures:
     config = config or PrimitiveConfig()
     rng = random.Random(seed)
-    free_positions = _sample_free_positions(kind, config, rng)
+    free_positions = _remap_free_positions_z(_sample_free_positions(kind, config, rng), config)
     start_center = _path(kind, torch.tensor([0.0], dtype=torch.float32))[0]
     end_center = _path(kind, torch.tensor([1.0], dtype=torch.float32))[0]
-    start_direction = free_positions[0] - start_center
-    end_direction = end_center - free_positions[-1]
-
-    fixed_anchors = _anchor_triangle(start_center, start_direction, config.anchor_radius)
-    mobile_anchors = _anchor_triangle(end_center, end_direction, config.anchor_radius)
+    fixed_anchors = _anchor_triangle(start_center, config.anchor_radius, anchor_z=config.fixed_anchor_z)
+    mobile_anchors = _anchor_triangle(end_center, config.anchor_radius, anchor_z=config.mobile_anchor_z)
     positions = torch.cat([fixed_anchors, mobile_anchors, free_positions], dim=0).clamp(0.02, 0.98)
 
     roles = torch.tensor(

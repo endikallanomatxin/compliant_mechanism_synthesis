@@ -27,6 +27,21 @@ def test_sample_primitive_design_is_valid_in_3d() -> None:
     assert torch.count_nonzero(structures.adjacency) > 0
 
 
+def test_sample_primitive_design_places_fixed_anchors_below_mobile_anchors() -> None:
+    structures = sample_primitive_design(
+        "straight_beam",
+        config=PrimitiveConfig(num_free_nodes=8),
+        seed=7,
+    )
+
+    fixed_z = structures.positions[0, :3, 2]
+    mobile_z = structures.positions[0, 3:6, 2]
+    free_z = structures.positions[0, 6:, 2]
+    assert torch.max(fixed_z) < torch.min(free_z)
+    assert torch.max(free_z) < torch.min(mobile_z)
+    assert torch.max(fixed_z) < torch.min(mobile_z)
+
+
 def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) -> None:
     initial_structures = sample_primitive_design(
         "straight_beam",
