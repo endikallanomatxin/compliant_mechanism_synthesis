@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from compliant_mechanism_synthesis.cli.common import timestamped_run_dir
+from compliant_mechanism_synthesis.utils import timestamped_run_dir
 from compliant_mechanism_synthesis.training import (
     SupervisedTrainingConfig,
     run_supervised_training,
