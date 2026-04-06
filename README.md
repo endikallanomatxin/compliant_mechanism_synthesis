@@ -95,12 +95,11 @@ uv run cms-dataset-generate \
   --num-cases 32 \
   --num-free-nodes 18 \
   --optimization-steps 120 \
-  --output-path datasets/offline_dataset.pt \
-  --logdir runs/offline_dataset
+  --logdir datasets
 ```
 
-By default this also writes preview images and a `summary.txt` file under
-`datasets/offline_dataset_preview/`.
+By default this also writes the `.pt`, previews and `summary.txt` under the
+run directory (something like `datasets/20260406T180000-supervised/`).
 
 Render previews again from an existing dataset:
 
