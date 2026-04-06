@@ -22,7 +22,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Generate and refine an offline dataset of 3D compliant-mechanism cases.",
     )
     parser.add_argument("--num-cases", type=int, default=32)
-    parser.add_argument("--num-free-nodes", type=int, default=18)
+    parser.add_argument("--num-free-nodes", type=int, default=6)
     parser.add_argument("--optimization-steps", type=int, default=120)
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--logdir", default="datasets")
@@ -31,8 +31,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--name", "-n", default="generated_dataset")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--just-check-sample", action="store_true")
-    parser.add_argument("--sample-primitive", default="curved_lattice_sheet")
-    parser.add_argument("--sample-num-free-nodes", type=int, default=18)
+    parser.add_argument("--sample-num-free-nodes", type=int, default=6)
     parser.add_argument("--sample-optimization-steps", type=int, default=120)
     parser.add_argument("--sample-output-dir", default="artifacts/sample_case")
     parser.add_argument("--sample-seed", type=int, default=7)
@@ -75,7 +74,8 @@ def _run_sample_check(args: argparse.Namespace) -> None:
     primitive_cfg = PrimitiveConfig(num_free_nodes=args.sample_num_free_nodes)
     optimization = CaseOptimizationConfig(num_steps=args.sample_optimization_steps)
     initial_structures = sample_primitive_design(
-        args.sample_primitive, config=primitive_cfg, seed=args.sample_seed
+        config=primitive_cfg,
+        seed=args.sample_seed,
     )
     target = sample_target_stiffness(
         initial_structures, config=optimization, seed=args.sample_seed + 1
@@ -86,24 +86,23 @@ def _run_sample_check(args: argparse.Namespace) -> None:
         config=optimization,
         logdir=output_dir / "tensorboard_cases",
     )
-    _dump_sample_figures(result, output_dir, args.sample_primitive)
-    print(f"primitive={args.sample_primitive}")
+    _dump_sample_figures(result, output_dir)
     print(f"initial_loss={float(result.initial_loss[0].item()):.6f}")
     print(f"best_loss={float(result.best_loss[0].item()):.6f}")
 
 
-def _dump_sample_figures(result, output_dir: Path, primitive: str) -> None:
+def _dump_sample_figures(result, output_dir: Path) -> None:
     initial_figure = plot_design_3d(
         result.raw_structures.positions[0],
         result.raw_structures.roles[0],
         result.raw_structures.adjacency[0],
-        title=f"initial-{primitive}",
+        title="initial",
     )
     optimized_figure = plot_design_3d(
         result.optimized_structures.positions[0],
         result.optimized_structures.roles[0],
         result.optimized_structures.adjacency[0],
-        title=f"optimized-{primitive}",
+        title="optimized",
     )
     initial_figure.savefig(output_dir / "initial.png", dpi=160, bbox_inches="tight")
     optimized_figure.savefig(output_dir / "optimized.png", dpi=160, bbox_inches="tight")

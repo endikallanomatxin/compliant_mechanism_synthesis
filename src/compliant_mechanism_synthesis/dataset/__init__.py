@@ -14,7 +14,6 @@ from compliant_mechanism_synthesis.dataset.optimization import (
 )
 from compliant_mechanism_synthesis.dataset.primitives import (
     CHAIN_PRIMITIVE_LIBRARY,
-    PRIMITIVE_LIBRARY,
     PrimitiveConfig,
     sample_primitive_design,
     sample_random_primitive,
@@ -28,7 +27,6 @@ __all__ = [
     "OfflineDatasetConfig",
     "OptimizationLossWeights",
     "OptimizedCases",
-    "PRIMITIVE_LIBRARY",
     "PrimitiveConfig",
     "Scaffolds",
     "Structures",

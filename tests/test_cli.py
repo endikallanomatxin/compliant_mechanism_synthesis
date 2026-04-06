@@ -34,7 +34,8 @@ def test_dataset_generate_main_generates_offline_dataset_and_preview(tmp_path: P
     )
 
     optimized_cases, _ = load_offline_dataset(output_path)
-    assert optimized_cases.optimized_structures.positions.shape == (2, 24, 3)
+    assert optimized_cases.optimized_structures.positions.shape[0] == 2
+    assert optimized_cases.optimized_structures.positions.shape[-1] == 3
     assert (preview_dir / "case_0000_primitives.png").exists()
     assert (preview_dir / "summary.txt").exists()
 
@@ -70,8 +71,6 @@ def test_dataset_generate_can_run_sample_check(tmp_path: Path) -> None:
     dataset_generate_main(
         [
             "--just-check-sample",
-            "--sample-primitive",
-            "straight_beam",
             "--sample-num-free-nodes",
             "6",
             "--sample-optimization-steps",

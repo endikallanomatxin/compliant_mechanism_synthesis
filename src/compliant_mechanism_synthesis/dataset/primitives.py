@@ -10,17 +10,6 @@ from compliant_mechanism_synthesis.dataset.types import Scaffolds, Structures
 from compliant_mechanism_synthesis.roles import NodeRole
 from compliant_mechanism_synthesis.tensor_ops import symmetrize_matrix
 
-
-PRIMITIVE_LIBRARY = (
-    "straight_lattice_sheet",
-    "curved_lattice_sheet",
-    "helix_lattice_sheet",
-    "straight_beam",
-    "curved_beam",
-    "path_truss",
-    "loose_cloud",
-)
-
 CHAIN_PRIMITIVE_LIBRARY = (
     "rod",
     "ribbon",
@@ -30,12 +19,18 @@ CHAIN_PRIMITIVE_LIBRARY = (
     "truss",
 )
 
+# During scaffold-to-mesh debugging we intentionally keep the active primitive
+# family to the simplest one. That gives us one geometry/conectivity pattern to
+# validate visually before re-introducing wider families.
+ACTIVE_CHAIN_PRIMITIVE_LIBRARY = ("rod",)
+
 
 @dataclass(frozen=True)
 class PrimitiveConfig:
     # This controls the sparse scaffolding graph, not the final number of free
-    # FEM nodes. The scaffold is expanded into connection triplets later.
-    num_free_nodes: int = 14
+    # FEM nodes. We keep the default sparse on purpose during primitive
+    # debugging so the scaffold-to-mesh conversion remains visually readable.
+    num_free_nodes: int = 6
     width: float = 0.18
     thickness: float = 0.10
     anchor_radius: float = 0.04
@@ -51,6 +46,7 @@ class PrimitiveConfig:
     free_z_max: float = 0.72
     fixed_anchor_z: float = 0.10
     mobile_anchor_z: float = 0.90
+    target_edge_length: float = 0.08
 
 
 @dataclass(frozen=True)
@@ -77,115 +73,27 @@ def _orthonormal_frame(direction: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return direction, normal_1, normal_2
 
 
-def _path(kind: str, t: torch.Tensor) -> torch.Tensor:
-    x = 0.15 + 0.70 * t
-    if kind == "straight_beam":
-        y = torch.full_like(t, 0.50)
-        z = torch.full_like(t, 0.50)
-    elif kind == "curved_beam":
-        y = 0.50 + 0.16 * torch.sin(math.pi * t)
-        z = 0.50 + 0.10 * torch.sin(2.0 * math.pi * t + 0.25)
-    elif kind == "straight_lattice_sheet":
-        y = torch.full_like(t, 0.50)
-        z = torch.full_like(t, 0.45)
-    elif kind == "curved_lattice_sheet":
-        y = 0.50 + 0.15 * torch.sin(math.pi * t)
-        z = 0.45 + 0.08 * torch.sin(2.0 * math.pi * t)
-    elif kind == "helix_lattice_sheet":
-        angle = 2.5 * math.pi * t
-        y = 0.50 + 0.15 * torch.cos(angle)
-        z = 0.50 + 0.15 * torch.sin(angle)
-    elif kind == "path_truss":
-        y = 0.50 + 0.08 * torch.sin(2.0 * math.pi * t)
-        z = 0.50 + 0.08 * torch.cos(2.0 * math.pi * t)
-    elif kind == "loose_cloud":
-        y = 0.50 + 0.05 * torch.sin(3.0 * math.pi * t)
-        z = 0.50 + 0.05 * torch.cos(2.0 * math.pi * t)
-    else:
-        raise ValueError(f"unknown primitive kind: {kind}")
-    return torch.stack([x, y, z], dim=-1)
-
-
-def _sample_free_scaffold_positions(
-    kind: str,
+def _sample_random_scaffold_centers(
     config: PrimitiveConfig,
     rng: random.Random,
 ) -> torch.Tensor:
-    t = torch.linspace(0.0, 1.0, steps=config.num_free_nodes + 2, dtype=torch.float32)[1:-1]
-    centerline = _path(kind, t)
+    start_center = torch.tensor([0.12, 0.50, config.fixed_anchor_z], dtype=torch.float32)
+    end_center = torch.tensor([0.88, 0.50, config.mobile_anchor_z], dtype=torch.float32)
 
-    if kind in {"straight_beam", "curved_beam"}:
-        jitter = torch.tensor(
-            [
-                [rng.uniform(-0.03, 0.03), rng.uniform(-0.03, 0.03), rng.uniform(-0.03, 0.03)]
-                for _ in range(config.num_free_nodes)
-            ],
-            dtype=torch.float32,
-        )
-        positions = centerline + jitter
-    elif kind in {"straight_lattice_sheet", "curved_lattice_sheet", "helix_lattice_sheet"}:
-        positions = []
-        lateral = config.width / 2.0
-        for index, point in enumerate(centerline):
-            left_right = -1.0 if index % 2 == 0 else 1.0
-            tangent_t0 = max(index - 1, 0)
-            tangent_t1 = min(index + 1, centerline.shape[0] - 1)
-            tangent = centerline[tangent_t1] - centerline[tangent_t0]
-            _, normal_1, normal_2 = _orthonormal_frame(tangent)
-            layer = normal_1 if index % 3 else normal_2
-            positions.append(point + lateral * left_right * layer)
-        positions = torch.stack(positions, dim=0)
-    elif kind == "path_truss":
-        positions = []
-        for index, point in enumerate(centerline):
-            tangent_t0 = max(index - 1, 0)
-            tangent_t1 = min(index + 1, centerline.shape[0] - 1)
-            tangent = centerline[tangent_t1] - centerline[tangent_t0]
-            _, normal_1, normal_2 = _orthonormal_frame(tangent)
-            angle = 2.0 * math.pi * (index % 3) / 3.0
-            positions.append(
-                point
-                + 0.5 * config.width * math.cos(angle) * normal_1
-                + 0.5 * config.thickness * math.sin(angle) * normal_2
-            )
-        positions = torch.stack(positions, dim=0)
-    elif kind == "loose_cloud":
-        positions = centerline + torch.tensor(
-            [
-                [rng.uniform(-0.14, 0.14), rng.uniform(-0.18, 0.18), rng.uniform(-0.18, 0.18)]
-                for _ in range(config.num_free_nodes)
-            ],
-            dtype=torch.float32,
-        )
-    else:
-        raise ValueError(f"unknown primitive kind: {kind}")
-
-    positions = positions.clamp(0.05, 0.95)
-    z_values = positions[:, 2]
-    z_min = float(z_values.min().item())
-    z_max = float(z_values.max().item())
-    if z_max - z_min < 1e-6:
-        positions[:, 2] = 0.5 * (config.free_z_min + config.free_z_max)
-    else:
-        normalized = (z_values - z_min) / (z_max - z_min)
-        positions[:, 2] = config.free_z_min + normalized * (config.free_z_max - config.free_z_min)
-    return positions
-
-
-def _sample_scaffold_centers(
-    kind: str,
-    config: PrimitiveConfig,
-    rng: random.Random,
-) -> torch.Tensor:
-    start_center = _path(kind, torch.tensor([0.0], dtype=torch.float32))[0]
-    end_center = _path(kind, torch.tensor([1.0], dtype=torch.float32))[0]
-    start_center[2] = config.fixed_anchor_z
-    end_center[2] = config.mobile_anchor_z
-    free_positions = _sample_free_scaffold_positions(kind, config, rng)
-    return torch.cat(
-        [start_center.unsqueeze(0), free_positions, end_center.unsqueeze(0)],
-        dim=0,
+    base_x = torch.linspace(0.22, 0.78, steps=config.num_free_nodes, dtype=torch.float32)
+    free_positions = torch.stack(
+        [
+            base_x + torch.tensor([rng.uniform(-0.025, 0.025) for _ in range(config.num_free_nodes)], dtype=torch.float32),
+            torch.tensor([rng.uniform(0.20, 0.80) for _ in range(config.num_free_nodes)], dtype=torch.float32),
+            torch.tensor(
+                [rng.uniform(config.free_z_min, config.free_z_max) for _ in range(config.num_free_nodes)],
+                dtype=torch.float32,
+            ),
+        ],
+        dim=-1,
     )
+    free_positions = free_positions[torch.argsort(free_positions[:, 0])]
+    return torch.cat([start_center.unsqueeze(0), free_positions, end_center.unsqueeze(0)], dim=0)
 
 
 def _localized_edge_probability(
@@ -218,6 +126,27 @@ def _sample_scaffold_connectivity(
     rng: random.Random,
 ) -> torch.Tensor:
     num_nodes = centers.shape[0]
+    if ACTIVE_CHAIN_PRIMITIVE_LIBRARY == ("rod",):
+        adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+        remaining = list(range(1, num_nodes - 1))
+        order = [0]
+        current = 0
+        while remaining:
+            weights = []
+            for candidate in remaining:
+                distance = float(torch.linalg.vector_norm(centers[candidate] - centers[current]).item())
+                forward_bias = max(float(centers[candidate, 0].item() - centers[current, 0].item()), 0.02)
+                weights.append(_localized_edge_probability(distance, config) * forward_bias)
+            next_index = rng.choices(remaining, weights=weights, k=1)[0]
+            order.append(next_index)
+            remaining.remove(next_index)
+            current = next_index
+        order.append(num_nodes - 1)
+        for source, target in zip(order[:-1], order[1:]):
+            adjacency[source, target] = 1.0
+            adjacency[target, source] = 1.0
+        return adjacency
+
     adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
     pairwise = torch.linalg.vector_norm(centers[:, None, :] - centers[None, :, :], dim=-1)
 
@@ -264,7 +193,7 @@ def _sample_chain_primitives(
         assignments.append(
             ChainPrimitiveAssignment(
                 chain=chain,
-                primitive_type=rng.choice(CHAIN_PRIMITIVE_LIBRARY),
+                primitive_type=rng.choice(ACTIVE_CHAIN_PRIMITIVE_LIBRARY),
                 width_start=config.primitive_radius * width_scale * rng.uniform(0.8, 1.1),
                 width_end=config.primitive_radius * width_scale * rng.uniform(0.8, 1.1),
                 thickness_start=config.primitive_radius * thickness_scale * rng.uniform(0.8, 1.1),
@@ -349,7 +278,9 @@ def _primitive_center_offset(
     sweep_phase: float,
 ) -> torch.Tensor:
     if primitive_type == "rod":
-        return 0.08 * width * (math.cos(sweep_phase) * normal_1 + math.sin(sweep_phase) * normal_2)
+        # The debug rod should stay centered on the scaffold so we can assess
+        # whether the expanded FEM mesh actually follows the sparse graph path.
+        return torch.zeros_like(normal_1)
     if primitive_type == "ribbon":
         return 0.18 * width * normal_1
     if primitive_type == "blade":
@@ -417,111 +348,192 @@ def _materialize_scaffold_node_triplets(
     adjacency: torch.Tensor,
     assignments: list[ChainPrimitiveAssignment],
     config: PrimitiveConfig,
-    rng: random.Random,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    node_parameters: dict[int, tuple[str, float, float, float]] = {}
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    degree = adjacency.sum(dim=1).to(dtype=torch.long)
+
+    positions: list[torch.Tensor] = []
+    roles: list[int] = []
+    edges: set[tuple[int, int]] = set()
+    connection_node_indices: dict[int, int] = {}
+
+    def add_node(position: torch.Tensor, role: NodeRole) -> int:
+        positions.append(position)
+        roles.append(int(role))
+        return len(positions) - 1
+
+    def add_edge(source: int, target: int) -> None:
+        if source == target:
+            return
+        edges.add(tuple(sorted((source, target))))
+
+    def ensure_connection_node(scaffold_index: int) -> int:
+        existing = connection_node_indices.get(scaffold_index)
+        if existing is not None:
+            return existing
+        connection_index = add_node(centers[scaffold_index], NodeRole.FREE)
+        connection_node_indices[scaffold_index] = connection_index
+        if scaffold_index == 0 or scaffold_index == centers.shape[0] - 1:
+            tangent = _estimate_scaffold_tangent(centers, adjacency, scaffold_index)
+            _, normal_1, normal_2 = _orthonormal_frame(tangent)
+            anchor_role = NodeRole.FIXED if scaffold_index == 0 else NodeRole.MOBILE
+            anchor_offsets = (
+                config.anchor_radius * normal_1,
+                config.anchor_radius * (-0.5 * normal_1 + 0.866 * normal_2),
+                config.anchor_radius * (-0.5 * normal_1 - 0.866 * normal_2),
+            )
+            anchor_indices = []
+            for offset in anchor_offsets:
+                anchor_index = add_node(centers[scaffold_index] + offset, anchor_role)
+                anchor_indices.append(anchor_index)
+                add_edge(connection_index, anchor_index)
+            for source, target in ((0, 1), (1, 2), (2, 0)):
+                add_edge(anchor_indices[source], anchor_indices[target])
+        return connection_index
+
+    for scaffold_index in range(centers.shape[0]):
+        if scaffold_index in {0, centers.shape[0] - 1} or degree[scaffold_index].item() != 2:
+            ensure_connection_node(scaffold_index)
+
     for assignment in assignments:
-        for local_index, node_index in enumerate(assignment.chain):
-            if node_index in {0, centers.shape[0] - 1}:
-                continue
-            fraction = local_index / max(len(assignment.chain) - 1, 1)
-            width = (1.0 - fraction) * assignment.width_start + fraction * assignment.width_end
-            thickness = (1.0 - fraction) * assignment.thickness_start + fraction * assignment.thickness_end
-            twist = (1.0 - fraction) * assignment.twist_start + fraction * assignment.twist_end
-            if node_index not in node_parameters:
-                node_parameters[node_index] = (assignment.primitive_type, width, thickness, twist)
+        if assignment.primitive_type != "rod":
+            raise ValueError("rod-only debugging path does not support other primitive types yet")
+        chain_positions = _discretize_rod_chain(
+            centers=centers[assignment.chain],
+            target_edge_length=config.target_edge_length,
+        )
+        start_index = ensure_connection_node(assignment.chain[0])
+        end_index = ensure_connection_node(assignment.chain[-1])
 
-    positions = []
-    roles = []
-    for node_index in range(centers.shape[0]):
-        center = centers[node_index]
-        tangent = _estimate_scaffold_tangent(centers, adjacency, node_index)
-        _, normal_1, normal_2 = _orthonormal_frame(tangent)
+        previous_index = start_index
+        for position in chain_positions[1:-1]:
+            node_index = add_node(position, NodeRole.FREE)
+            add_edge(previous_index, node_index)
+            previous_index = node_index
+        add_edge(previous_index, end_index)
 
-        if node_index == 0:
-            role = NodeRole.FIXED
-            offsets = (
-                config.anchor_radius * normal_1,
-                config.anchor_radius * (-0.5 * normal_1 + 0.866 * normal_2),
-                config.anchor_radius * (-0.5 * normal_1 - 0.866 * normal_2),
+    edge_index = torch.tensor(sorted(edges), dtype=torch.long)
+    return (
+        torch.stack(positions, dim=0),
+        torch.tensor(roles, dtype=torch.long),
+        edge_index,
+    )
+
+
+def _catmull_rom_point(
+    p0: torch.Tensor,
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    p3: torch.Tensor,
+    t: float,
+) -> torch.Tensor:
+    t2 = t * t
+    t3 = t2 * t
+    return 0.5 * (
+        (2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+    )
+
+
+def _sample_catmull_rom_polyline(
+    control_points: torch.Tensor,
+    target_edge_length: float,
+) -> torch.Tensor:
+    if control_points.shape[0] <= 2:
+        return control_points
+
+    samples = [control_points[0]]
+    for segment_index in range(control_points.shape[0] - 1):
+        p0 = control_points[max(segment_index - 1, 0)]
+        p1 = control_points[segment_index]
+        p2 = control_points[segment_index + 1]
+        p3 = control_points[min(segment_index + 2, control_points.shape[0] - 1)]
+        segment_length = float(torch.linalg.vector_norm(p2 - p1).item())
+        subdivisions = max(4, int(math.ceil(segment_length / max(target_edge_length, 1e-6))) * 6)
+        for sample_index in range(1, subdivisions + 1):
+            samples.append(
+                _catmull_rom_point(
+                    p0,
+                    p1,
+                    p2,
+                    p3,
+                    sample_index / subdivisions,
+                )
             )
-        elif node_index == centers.shape[0] - 1:
-            role = NodeRole.MOBILE
-            offsets = (
-                config.anchor_radius * normal_1,
-                config.anchor_radius * (-0.5 * normal_1 + 0.866 * normal_2),
-                config.anchor_radius * (-0.5 * normal_1 - 0.866 * normal_2),
-            )
-        else:
-            role = NodeRole.FREE
-            primitive_type, width, thickness, twist = node_parameters.get(
-                node_index,
-                ("rod", config.primitive_radius, 0.75 * config.primitive_radius, 0.0),
-            )
-            if primitive_type == "rod":
-                offsets = (
-                    width * normal_1,
-                    width * (-0.5 * normal_1 + 0.866 * normal_2),
-                    width * (-0.5 * normal_1 - 0.866 * normal_2),
-                )
-            elif primitive_type == "ribbon":
-                offsets = (
-                    width * normal_1 + 0.2 * thickness * normal_2,
-                    -width * normal_1 + 0.2 * thickness * normal_2,
-                    -0.4 * thickness * normal_2,
-                )
-            elif primitive_type == "blade":
-                offsets = (
-                    thickness * normal_2,
-                    -0.5 * thickness * normal_2 + width * normal_1,
-                    -0.5 * thickness * normal_2 - width * normal_1,
-                )
-            elif primitive_type == "twist":
-                angle = twist * math.pi
-                rotated_1 = math.cos(angle) * normal_1 + math.sin(angle) * normal_2
-                rotated_2 = -math.sin(angle) * normal_1 + math.cos(angle) * normal_2
-                offsets = (
-                    width * rotated_1,
-                    -0.5 * width * rotated_1 + thickness * rotated_2,
-                    -0.5 * width * rotated_1 - thickness * rotated_2,
-                )
-            elif primitive_type == "fin":
-                offsets = (
-                    1.2 * width * normal_1,
-                    -0.4 * width * normal_1 + thickness * normal_2,
-                    -0.4 * width * normal_1 - thickness * normal_2,
-                )
-            elif primitive_type == "truss":
-                offsets = (
-                    width * normal_1 + thickness * normal_2,
-                    -width * normal_1 + thickness * normal_2,
-                    -thickness * normal_2,
-                )
-            else:
-                raise ValueError(f"unknown primitive type: {primitive_type}")
-
-        for offset in offsets:
-            positions.append(center + offset)
-            roles.append(role)
-
-    return torch.stack(positions, dim=0), torch.tensor(roles, dtype=torch.long)
+    return torch.stack(samples, dim=0)
 
 
-def _materialize_primitive_connectivity(scaffold_adjacency: torch.Tensor) -> torch.Tensor:
-    num_scaffold_nodes = scaffold_adjacency.shape[0]
-    adjacency = torch.zeros((num_scaffold_nodes * 3, num_scaffold_nodes * 3), dtype=torch.float32)
+def _resample_polyline_by_spacing(
+    polyline: torch.Tensor,
+    target_edge_length: float,
+    num_points: int | None = None,
+) -> torch.Tensor:
+    if polyline.shape[0] <= 2:
+        return polyline
 
-    for source in range(num_scaffold_nodes):
-        for target in range(source + 1, num_scaffold_nodes):
-            if scaffold_adjacency[source, target] <= 0.0:
-                continue
-            source_nodes = range(3 * source, 3 * source + 3)
-            target_nodes = range(3 * target, 3 * target + 3)
-            for source_node in source_nodes:
-                for target_node in target_nodes:
-                    adjacency[source_node, target_node] = 1.0
-                    adjacency[target_node, source_node] = 1.0
+    segment_vectors = polyline[1:] - polyline[:-1]
+    segment_lengths = torch.linalg.vector_norm(segment_vectors, dim=1)
+    cumulative = torch.cat(
+        [torch.zeros(1, dtype=polyline.dtype), torch.cumsum(segment_lengths, dim=0)],
+        dim=0,
+    )
+    total_length = float(cumulative[-1].item())
+    if total_length < 1e-8:
+        return polyline[[0, -1]]
 
+    if num_points is None:
+        num_segments = max(1, int(math.ceil(total_length / max(target_edge_length, 1e-6))))
+        num_points = num_segments + 1
+    else:
+        num_points = max(2, num_points)
+    targets = torch.linspace(0.0, total_length, steps=num_points, dtype=polyline.dtype)
+    resampled = []
+    segment_index = 0
+    for target in targets.tolist():
+        while segment_index < segment_lengths.shape[0] - 1 and float(cumulative[segment_index + 1].item()) < target:
+            segment_index += 1
+        start = polyline[segment_index]
+        end = polyline[segment_index + 1]
+        start_distance = float(cumulative[segment_index].item())
+        end_distance = float(cumulative[segment_index + 1].item())
+        if end_distance - start_distance < 1e-8:
+            resampled.append(start)
+            continue
+        fraction = (target - start_distance) / (end_distance - start_distance)
+        resampled.append((1.0 - fraction) * start + fraction * end)
+    return torch.stack(resampled, dim=0)
+
+
+def _discretize_rod_chain(
+    centers: torch.Tensor,
+    target_edge_length: float,
+) -> torch.Tensor:
+    # Rods should read as one-dimensional members that follow the scaffold
+    # trajectory. We therefore interpolate a smooth centerline through the
+    # scaffold control points and discretize it by arc length, instead of
+    # inflating every scaffold node into a local volume.
+    smoothed = _sample_catmull_rom_polyline(centers, target_edge_length)
+    # The downstream pipeline is fully batched, so rod debugging still needs a
+    # stable tensor shape across cases. We therefore resample every rod chain
+    # to a fixed number of points derived from the fixed workspace span and the
+    # requested target edge length. The curve geometry still comes from the
+    # scaffold; only the sample count is normalized for batching.
+    workspace_span = float(torch.linalg.vector_norm(centers[-1] - centers[0]).item())
+    num_points = max(2, int(math.ceil(workspace_span / max(target_edge_length, 1e-6))) + 1)
+    return _resample_polyline_by_spacing(
+        smoothed,
+        target_edge_length,
+        num_points=num_points,
+    )
+
+
+def _edge_index_to_adjacency(num_nodes: int, edge_index: torch.Tensor) -> torch.Tensor:
+    adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    if edge_index.numel() == 0:
+        return adjacency
+    adjacency[edge_index[:, 0], edge_index[:, 1]] = 1.0
+    adjacency[edge_index[:, 1], edge_index[:, 0]] = 1.0
     return adjacency
 
 
@@ -553,7 +565,6 @@ def _build_scaffold_roles(num_nodes: int) -> torch.Tensor:
 
 
 def _sample_primitive_case(
-    kind: str,
     config: PrimitiveConfig,
     seed: int | None,
 ) -> tuple[Structures, Scaffolds]:
@@ -564,7 +575,7 @@ def _sample_primitive_case(
     # from the final FEM mesh and leaves a clean place for a future two-stage
     # optimizer: first over the scaffold/primitive parameters, then over the
     # final expanded mesh.
-    scaffold_centers = _sample_scaffold_centers(kind, config, rng)
+    scaffold_centers = _sample_random_scaffold_centers(config, rng)
     scaffold_adjacency = _sample_scaffold_connectivity(scaffold_centers, config, rng)
     primitive_chains = _extract_primitive_chains(scaffold_adjacency)
     primitive_assignments = _sample_chain_primitives(primitive_chains, config, rng)
@@ -574,14 +585,13 @@ def _sample_primitive_case(
         assignments=primitive_assignments,
         config=config,
     )
-    positions, roles = _materialize_scaffold_node_triplets(
+    positions, roles, edge_index = _materialize_scaffold_node_triplets(
         centers=styled_centers,
         adjacency=scaffold_adjacency,
         assignments=primitive_assignments,
         config=config,
-        rng=rng,
     )
-    adjacency = _materialize_primitive_connectivity(scaffold_adjacency)
+    adjacency = _edge_index_to_adjacency(positions.shape[0], edge_index)
 
     design = Structures(
         positions=positions.unsqueeze(0).clamp(0.02, 0.98),
@@ -603,12 +613,11 @@ def _sample_primitive_case(
 
 
 def sample_primitive_design(
-    kind: str,
     config: PrimitiveConfig | None = None,
     seed: int | None = None,
 ) -> Structures:
     config = config or PrimitiveConfig()
-    design, _ = _sample_primitive_case(kind, config, seed)
+    design, _ = _sample_primitive_case(config, seed)
     return design
 
 
@@ -616,7 +625,4 @@ def sample_random_primitive(
     config: PrimitiveConfig | None = None,
     seed: int | None = None,
 ) -> tuple[Structures, Scaffolds]:
-    rng = random.Random(seed)
-    kind = rng.choice(PRIMITIVE_LIBRARY)
-    kind_seed = None if seed is None else rng.randrange(0, 2**31)
-    return _sample_primitive_case(kind, config or PrimitiveConfig(), kind_seed)
+    return _sample_primitive_case(config or PrimitiveConfig(), seed)
