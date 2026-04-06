@@ -45,6 +45,22 @@ class CaseOptimizationConfig:
     geometry: GeometryPenaltyConfig = GeometryPenaltyConfig()
 
 
+_LOGGED_BREAKDOWN_NAMES = (
+    "stiffness_loss",
+    "material_loss",
+    "sparsity_loss",
+    "short_beam_loss",
+    "long_beam_loss",
+    "thin_beam_loss",
+    "thick_beam_loss",
+    "free_spacing_loss",
+    "domain_loss",
+    "anchor_attachment_loss",
+    "psd_loss",
+    "total_loss",
+)
+
+
 def _allowed_edge_mask(roles: torch.Tensor) -> torch.Tensor:
     fixed_mask, mobile_mask, _ = role_masks(roles.unsqueeze(0))
     fixed_mask = fixed_mask[0]
@@ -187,7 +203,7 @@ def _optimize_single_case(
     structures: Structures,
     target_stiffness: torch.Tensor,
     config: CaseOptimizationConfig | None = None,
-    logdir: str | Path | None = None,
+    log_callback=None,
 ) -> OptimizedCases:
     config = config or CaseOptimizationConfig()
     structures.validate()
@@ -209,7 +225,6 @@ def _optimize_single_case(
     )
     optimizer = torch.optim.Adam([free_positions, edge_logits], lr=config.learning_rate)
 
-    writer = SummaryWriter(log_dir=str(logdir)) if logdir is not None else None
     best_loss = None
     best_structures = initial_structures
     initial_loss = None
@@ -246,26 +261,14 @@ def _optimize_single_case(
             )
             best_breakdown = {name: value.detach().clone() for name, value in breakdown.items()}
 
-        if writer is not None and (step % config.log_every == 0 or step == config.num_steps - 1):
-            for name, value in breakdown.items():
-                if name in {
-                    "generalized_stiffness",
-                    "material_usage",
-                    "short_beam_penalty",
-                    "long_beam_penalty",
-                    "thin_beam_penalty",
-                    "thick_beam_penalty",
-                    "free_node_spacing_penalty",
-                }:
-                    continue
-                writer.add_scalar(
-                    f"dataset/optimization/{name}",
-                    float(value.detach().item()),
-                    step,
-                )
-
-    if writer is not None:
-        writer.close()
+        if log_callback is not None and (step % config.log_every == 0 or step == config.num_steps - 1):
+            log_callback(
+                step,
+                {
+                    name: float(breakdown[name].detach().item())
+                    for name in _LOGGED_BREAKDOWN_NAMES
+                },
+            )
 
     if best_breakdown is None:
         best_breakdown = _loss_breakdown(best_structures, target_stiffness_single, config)
@@ -305,17 +308,39 @@ def optimize_cases(
     if target_stiffness.shape != (structures.batch_size, 6, 6):
         raise ValueError("target_stiffness must have shape [batch, 6, 6]")
 
+    writer = SummaryWriter(log_dir=str(logdir)) if logdir is not None else None
+    aggregate_sums = {
+        step: {name: 0.0 for name in _LOGGED_BREAKDOWN_NAMES}
+        for step in range(config.num_steps)
+        if step % config.log_every == 0 or step == config.num_steps - 1
+    }
+    aggregate_counts = {step: 0 for step in aggregate_sums}
     optimized_items = []
-    for case_index in range(structures.batch_size):
-        case_logdir = None if logdir is None else Path(logdir) / f"case_{case_index:04d}"
-        optimized_items.append(
-            _optimize_single_case(
+    try:
+        for case_index in range(structures.batch_size):
+            def _log_case_step(step: int, values: dict[str, float]) -> None:
+                aggregate_counts[step] += 1
+                for name, value in values.items():
+                    aggregate_sums[step][name] += value
+                    if writer is not None:
+                        writer.add_scalar(
+                            f"dataset/optimization/{name}",
+                            aggregate_sums[step][name] / aggregate_counts[step],
+                            step,
+                        )
+                if writer is not None:
+                    writer.flush()
+
+            optimized_item = _optimize_single_case(
                 structures=structures.slice(case_index),
                 target_stiffness=target_stiffness[case_index : case_index + 1],
                 config=config,
-                logdir=case_logdir,
+                log_callback=_log_case_step,
             )
-        )
+            optimized_items.append(optimized_item)
+    finally:
+        if writer is not None:
+            writer.close()
 
     result = OptimizedCases(
         raw_structures=Structures(
