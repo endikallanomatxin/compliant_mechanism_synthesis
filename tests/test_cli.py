@@ -5,9 +5,11 @@ from pathlib import Path
 from compliant_mechanism_synthesis.cli import (
     generate_dataset_main,
     sample_main,
+    train_supervised_main,
     visualize_dataset_main,
 )
 from compliant_mechanism_synthesis.dataset import load_offline_dataset
+import pytest
 
 
 def test_generate_dataset_main_generates_offline_dataset_and_preview(tmp_path: Path) -> None:
@@ -87,3 +89,33 @@ def test_visualize_dataset_main_renders_existing_dataset(tmp_path: Path) -> None
 
     assert (output_dir / "summary.txt").exists()
     assert any(path.suffix == ".png" for path in output_dir.iterdir())
+
+
+def test_train_supervised_main_is_explicitly_deferred(tmp_path: Path) -> None:
+    output_path = tmp_path / "dataset.pt"
+    generate_dataset_main(
+        [
+            "--num-cases",
+            "2",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs"),
+        ]
+    )
+
+    with pytest.raises(NotImplementedError, match="deferred"):
+        train_supervised_main(
+            [
+                "--dataset-path",
+                str(output_path),
+                "--batch-size",
+                "2",
+                "--num-steps",
+                "10",
+            ]
+        )

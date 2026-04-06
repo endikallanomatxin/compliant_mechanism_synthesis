@@ -13,6 +13,10 @@ from compliant_mechanism_synthesis.dataset import (
     sample_primitive_design,
     sample_target_stiffness,
 )
+from compliant_mechanism_synthesis.training import (
+    SupervisedTrainingConfig,
+    run_supervised_training,
+)
 from compliant_mechanism_synthesis.visualization import (
     plot_design_3d,
     write_dataset_visualizations,
@@ -43,6 +47,21 @@ def _build_visualize_dataset_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-path", required=True)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--max-cases", type=int, default=6)
+    return parser
+
+
+def _build_train_supervised_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cms-train-supervised",
+        description=(
+            "Entry point for the future supervised refinement stage. The training "
+            "loop itself is still intentionally deferred, but the dataset loading "
+            "and curriculum interfaces are already in place."
+        ),
+    )
+    parser.add_argument("--dataset-path", required=True)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-steps", type=int, default=10_000)
     return parser
 
 
@@ -100,6 +119,18 @@ def visualize_dataset_main(argv: list[str] | None = None) -> None:
     )
     print(f"dataset={dataset_path}")
     print(f"visualizations={output_dir}")
+
+
+def train_supervised_main(argv: list[str] | None = None) -> None:
+    parser = _build_train_supervised_parser()
+    args = parser.parse_args(argv)
+    run_supervised_training(
+        SupervisedTrainingConfig(
+            dataset_path=args.dataset_path,
+            batch_size=args.batch_size,
+            num_steps=args.num_steps,
+        )
+    )
 
 
 def sample_main(argv: list[str] | None = None) -> None:
