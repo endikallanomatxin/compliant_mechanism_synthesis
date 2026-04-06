@@ -91,7 +91,7 @@ def test_visualize_dataset_main_renders_existing_dataset(tmp_path: Path) -> None
     assert any(path.suffix == ".png" for path in output_dir.iterdir())
 
 
-def test_train_supervised_main_is_explicitly_deferred(tmp_path: Path) -> None:
+def test_train_supervised_main_writes_checkpoint(tmp_path: Path) -> None:
     output_path = tmp_path / "dataset.pt"
     generate_dataset_main(
         [
@@ -108,14 +108,19 @@ def test_train_supervised_main_is_explicitly_deferred(tmp_path: Path) -> None:
         ]
     )
 
-    with pytest.raises(NotImplementedError, match="deferred"):
-        train_supervised_main(
-            [
-                "--dataset-path",
-                str(output_path),
-                "--batch-size",
-                "2",
-                "--num-steps",
-                "10",
-            ]
-        )
+    checkpoint_path = tmp_path / "refiner.pt"
+    train_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--batch-size",
+            "2",
+            "--num-steps",
+            "6",
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--logdir",
+            str(tmp_path / "runs_supervised"),
+        ]
+    )
+    assert checkpoint_path.exists()

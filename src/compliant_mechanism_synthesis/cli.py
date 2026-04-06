@@ -54,14 +54,14 @@ def _build_train_supervised_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cms-train-supervised",
         description=(
-            "Entry point for the future supervised refinement stage. The training "
-            "loop itself is still intentionally deferred, but the dataset loading "
-            "and curriculum interfaces are already in place."
+            "Train the supervised refinement model with flow matching over the offline dataset."
         ),
     )
     parser.add_argument("--dataset-path", required=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-steps", type=int, default=10_000)
+    parser.add_argument("--checkpoint-path", default="artifacts/supervised_refiner.pt")
+    parser.add_argument("--logdir", default="runs/supervised")
     return parser
 
 
@@ -129,6 +129,8 @@ def train_supervised_main(argv: list[str] | None = None) -> None:
             dataset_path=args.dataset_path,
             batch_size=args.batch_size,
             num_steps=args.num_steps,
+            checkpoint_path=args.checkpoint_path,
+            logdir=args.logdir,
         )
     )
 

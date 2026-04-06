@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from compliant_mechanism_synthesis.dataset.types import OptimizedCases, Structures
+from compliant_mechanism_synthesis.models import SupervisedRefiner
 from compliant_mechanism_synthesis.training.supervised import (
     CurriculumConfig,
     analyze_structures,
@@ -19,7 +21,7 @@ class RefinementMetrics:
 
 
 def evaluate_refinement_step(
-    refiner,
+    refiner: SupervisedRefiner | Callable[[Structures, object], Structures],
     optimized_cases: OptimizedCases,
     curriculum: CurriculumConfig | None = None,
     difficulty: float = 1.0,
@@ -32,7 +34,14 @@ def evaluate_refinement_step(
         difficulty=difficulty,
         seed=seed,
     )
-    refined_structures = refiner(batch.noisy_structures, batch.target_stiffness)
+    if isinstance(refiner, SupervisedRefiner):
+        refined_structures = refiner(
+            batch.noisy_structures,
+            batch.target_stiffness,
+            analysis_fn=analyze_structures,
+        )
+    else:
+        refined_structures = refiner(batch.noisy_structures, batch.target_stiffness)
     if not isinstance(refined_structures, Structures):
         raise TypeError("refiner must return Structures")
     refined_structures.validate()

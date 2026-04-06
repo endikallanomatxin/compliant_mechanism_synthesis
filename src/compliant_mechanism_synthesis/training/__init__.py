@@ -3,6 +3,7 @@
 from compliant_mechanism_synthesis.training.supervised import (
     CurriculumConfig,
     SupervisedBatch,
+    SupervisedTrainingSummary,
     SupervisedTrainingConfig,
     analyze_structures,
     generalized_stiffness_error,
@@ -12,11 +13,13 @@ from compliant_mechanism_synthesis.training.supervised import (
     run_supervised_training,
     sample_noisy_structures,
     select_batch,
+    train_supervised_refiner,
 )
 
 __all__ = [
     "CurriculumConfig",
     "SupervisedBatch",
+    "SupervisedTrainingSummary",
     "SupervisedTrainingConfig",
     "analyze_structures",
     "generalized_stiffness_error",
@@ -26,4 +29,5 @@ __all__ = [
     "run_supervised_training",
     "sample_noisy_structures",
     "select_batch",
+    "train_supervised_refiner",
 ]

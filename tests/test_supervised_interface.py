@@ -19,7 +19,6 @@ from compliant_mechanism_synthesis.training import (
     iter_supervised_minibatches,
     load_supervised_cases,
     make_supervised_batch,
-    run_supervised_training,
     select_batch,
 )
 
@@ -83,11 +82,3 @@ def test_analyze_structures_matches_dataset_batch_shape(tmp_path: Path) -> None:
 
     assert analyses.generalized_stiffness.shape == optimized_cases.target_stiffness.shape
     assert analyses.material_usage.shape == optimized_cases.initial_loss.shape
-
-
-def test_run_supervised_training_is_explicitly_deferred(tmp_path: Path) -> None:
-    path, _ = _build_cases(tmp_path)
-    with pytest.raises(NotImplementedError, match="deferred"):
-        run_supervised_training(
-            config=type("Cfg", (), {"dataset_path": str(path), "batch_size": 2, "num_steps": 10})()
-        )
