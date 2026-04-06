@@ -258,7 +258,11 @@ def _optimize_single_case(
                     "free_node_spacing_penalty",
                 }:
                     continue
-                writer.add_scalar(name, float(value.detach().item()), step)
+                writer.add_scalar(
+                    f"dataset/optimization/{name}",
+                    float(value.detach().item()),
+                    step,
+                )
 
     if writer is not None:
         writer.close()
