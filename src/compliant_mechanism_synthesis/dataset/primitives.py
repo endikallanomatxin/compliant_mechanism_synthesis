@@ -12,17 +12,16 @@ from compliant_mechanism_synthesis.tensor_ops import symmetrize_matrix
 
 CHAIN_PRIMITIVE_LIBRARY = (
     "rod",
-    "ribbon",
-    "blade",
-    "twist",
-    "fin",
+    "rod_helix",
+    "sheet",
+    "sheet_helix",
     "truss",
 )
 
 # During scaffold-to-mesh debugging we intentionally keep the active primitive
 # family to the simplest one. That gives us one geometry/conectivity pattern to
 # validate visually before re-introducing wider families.
-ACTIVE_CHAIN_PRIMITIVE_LIBRARY = ("rod",)
+ACTIVE_CHAIN_PRIMITIVE_LIBRARY = ("rod_helix",)
 
 
 @dataclass(frozen=True)
@@ -46,7 +45,11 @@ class PrimitiveConfig:
     free_z_max: float = 0.72
     fixed_anchor_z: float = 0.10
     mobile_anchor_z: float = 0.90
-    target_edge_length: float = 0.08
+    target_edge_length: float = 0.05
+    helix_radius: float = 0.06
+    helix_turns: float = 12.0
+    sheet_width_nodes: int = 4
+    sheet_width_distance: float = 0.03
 
 
 @dataclass(frozen=True)
@@ -126,7 +129,7 @@ def _sample_scaffold_connectivity(
     rng: random.Random,
 ) -> torch.Tensor:
     num_nodes = centers.shape[0]
-    if ACTIVE_CHAIN_PRIMITIVE_LIBRARY == ("rod",):
+    if set(ACTIVE_CHAIN_PRIMITIVE_LIBRARY).issubset({"rod", "rod_helix", "sheet", "sheet_helix", "truss"}):
         adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
         remaining = list(range(1, num_nodes - 1))
         order = [0]
@@ -281,15 +284,13 @@ def _primitive_center_offset(
         # The debug rod should stay centered on the scaffold so we can assess
         # whether the expanded FEM mesh actually follows the sparse graph path.
         return torch.zeros_like(normal_1)
-    if primitive_type == "ribbon":
-        return 0.18 * width * normal_1
-    if primitive_type == "blade":
-        return 0.18 * thickness * normal_2
-    if primitive_type == "twist":
+    if primitive_type == "rod_helix":
+        return torch.zeros_like(normal_1)
+    if primitive_type == "sheet":
+        return 0.12 * width * normal_1
+    if primitive_type == "sheet_helix":
         angle = sweep_phase + twist * math.pi
-        return 0.14 * width * (math.cos(angle) * normal_1 + math.sin(angle) * normal_2)
-    if primitive_type == "fin":
-        return 0.16 * width * normal_1 + 0.08 * thickness * normal_2
+        return 0.12 * width * (math.cos(angle) * normal_1 + math.sin(angle) * normal_2)
     if primitive_type == "truss":
         return 0.12 * width * normal_1 - 0.12 * thickness * normal_2
     raise ValueError(f"unknown primitive type: {primitive_type}")
@@ -395,21 +396,57 @@ def _materialize_scaffold_node_triplets(
             ensure_connection_node(scaffold_index)
 
     for assignment in assignments:
-        if assignment.primitive_type != "rod":
-            raise ValueError("rod-only debugging path does not support other primitive types yet")
+        if assignment.primitive_type not in {"rod", "rod_helix", "sheet", "sheet_helix", "truss"}:
+            raise ValueError("debugging path only supports the current primitive families")
         chain_positions = _discretize_rod_chain(
             centers=centers[assignment.chain],
             target_edge_length=config.target_edge_length,
         )
         start_index = ensure_connection_node(assignment.chain[0])
         end_index = ensure_connection_node(assignment.chain[-1])
+        if assignment.primitive_type == "rod":
+            _materialize_single_rail(
+                chain_positions=chain_positions,
+                add_node=add_node,
+                add_edge=add_edge,
+                start_index=start_index,
+                end_index=end_index,
+            )
+            continue
 
-        previous_index = start_index
-        for position in chain_positions[1:-1]:
-            node_index = add_node(position, NodeRole.FREE)
-            add_edge(previous_index, node_index)
-            previous_index = node_index
-        add_edge(previous_index, end_index)
+        if assignment.primitive_type == "rod_helix":
+            helix_radius = config.helix_radius
+            helical_chain = _discretize_rod_helix_chain(
+                chain_positions=chain_positions,
+                helix_radius=helix_radius,
+                turns=config.helix_turns,
+                phase=assignment.sweep_phase,
+                target_edge_length=config.target_edge_length,
+            )
+            _materialize_single_rail(
+                chain_positions=helical_chain,
+                add_node=add_node,
+                add_edge=add_edge,
+                start_index=start_index,
+                end_index=end_index,
+            )
+            continue
+
+        sheet_width = max(config.sheet_width_distance, 0.75 * (assignment.width_start + assignment.width_end))
+        left_chain, right_chain = _discretize_sheet_chain(
+            chain_positions=chain_positions,
+            sheet_width=sheet_width,
+            helix_turns=(config.helix_turns if assignment.primitive_type == "sheet_helix" else 0.0),
+            helix_phase=assignment.sweep_phase,
+        )
+        _materialize_two_rail_sheet(
+            left_chain=left_chain,
+            right_chain=right_chain,
+            add_node=add_node,
+            add_edge=add_edge,
+            start_index=start_index,
+            end_index=end_index,
+        )
 
     edge_index = torch.tensor(sorted(edges), dtype=torch.long)
     return (
@@ -526,6 +563,115 @@ def _discretize_rod_chain(
         target_edge_length,
         num_points=num_points,
     )
+
+
+def _materialize_single_rail(
+    chain_positions: torch.Tensor,
+    add_node,
+    add_edge,
+    start_index: int,
+    end_index: int,
+) -> None:
+    previous_index = start_index
+    for position in chain_positions[1:-1]:
+        node_index = add_node(position, NodeRole.FREE)
+        add_edge(previous_index, node_index)
+        previous_index = node_index
+    add_edge(previous_index, end_index)
+
+
+def _estimate_polyline_tangent(polyline: torch.Tensor, sample_index: int) -> torch.Tensor:
+    if sample_index == 0:
+        tangent = polyline[1] - polyline[0]
+    elif sample_index == polyline.shape[0] - 1:
+        tangent = polyline[-1] - polyline[-2]
+    else:
+        tangent = polyline[sample_index + 1] - polyline[sample_index - 1]
+    if torch.linalg.vector_norm(tangent).item() < 1e-8:
+        tangent = torch.tensor([1.0, 0.0, 0.0], dtype=polyline.dtype)
+    return tangent
+
+
+def _discretize_sheet_chain(
+    chain_positions: torch.Tensor,
+    sheet_width: float,
+    helix_turns: float,
+    helix_phase: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    left = []
+    right = []
+    sample_count = max(chain_positions.shape[0] - 1, 1)
+    for sample_index in range(chain_positions.shape[0]):
+        tangent = _estimate_polyline_tangent(chain_positions, sample_index)
+        _, normal_1, normal_2 = _orthonormal_frame(tangent)
+        if helix_turns != 0.0:
+            angle = helix_phase + 2.0 * math.pi * helix_turns * (sample_index / sample_count)
+            lateral_axis = math.cos(angle) * normal_1 + math.sin(angle) * normal_2
+        else:
+            lateral_axis = normal_1
+        offset = 0.5 * sheet_width * lateral_axis
+        center = chain_positions[sample_index]
+        left.append(center + offset)
+        right.append(center - offset)
+    return torch.stack(left, dim=0), torch.stack(right, dim=0)
+
+
+def _discretize_rod_helix_chain(
+    chain_positions: torch.Tensor,
+    helix_radius: float,
+    turns: float,
+    phase: float,
+    target_edge_length: float,
+) -> torch.Tensor:
+    centerline_span = float(torch.linalg.vector_norm(chain_positions[-1] - chain_positions[0]).item())
+    helix_circumference_travel = abs(turns) * 2.0 * math.pi * helix_radius
+    helical_length = math.sqrt(centerline_span**2 + helix_circumference_travel**2)
+    # Helices need denser sampling than their centerline, but the offline
+    # dataset still needs fixed tensor shapes across cases. We therefore
+    # normalize the sample count against the expected helix geometry for the
+    # whole family rather than the exact per-case arc length.
+    num_points = max(2, int(math.ceil(helical_length / max(1e-6, target_edge_length))) + 1)
+    helix_support = _resample_polyline_by_spacing(
+        chain_positions,
+        target_edge_length=target_edge_length,
+        num_points=num_points,
+    )
+
+    helical_positions = []
+    sample_count = max(helix_support.shape[0] - 1, 1)
+    for sample_index in range(helix_support.shape[0]):
+        tangent = _estimate_polyline_tangent(helix_support, sample_index)
+        _, normal_1, normal_2 = _orthonormal_frame(tangent)
+        angle = phase + 2.0 * math.pi * turns * (sample_index / sample_count)
+        offset = helix_radius * (math.cos(angle) * normal_1 + math.sin(angle) * normal_2)
+        helical_positions.append(helix_support[sample_index] + offset)
+    return torch.stack(helical_positions, dim=0)
+
+
+def _materialize_two_rail_sheet(
+    left_chain: torch.Tensor,
+    right_chain: torch.Tensor,
+    add_node,
+    add_edge,
+    start_index: int,
+    end_index: int,
+) -> None:
+    previous_left = start_index
+    previous_right = start_index
+    for sample_index in range(1, left_chain.shape[0] - 1):
+        left_index = add_node(left_chain[sample_index], NodeRole.FREE)
+        right_index = add_node(right_chain[sample_index], NodeRole.FREE)
+        add_edge(previous_left, left_index)
+        add_edge(previous_right, right_index)
+        add_edge(left_index, right_index)
+        if sample_index > 1:
+            add_edge(previous_left, right_index)
+            add_edge(previous_right, left_index)
+        previous_left = left_index
+        previous_right = right_index
+    add_edge(previous_left, end_index)
+    add_edge(previous_right, end_index)
+    add_edge(previous_left, previous_right)
 
 
 def _edge_index_to_adjacency(num_nodes: int, edge_index: torch.Tensor) -> torch.Tensor:
