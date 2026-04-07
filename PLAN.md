@@ -63,6 +63,25 @@ Su papel será: partir de buenos starting points, usar gradientes de la
 simulación para refinar mecanismos concretos y producir ejemplos de bastante
 calidad.
 
+### Idea: Generación de starting points
+
+Primero se hace un grafo `scaffold`, con pocos nodos y conexiones binarias.
+
+Luego toman tramos de ese grafo y se usan como puntos de beziers para la
+generación de primitivas de tipo aleatorio.
+
+### Idea: Optimización en dos fases.
+
+Primero optimizar a nivel scaffold y luego optimizar a nivel de nodos libres.
+
+### Idea: Aumentar diversidad de la consigna de rigidez.
+
+Como se diseñan en batch, se puede hacer que si un componente de rigidez está
+por encima o por debajo de la media, lo lleve un poco más lejos usando una loss
+adicional para esto.
+
+Así la optimización no solo optimiza, sino que también diversifica el dataset.
+
 
 ## Entrenamiento supervisado
 
