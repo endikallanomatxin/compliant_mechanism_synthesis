@@ -48,6 +48,7 @@ class PrimitiveConfig:
     target_edge_length: float = 0.05
     helix_radius: float = 0.06
     helix_turns: float = 12.0
+    truss_target_edge_length_scale: float = 0.33
     sheet_width_nodes: int = 4
     sheet_width_distance: float = 0.02
     sample_sheet_helix_width_nodes: bool = True
@@ -555,6 +556,26 @@ def _materialize_scaffold_node_triplets(
             continue
 
         if assignment.primitive_type == "truss":
+            truss_target_edge_length = max(
+                1e-6,
+                config.target_edge_length * config.truss_target_edge_length_scale,
+            )
+            truss_num_points = max(
+                chain_positions.shape[0],
+                int(
+                    math.ceil(
+                        (chain_positions.shape[0] - 1)
+                        * config.target_edge_length
+                        / truss_target_edge_length
+                    )
+                )
+                + 1,
+            )
+            chain_positions = _resample_polyline_by_spacing(
+                chain_positions,
+                target_edge_length=truss_target_edge_length,
+                num_points=truss_num_points,
+            )
             truss_positions = _build_truss_helix_positions(
                 chain_positions=chain_positions,
                 assignment=assignment,
