@@ -439,29 +439,41 @@ def _training_losses(
     batch: SupervisedBatch,
     config: SupervisedTrainingConfig,
     profile: dict[str, float] | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    position_loss = _position_velocity_loss(prediction, batch)
-    adjacency_loss = _adjacency_velocity_loss(prediction, batch)
-    endpoint_loss, estimated = _endpoint_loss(prediction, batch)
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    position_error = _position_velocity_loss(prediction, batch)
+    adjacency_error = _adjacency_velocity_loss(prediction, batch)
+    endpoint_error, estimated = _endpoint_loss(prediction, batch)
     endpoint_analyses = analyze_structures(estimated, profile=profile)
-    stiffness_loss = torch.log1p(
+    stiffness_error = torch.log1p(
         generalized_stiffness_error(
             endpoint_analyses.generalized_stiffness, batch.target_stiffness
         )
     )
-    total = (
-        config.position_loss_weight * position_loss
-        + config.adjacency_loss_weight * adjacency_loss
-        + config.endpoint_loss_weight * endpoint_loss
-        + config.stiffness_loss_weight * stiffness_loss
-    )
-    return total.mean(), {
-        "position": position_loss.mean(),
-        "adjacency": adjacency_loss.mean(),
-        "endpoint": endpoint_loss.mean(),
-        "stiffness": stiffness_loss.mean(),
-        "total": total.mean(),
+    loss_contributions = {
+        "position_error_loss_contribution": config.position_loss_weight
+        * position_error,
+        "adjacency_error_loss_contribution": config.adjacency_loss_weight
+        * adjacency_error,
+        "endpoint_error_loss_contribution": config.endpoint_loss_weight
+        * endpoint_error,
+        "stiffness_error_loss_contribution": config.stiffness_loss_weight
+        * stiffness_error,
     }
+    total_loss = (
+        loss_contributions["position_error_loss_contribution"]
+        + loss_contributions["adjacency_error_loss_contribution"]
+        + loss_contributions["endpoint_error_loss_contribution"]
+        + loss_contributions["stiffness_error_loss_contribution"]
+    )
+    metrics = {
+        "position_error": position_error.mean(),
+        "adjacency_error": adjacency_error.mean(),
+        "endpoint_error": endpoint_error.mean(),
+        "stiffness_error": stiffness_error.mean(),
+    }
+    loss_summary = {name: value.mean() for name, value in loss_contributions.items()}
+    loss_summary["total_loss"] = total_loss.mean()
+    return total_loss.mean(), metrics, loss_summary
 
 
 def train_supervised_refiner(
@@ -495,11 +507,11 @@ def train_supervised_refiner(
     model = SupervisedRefiner(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
     history = {
-        "total": [],
-        "position": [],
-        "adjacency": [],
-        "endpoint": [],
-        "stiffness": [],
+        "total_loss": [],
+        "position_error_loss_contribution": [],
+        "adjacency_error_loss_contribution": [],
+        "endpoint_error_loss_contribution": [],
+        "stiffness_error_loss_contribution": [],
     }
     checkpoint_path = (
         Path(train_config.checkpoint_path)
@@ -555,7 +567,7 @@ def train_supervised_refiner(
                 _synchronize_device_if_needed(device)
                 forward_time = time.perf_counter()
                 loss_analysis_profile: dict[str, float] = {}
-                total_loss, loss_terms = _training_losses(
+                total_loss, metrics, loss_terms = _training_losses(
                     prediction, batch, train_config, profile=loss_analysis_profile
                 )
                 _synchronize_device_if_needed(device)
@@ -573,18 +585,26 @@ def train_supervised_refiner(
                 _synchronize_device_if_needed(device)
                 optimizer_time = time.perf_counter()
 
-                for name in history:
-                    value = float(loss_terms[name].detach().item())
+                for name, value_tensor in loss_terms.items():
+                    value = float(value_tensor.detach().item())
                     history[name].append(value)
-                    writer.add_scalar(f"train/{name}", value, step)
-                writer.add_scalar("train/difficulty", difficulty, step)
+                    writer.add_scalar(f"train/loss/{name}", value, step)
+                for name, value_tensor in metrics.items():
+                    writer.add_scalar(
+                        f"train/metrics/{name}",
+                        float(value_tensor.detach().item()),
+                        step,
+                    )
+                writer.add_scalar("train/curriculum/difficulty", difficulty, step)
                 writer.add_scalar(
-                    "train/flow_time_mean", float(batch.flow_times.mean().item()), step
+                    "train/curriculum/flow_time_mean",
+                    float(batch.flow_times.mean().item()),
+                    step,
                 )
-                writer.add_scalar("train/learning_rate", learning_rate, step)
-                writer.add_scalar("train/grad_norm", grad_norm, step)
-                writer.add_scalar("train/clip_ratio", clip_ratio, step)
-                writer.add_scalar("train/clipped", float(clipped), step)
+                writer.add_scalar("train/parameters/learning_rate", learning_rate, step)
+                writer.add_scalar("train/gradients/grad_norm", grad_norm, step)
+                writer.add_scalar("train/gradients/clip_ratio", clip_ratio, step)
+                writer.add_scalar("train/gradients/clipped", float(clipped), step)
                 examples_seen += batch_cases.raw_structures.batch_size
                 if (
                     step % train_config.log_every_steps == 0
@@ -595,11 +615,15 @@ def train_supervised_refiner(
                         f"batch_cases={batch_cases.raw_structures.batch_size} "
                         f"examples_seen={examples_seen} difficulty={difficulty:.3f} "
                         f"learning_rate={learning_rate:.8f} "
-                        f"loss_total={history['total'][-1]:.6f} "
-                        f"loss_position={history['position'][-1]:.6f} "
-                        f"loss_adjacency={history['adjacency'][-1]:.6f} "
-                        f"loss_endpoint={history['endpoint'][-1]:.6f} "
-                        f"loss_stiffness={history['stiffness'][-1]:.6f} "
+                        f"loss_total={history['total_loss'][-1]:.6f} "
+                        f"loss_position={history['position_error_loss_contribution'][-1]:.6f} "
+                        f"loss_adjacency={history['adjacency_error_loss_contribution'][-1]:.6f} "
+                        f"loss_endpoint={history['endpoint_error_loss_contribution'][-1]:.6f} "
+                        f"loss_stiffness={history['stiffness_error_loss_contribution'][-1]:.6f} "
+                        f"metric_position={float(metrics['position_error'].detach().item()):.6f} "
+                        f"metric_adjacency={float(metrics['adjacency_error'].detach().item()):.6f} "
+                        f"metric_endpoint={float(metrics['endpoint_error'].detach().item()):.6f} "
+                        f"metric_stiffness={float(metrics['stiffness_error'].detach().item()):.6f} "
                         f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
                         f"clip_ratio={clip_ratio:.3f} "
                         f"t_transfer={batch_transfer_time - step_start_time:.3f}s "
@@ -657,4 +681,4 @@ def run_supervised_training(config: SupervisedTrainingConfig) -> None:
         train_config=config,
     )
     print(f"checkpoint={summary.checkpoint_path}")
-    print(f"final_total_loss={summary.history['total'][-1]:.6f}")
+    print(f"final_total_loss={summary.history['total_loss'][-1]:.6f}")
