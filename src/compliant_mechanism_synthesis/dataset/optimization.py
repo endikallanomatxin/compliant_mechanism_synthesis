@@ -36,8 +36,8 @@ class OptimizationLossWeights:
 
 @dataclass(frozen=True)
 class CaseOptimizationConfig:
-    num_steps: int = 120
-    learning_rate: float = 2e-2
+    num_steps: int = 32
+    learning_rate: float = 1e-3
     log_every: int = 10
     stiffness_perturbation_scale: float = 0.18
     weights: OptimizationLossWeights = OptimizationLossWeights()
