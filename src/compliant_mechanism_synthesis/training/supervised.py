@@ -300,7 +300,11 @@ def make_supervised_batch(
             flow_adjacency, source_structures.roles
         ),
     )
-    current_analyses = analyze_structures(flow_structures)
+    # These mechanics features condition the model input but do not need a
+    # gradient path: the flow batch is sampled from offline data, not from the
+    # model's own predictions.
+    with torch.no_grad():
+        current_analyses = analyze_structures(flow_structures)
     position_noise_levels, adjacency_noise_levels = _flow_noise_levels(
         source_structures=source_structures,
         oracle_structures=optimized_cases.optimized_structures,
