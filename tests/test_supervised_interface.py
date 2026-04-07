@@ -16,7 +16,7 @@ from compliant_mechanism_synthesis.evaluation import evaluate_refinement_step
 from compliant_mechanism_synthesis.training import (
     CurriculumConfig,
     analyze_structures,
-    iter_supervised_minibatches,
+    iter_supervised_batches,
     load_supervised_cases,
     make_supervised_batch,
     select_batch,
@@ -57,14 +57,14 @@ def test_make_supervised_batch_returns_noisy_structures(tmp_path: Path) -> None:
     )
 
 
-def test_iter_supervised_minibatches_covers_all_cases(tmp_path: Path) -> None:
+def test_iter_supervised_batches_covers_all_cases(tmp_path: Path) -> None:
     _, optimized_cases = _build_cases(tmp_path)
-    minibatches = list(
-        iter_supervised_minibatches(optimized_cases, batch_size=2, shuffle=False)
+    batches = list(
+        iter_supervised_batches(optimized_cases, batch_size=2, shuffle=False)
     )
 
-    assert len(minibatches) == 2
-    assert sum(batch.raw_structures.batch_size for batch in minibatches) == 3
+    assert len(batches) == 2
+    assert sum(batch.raw_structures.batch_size for batch in batches) == 3
 
 
 def test_evaluate_refinement_step_compares_noisy_refined_and_oracle(

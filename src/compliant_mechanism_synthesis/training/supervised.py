@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import random
@@ -124,6 +125,11 @@ def _scheduled_learning_rate(
     return config.min_learning_rate + cosine * (
         config.learning_rate - config.min_learning_rate
     )
+
+
+def _synchronize_device_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def load_supervised_cases(dataset_path: str) -> OptimizedCases:
@@ -325,7 +331,7 @@ def select_batch(
     return optimized_cases.index_select(batch_indices)
 
 
-def iter_supervised_minibatches(
+def iter_supervised_batches(
     optimized_cases: OptimizedCases,
     batch_size: int,
     shuffle: bool = True,
@@ -505,23 +511,29 @@ def train_supervised_refiner(
         step = 0
         examples_seen = 0
         while step < train_config.num_steps:
-            for minibatch_cases in iter_supervised_minibatches(
+            for batch_cases in iter_supervised_batches(
                 optimized_cases,
                 batch_size=train_config.batch_size,
                 shuffle=True,
                 seed=train_config.seed + step,
             ):
-                minibatch_cases = minibatch_cases.to(device)
+                _synchronize_device_if_needed(device)
+                step_start_time = time.perf_counter()
+                batch_cases = batch_cases.to(device)
+                _synchronize_device_if_needed(device)
+                batch_transfer_time = time.perf_counter()
                 difficulty = _difficulty_fraction(step, train_config.num_steps)
                 learning_rate = _scheduled_learning_rate(step, train_config)
                 for parameter_group in optimizer.param_groups:
                     parameter_group["lr"] = learning_rate
                 batch = make_supervised_batch(
-                    optimized_cases=minibatch_cases,
+                    optimized_cases=batch_cases,
                     curriculum=curriculum,
                     difficulty=difficulty,
                     seed=train_config.seed + step,
                 )
+                _synchronize_device_if_needed(device)
+                batch_build_time = time.perf_counter()
                 prediction = model.predict_flow(
                     structures=batch.flow_structures,
                     target_stiffness=batch.target_stiffness,
@@ -530,9 +542,13 @@ def train_supervised_refiner(
                     position_noise_levels=batch.position_noise_levels,
                     adjacency_noise_levels=batch.adjacency_noise_levels,
                 )
+                _synchronize_device_if_needed(device)
+                forward_time = time.perf_counter()
                 total_loss, loss_terms = _training_losses(
                     prediction, batch, train_config
                 )
+                _synchronize_device_if_needed(device)
+                loss_time = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
                 grad_norm = float(
@@ -543,6 +559,8 @@ def train_supervised_refiner(
                 clipped = grad_norm > train_config.max_grad_norm
                 clip_ratio = grad_norm / train_config.max_grad_norm
                 optimizer.step()
+                _synchronize_device_if_needed(device)
+                optimizer_time = time.perf_counter()
 
                 for name in history:
                     value = float(loss_terms[name].detach().item())
@@ -556,14 +574,14 @@ def train_supervised_refiner(
                 writer.add_scalar("train/grad_norm", grad_norm, step)
                 writer.add_scalar("train/clip_ratio", clip_ratio, step)
                 writer.add_scalar("train/clipped", float(clipped), step)
-                examples_seen += minibatch_cases.raw_structures.batch_size
+                examples_seen += batch_cases.raw_structures.batch_size
                 if (
                     step % train_config.log_every_steps == 0
                     or step == train_config.num_steps - 1
                 ):
                     print(
                         f"train step={step + 1}/{train_config.num_steps} "
-                        f"batch_cases={minibatch_cases.raw_structures.batch_size} "
+                        f"batch_cases={batch_cases.raw_structures.batch_size} "
                         f"examples_seen={examples_seen} difficulty={difficulty:.3f} "
                         f"learning_rate={learning_rate:.8f} "
                         f"loss_total={history['total'][-1]:.6f} "
@@ -572,7 +590,13 @@ def train_supervised_refiner(
                         f"loss_endpoint={history['endpoint'][-1]:.6f} "
                         f"loss_stiffness={history['stiffness'][-1]:.6f} "
                         f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
-                        f"clip_ratio={clip_ratio:.3f}",
+                        f"clip_ratio={clip_ratio:.3f} "
+                        f"t_transfer={batch_transfer_time - step_start_time:.3f}s "
+                        f"t_batch={batch_build_time - batch_transfer_time:.3f}s "
+                        f"t_forward={forward_time - batch_build_time:.3f}s "
+                        f"t_loss={loss_time - forward_time:.3f}s "
+                        f"t_opt={optimizer_time - loss_time:.3f}s "
+                        f"t_total={optimizer_time - step_start_time:.3f}s",
                         flush=True,
                     )
                 step += 1
