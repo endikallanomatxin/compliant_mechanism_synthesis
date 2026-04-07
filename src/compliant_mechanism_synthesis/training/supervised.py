@@ -8,7 +8,12 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.dataset import load_offline_dataset
-from compliant_mechanism_synthesis.dataset.types import Analyses, OptimizedCases, Scaffolds, Structures
+from compliant_mechanism_synthesis.dataset.types import (
+    Analyses,
+    OptimizedCases,
+    Scaffolds,
+    Structures,
+)
 from compliant_mechanism_synthesis.mechanics import (
     Frame3DConfig,
     GeometryPenaltyConfig,
@@ -25,6 +30,7 @@ from compliant_mechanism_synthesis.tensor_ops import (
     enforce_role_adjacency_constraints,
     symmetrize_matrix,
 )
+from compliant_mechanism_synthesis.utils import resolve_torch_device
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,7 @@ class CurriculumConfig:
 @dataclass(frozen=True)
 class SupervisedTrainingConfig:
     dataset_path: str
+    device: str = "auto"
     batch_size: int = 64
     num_steps: int = 20_000
     learning_rate: float = 1e-4
@@ -94,30 +101,42 @@ def sample_noisy_structures(
 ) -> Structures:
     optimized_cases.validate()
     difficulty = float(min(max(difficulty, 0.0), 1.0))
-    mix = curriculum.initial_mix + difficulty * (curriculum.final_mix - curriculum.initial_mix)
+    mix = curriculum.initial_mix + difficulty * (
+        curriculum.final_mix - curriculum.initial_mix
+    )
 
     base_positions = optimized_cases.optimized_structures.positions + mix * (
-        optimized_cases.raw_structures.positions - optimized_cases.optimized_structures.positions
+        optimized_cases.raw_structures.positions
+        - optimized_cases.optimized_structures.positions
     )
     base_adjacency = optimized_cases.optimized_structures.adjacency + mix * (
-        optimized_cases.raw_structures.adjacency - optimized_cases.optimized_structures.adjacency
+        optimized_cases.raw_structures.adjacency
+        - optimized_cases.optimized_structures.adjacency
     )
 
     generator = None
     if seed is not None:
         generator = torch.Generator(device=base_positions.device).manual_seed(seed)
 
-    position_noise = curriculum.position_noise * difficulty * torch.randn(
-        base_positions.shape,
-        generator=generator,
-        device=base_positions.device,
-        dtype=base_positions.dtype,
+    position_noise = (
+        curriculum.position_noise
+        * difficulty
+        * torch.randn(
+            base_positions.shape,
+            generator=generator,
+            device=base_positions.device,
+            dtype=base_positions.dtype,
+        )
     )
-    adjacency_noise = curriculum.adjacency_noise * difficulty * torch.randn(
-        base_adjacency.shape,
-        generator=generator,
-        device=base_adjacency.device,
-        dtype=base_adjacency.dtype,
+    adjacency_noise = (
+        curriculum.adjacency_noise
+        * difficulty
+        * torch.randn(
+            base_adjacency.shape,
+            generator=generator,
+            device=base_adjacency.device,
+            dtype=base_adjacency.dtype,
+        )
     )
 
     noisy_positions = (base_positions + position_noise).clamp(0.0, 1.0)
@@ -180,10 +199,16 @@ def _flow_noise_levels(
     free_mask = free_mask.unsqueeze(-1).to(dtype=source_structures.positions.dtype)
     free_count = free_mask.sum(dim=(1, 2)).clamp_min(1.0)
     position_gap = (
-        ((oracle_structures.positions - source_structures.positions).square() * free_mask).sum(dim=(1, 2)) / free_count
+        (
+            (oracle_structures.positions - source_structures.positions).square()
+            * free_mask
+        ).sum(dim=(1, 2))
+        / free_count
     ).sqrt()
     adjacency_gap = (
-        (oracle_structures.adjacency - source_structures.adjacency).square().mean(dim=(1, 2))
+        (oracle_structures.adjacency - source_structures.adjacency)
+        .square()
+        .mean(dim=(1, 2))
     ).sqrt()
     return position_gap, adjacency_gap
 
@@ -202,7 +227,9 @@ def make_supervised_batch(
     )
     generator = None
     if seed is not None:
-        generator = torch.Generator(device=source_structures.positions.device).manual_seed(seed + 10_000)
+        generator = torch.Generator(
+            device=source_structures.positions.device
+        ).manual_seed(seed + 10_000)
     flow_times = torch.rand(
         (optimized_cases.raw_structures.batch_size,),
         generator=generator,
@@ -225,7 +252,9 @@ def make_supervised_batch(
     flow_structures = Structures(
         positions=flow_positions,
         roles=source_structures.roles,
-        adjacency=enforce_role_adjacency_constraints(flow_adjacency, source_structures.roles),
+        adjacency=enforce_role_adjacency_constraints(
+            flow_adjacency, source_structures.roles
+        ),
     )
     current_analyses = analyze_structures(flow_structures)
     position_noise_levels, adjacency_noise_levels = _flow_noise_levels(
@@ -242,8 +271,10 @@ def make_supervised_batch(
         flow_times=flow_times,
         position_noise_levels=position_noise_levels,
         adjacency_noise_levels=adjacency_noise_levels,
-        target_position_velocity=optimized_cases.optimized_structures.positions - source_structures.positions,
-        target_adjacency_velocity=optimized_cases.optimized_structures.adjacency - source_structures.adjacency,
+        target_position_velocity=optimized_cases.optimized_structures.positions
+        - source_structures.positions,
+        target_adjacency_velocity=optimized_cases.optimized_structures.adjacency
+        - source_structures.adjacency,
     )
 
 
@@ -255,35 +286,67 @@ def select_batch(
         raise ValueError("batch_indices must be one-dimensional")
     return OptimizedCases(
         raw_structures=Structures(
-            positions=optimized_cases.raw_structures.positions.index_select(0, batch_indices),
+            positions=optimized_cases.raw_structures.positions.index_select(
+                0, batch_indices
+            ),
             roles=optimized_cases.raw_structures.roles.index_select(0, batch_indices),
-            adjacency=optimized_cases.raw_structures.adjacency.index_select(0, batch_indices),
+            adjacency=optimized_cases.raw_structures.adjacency.index_select(
+                0, batch_indices
+            ),
         ),
-        target_stiffness=optimized_cases.target_stiffness.index_select(0, batch_indices),
+        target_stiffness=optimized_cases.target_stiffness.index_select(
+            0, batch_indices
+        ),
         optimized_structures=Structures(
-            positions=optimized_cases.optimized_structures.positions.index_select(0, batch_indices),
-            roles=optimized_cases.optimized_structures.roles.index_select(0, batch_indices),
-            adjacency=optimized_cases.optimized_structures.adjacency.index_select(0, batch_indices),
+            positions=optimized_cases.optimized_structures.positions.index_select(
+                0, batch_indices
+            ),
+            roles=optimized_cases.optimized_structures.roles.index_select(
+                0, batch_indices
+            ),
+            adjacency=optimized_cases.optimized_structures.adjacency.index_select(
+                0, batch_indices
+            ),
         ),
         initial_loss=optimized_cases.initial_loss.index_select(0, batch_indices),
         best_loss=optimized_cases.best_loss.index_select(0, batch_indices),
         last_analyses=Analyses(
-            generalized_stiffness=optimized_cases.last_analyses.generalized_stiffness.index_select(0, batch_indices),
-            material_usage=optimized_cases.last_analyses.material_usage.index_select(0, batch_indices),
-            short_beam_penalty=optimized_cases.last_analyses.short_beam_penalty.index_select(0, batch_indices),
-            long_beam_penalty=optimized_cases.last_analyses.long_beam_penalty.index_select(0, batch_indices),
-            thin_beam_penalty=optimized_cases.last_analyses.thin_beam_penalty.index_select(0, batch_indices),
-            thick_beam_penalty=optimized_cases.last_analyses.thick_beam_penalty.index_select(0, batch_indices),
-            free_node_spacing_penalty=optimized_cases.last_analyses.free_node_spacing_penalty.index_select(0, batch_indices),
+            generalized_stiffness=optimized_cases.last_analyses.generalized_stiffness.index_select(
+                0, batch_indices
+            ),
+            material_usage=optimized_cases.last_analyses.material_usage.index_select(
+                0, batch_indices
+            ),
+            short_beam_penalty=optimized_cases.last_analyses.short_beam_penalty.index_select(
+                0, batch_indices
+            ),
+            long_beam_penalty=optimized_cases.last_analyses.long_beam_penalty.index_select(
+                0, batch_indices
+            ),
+            thin_beam_penalty=optimized_cases.last_analyses.thin_beam_penalty.index_select(
+                0, batch_indices
+            ),
+            thick_beam_penalty=optimized_cases.last_analyses.thick_beam_penalty.index_select(
+                0, batch_indices
+            ),
+            free_node_spacing_penalty=optimized_cases.last_analyses.free_node_spacing_penalty.index_select(
+                0, batch_indices
+            ),
         ),
         scaffolds=(
             None
             if optimized_cases.scaffolds is None
             else Scaffolds(
-                positions=optimized_cases.scaffolds.positions.index_select(0, batch_indices),
+                positions=optimized_cases.scaffolds.positions.index_select(
+                    0, batch_indices
+                ),
                 roles=optimized_cases.scaffolds.roles.index_select(0, batch_indices),
-                adjacency=optimized_cases.scaffolds.adjacency.index_select(0, batch_indices),
-                edge_primitive_types=optimized_cases.scaffolds.edge_primitive_types.index_select(0, batch_indices),
+                adjacency=optimized_cases.scaffolds.adjacency.index_select(
+                    0, batch_indices
+                ),
+                edge_primitive_types=optimized_cases.scaffolds.edge_primitive_types.index_select(
+                    0, batch_indices
+                ),
             )
         ),
     )
@@ -302,8 +365,11 @@ def iter_supervised_minibatches(
     if shuffle:
         rng = random.Random(seed)
         rng.shuffle(indices)
+    index_device = optimized_cases.raw_structures.positions.device
     for start in range(0, len(indices), batch_size):
-        batch_indices = torch.tensor(indices[start : start + batch_size], dtype=torch.long)
+        batch_indices = torch.tensor(
+            indices[start : start + batch_size], dtype=torch.long, device=index_device
+        )
         yield select_batch(optimized_cases, batch_indices)
 
 
@@ -316,27 +382,43 @@ def generalized_stiffness_error(
     return (normalized_current - normalized_target).square().mean(dim=(1, 2))
 
 
-def _position_velocity_loss(prediction: FlowPrediction, batch: SupervisedBatch) -> torch.Tensor:
+def _position_velocity_loss(
+    prediction: FlowPrediction, batch: SupervisedBatch
+) -> torch.Tensor:
     _, _, free_mask = role_masks(batch.flow_structures.roles)
     free_mask = free_mask.unsqueeze(-1).to(dtype=prediction.position_velocity.dtype)
-    error = ((prediction.position_velocity - batch.target_position_velocity).square() * free_mask).sum(dim=(1, 2))
+    error = (
+        (prediction.position_velocity - batch.target_position_velocity).square()
+        * free_mask
+    ).sum(dim=(1, 2))
     denom = free_mask.sum(dim=(1, 2)).clamp_min(1.0)
     return error / denom
 
 
-def _adjacency_velocity_loss(prediction: FlowPrediction, batch: SupervisedBatch) -> torch.Tensor:
-    return (prediction.adjacency_velocity - batch.target_adjacency_velocity).square().mean(dim=(1, 2))
+def _adjacency_velocity_loss(
+    prediction: FlowPrediction, batch: SupervisedBatch
+) -> torch.Tensor:
+    return (
+        (prediction.adjacency_velocity - batch.target_adjacency_velocity)
+        .square()
+        .mean(dim=(1, 2))
+    )
 
 
-def _endpoint_loss(prediction: FlowPrediction, batch: SupervisedBatch) -> tuple[torch.Tensor, Structures]:
+def _endpoint_loss(
+    prediction: FlowPrediction, batch: SupervisedBatch
+) -> tuple[torch.Tensor, Structures]:
     _, _, free_mask = role_masks(batch.flow_structures.roles)
     free_mask = free_mask.unsqueeze(-1).to(dtype=prediction.position_velocity.dtype)
     remaining = (1.0 - batch.flow_times)[:, None, None]
     estimated_positions = (
-        batch.flow_structures.positions + remaining * prediction.position_velocity * free_mask
+        batch.flow_structures.positions
+        + remaining * prediction.position_velocity * free_mask
     ).clamp(0.0, 1.0)
     estimated_adjacency = enforce_role_adjacency_constraints(
-        (batch.flow_structures.adjacency + remaining * prediction.adjacency_velocity).clamp(0.0, 1.0),
+        (
+            batch.flow_structures.adjacency + remaining * prediction.adjacency_velocity
+        ).clamp(0.0, 1.0),
         batch.flow_structures.roles,
     )
     # This endpoint estimate is an inexpensive consistency term: if the
@@ -347,9 +429,15 @@ def _endpoint_loss(prediction: FlowPrediction, batch: SupervisedBatch) -> tuple[
         roles=batch.flow_structures.roles,
         adjacency=estimated_adjacency,
     )
-    position_error = ((estimated.positions - batch.oracle_structures.positions).square() * free_mask).sum(dim=(1, 2))
+    position_error = (
+        (estimated.positions - batch.oracle_structures.positions).square() * free_mask
+    ).sum(dim=(1, 2))
     position_error = position_error / free_mask.sum(dim=(1, 2)).clamp_min(1.0)
-    adjacency_error = (estimated.adjacency - batch.oracle_structures.adjacency).square().mean(dim=(1, 2))
+    adjacency_error = (
+        (estimated.adjacency - batch.oracle_structures.adjacency)
+        .square()
+        .mean(dim=(1, 2))
+    )
     return position_error + adjacency_error, estimated
 
 
@@ -363,7 +451,9 @@ def _training_losses(
     endpoint_loss, estimated = _endpoint_loss(prediction, batch)
     endpoint_analyses = analyze_structures(estimated)
     stiffness_loss = torch.log1p(
-        generalized_stiffness_error(endpoint_analyses.generalized_stiffness, batch.target_stiffness)
+        generalized_stiffness_error(
+            endpoint_analyses.generalized_stiffness, batch.target_stiffness
+        )
     )
     total = (
         config.position_loss_weight * position_loss
@@ -390,13 +480,21 @@ def train_supervised_refiner(
     model_config = model_config or SupervisedRefinerConfig()
     train_config = train_config or SupervisedTrainingConfig(dataset_path="")
     curriculum = curriculum or CurriculumConfig()
+    device = resolve_torch_device(train_config.device)
 
     random.seed(train_config.seed)
     torch.manual_seed(train_config.seed)
 
-    model = SupervisedRefiner(model_config)
+    optimized_cases = optimized_cases.to(device)
+    model = SupervisedRefiner(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
-    history = {"total": [], "position": [], "adjacency": [], "endpoint": [], "stiffness": []}
+    history = {
+        "total": [],
+        "position": [],
+        "adjacency": [],
+        "endpoint": [],
+        "stiffness": [],
+    }
     checkpoint_path = Path(train_config.checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=train_config.logdir)
@@ -424,7 +522,9 @@ def train_supervised_refiner(
                     position_noise_levels=batch.position_noise_levels,
                     adjacency_noise_levels=batch.adjacency_noise_levels,
                 )
-                total_loss, loss_terms = _training_losses(prediction, batch, train_config)
+                total_loss, loss_terms = _training_losses(
+                    prediction, batch, train_config
+                )
                 optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -435,14 +535,19 @@ def train_supervised_refiner(
                     history[name].append(value)
                     writer.add_scalar(f"train/{name}", value, step)
                 writer.add_scalar("train/difficulty", difficulty, step)
-                writer.add_scalar("train/flow_time_mean", float(batch.flow_times.mean().item()), step)
+                writer.add_scalar(
+                    "train/flow_time_mean", float(batch.flow_times.mean().item()), step
+                )
                 step += 1
                 if step >= train_config.num_steps:
                     break
 
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": {
+                    name: value.detach().cpu()
+                    for name, value in model.state_dict().items()
+                },
                 "model_config": asdict(model_config),
                 "train_config": asdict(train_config),
                 "curriculum_config": asdict(curriculum),
@@ -453,7 +558,10 @@ def train_supervised_refiner(
     finally:
         writer.close()
 
-    return model, SupervisedTrainingSummary(history=history, checkpoint_path=checkpoint_path)
+    model = model.to("cpu")
+    return model, SupervisedTrainingSummary(
+        history=history, checkpoint_path=checkpoint_path
+    )
 
 
 def run_supervised_training(config: SupervisedTrainingConfig) -> None:

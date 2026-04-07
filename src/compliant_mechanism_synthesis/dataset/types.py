@@ -9,7 +9,9 @@ from compliant_mechanism_synthesis.roles import NodeRole
 
 def _require_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
     if tensor.ndim != rank:
-        raise ValueError(f"{name} must have rank {rank}, got shape {tuple(tensor.shape)}")
+        raise ValueError(
+            f"{name} must have rank {rank}, got shape {tuple(tensor.shape)}"
+        )
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,13 @@ class Structures:
     positions: torch.Tensor
     roles: torch.Tensor
     adjacency: torch.Tensor
+
+    def to(self, device: torch.device | str) -> Structures:
+        return Structures(
+            positions=self.positions.to(device),
+            roles=self.roles.to(device),
+            adjacency=self.adjacency.to(device),
+        )
 
     def validate(self) -> None:
         _require_rank("positions", self.positions, 3)
@@ -45,9 +54,13 @@ class Structures:
         fixed_count = (self.roles == int(NodeRole.FIXED)).sum(dim=1)
         mobile_count = (self.roles == int(NodeRole.MOBILE)).sum(dim=1)
         if torch.any(fixed_count < 3):
-            raise ValueError("3D rigid clamping needs at least 3 fixed anchor nodes per structure")
+            raise ValueError(
+                "3D rigid clamping needs at least 3 fixed anchor nodes per structure"
+            )
         if torch.any(mobile_count < 3):
-            raise ValueError("3D rigid output needs at least 3 mobile anchor nodes per structure")
+            raise ValueError(
+                "3D rigid output needs at least 3 mobile anchor nodes per structure"
+            )
 
     @property
     def batch_size(self) -> int:
@@ -72,6 +85,14 @@ class Scaffolds:
     adjacency: torch.Tensor
     edge_primitive_types: torch.Tensor
 
+    def to(self, device: torch.device | str) -> Scaffolds:
+        return Scaffolds(
+            positions=self.positions.to(device),
+            roles=self.roles.to(device),
+            adjacency=self.adjacency.to(device),
+            edge_primitive_types=self.edge_primitive_types.to(device),
+        )
+
     def validate(self) -> None:
         _require_rank("positions", self.positions, 3)
         _require_rank("roles", self.roles, 2)
@@ -86,10 +107,14 @@ class Scaffolds:
         if self.adjacency.shape != (batch_size, num_nodes, num_nodes):
             raise ValueError("scaffold adjacency must have shape [batch, nodes, nodes]")
         if self.edge_primitive_types.shape != (batch_size, num_nodes, num_nodes):
-            raise ValueError("edge_primitive_types must have shape [batch, nodes, nodes]")
+            raise ValueError(
+                "edge_primitive_types must have shape [batch, nodes, nodes]"
+            )
         if not torch.allclose(self.adjacency, self.adjacency.transpose(1, 2)):
             raise ValueError("scaffold adjacency must be symmetric")
-        if not torch.equal(self.edge_primitive_types, self.edge_primitive_types.transpose(1, 2)):
+        if not torch.equal(
+            self.edge_primitive_types, self.edge_primitive_types.transpose(1, 2)
+        ):
             raise ValueError("edge_primitive_types must be symmetric")
 
         adjacency_diagonal = torch.diagonal(self.adjacency, dim1=1, dim2=2)
@@ -140,6 +165,17 @@ class Analyses:
     thick_beam_penalty: torch.Tensor
     free_node_spacing_penalty: torch.Tensor
 
+    def to(self, device: torch.device | str) -> Analyses:
+        return Analyses(
+            generalized_stiffness=self.generalized_stiffness.to(device),
+            material_usage=self.material_usage.to(device),
+            short_beam_penalty=self.short_beam_penalty.to(device),
+            long_beam_penalty=self.long_beam_penalty.to(device),
+            thin_beam_penalty=self.thin_beam_penalty.to(device),
+            thick_beam_penalty=self.thick_beam_penalty.to(device),
+            free_node_spacing_penalty=self.free_node_spacing_penalty.to(device),
+        )
+
     def validate(self, batch_size: int) -> None:
         _require_rank("generalized_stiffness", self.generalized_stiffness, 3)
         if self.generalized_stiffness.shape != (batch_size, 6, 6):
@@ -168,6 +204,17 @@ class OptimizedCases:
     last_analyses: Analyses
     scaffolds: Scaffolds | None = None
 
+    def to(self, device: torch.device | str) -> OptimizedCases:
+        return OptimizedCases(
+            raw_structures=self.raw_structures.to(device),
+            target_stiffness=self.target_stiffness.to(device),
+            optimized_structures=self.optimized_structures.to(device),
+            initial_loss=self.initial_loss.to(device),
+            best_loss=self.best_loss.to(device),
+            last_analyses=self.last_analyses.to(device),
+            scaffolds=None if self.scaffolds is None else self.scaffolds.to(device),
+        )
+
     def validate(self) -> None:
         self.raw_structures.validate()
         self.optimized_structures.validate()
@@ -194,13 +241,25 @@ class OptimizedCases:
             initial_loss=self.initial_loss[index : index + 1],
             best_loss=self.best_loss[index : index + 1],
             last_analyses=Analyses(
-                generalized_stiffness=self.last_analyses.generalized_stiffness[index : index + 1],
+                generalized_stiffness=self.last_analyses.generalized_stiffness[
+                    index : index + 1
+                ],
                 material_usage=self.last_analyses.material_usage[index : index + 1],
-                short_beam_penalty=self.last_analyses.short_beam_penalty[index : index + 1],
-                long_beam_penalty=self.last_analyses.long_beam_penalty[index : index + 1],
-                thin_beam_penalty=self.last_analyses.thin_beam_penalty[index : index + 1],
-                thick_beam_penalty=self.last_analyses.thick_beam_penalty[index : index + 1],
-                free_node_spacing_penalty=self.last_analyses.free_node_spacing_penalty[index : index + 1],
+                short_beam_penalty=self.last_analyses.short_beam_penalty[
+                    index : index + 1
+                ],
+                long_beam_penalty=self.last_analyses.long_beam_penalty[
+                    index : index + 1
+                ],
+                thin_beam_penalty=self.last_analyses.thin_beam_penalty[
+                    index : index + 1
+                ],
+                thick_beam_penalty=self.last_analyses.thick_beam_penalty[
+                    index : index + 1
+                ],
+                free_node_spacing_penalty=self.last_analyses.free_node_spacing_penalty[
+                    index : index + 1
+                ],
             ),
             scaffolds=None if self.scaffolds is None else self.scaffolds.slice(index),
         )

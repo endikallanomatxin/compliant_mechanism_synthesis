@@ -11,26 +11,30 @@ from compliant_mechanism_synthesis.dataset import load_offline_dataset
 import pytest
 
 
-def test_dataset_generate_main_generates_offline_dataset_and_preview(tmp_path: Path) -> None:
+def test_dataset_generate_main_generates_offline_dataset_and_preview(
+    tmp_path: Path,
+) -> None:
     output_path = tmp_path / "dataset.pt"
     preview_dir = tmp_path / "preview"
     dataset_generate_main(
         [
             "--num-cases",
             "2",
+            "--device",
+            "cpu",
             "--num-free-nodes",
             "6",
             "--optimization-steps",
             "3",
             "--output-path",
             str(output_path),
-        "--logdir",
-        str(tmp_path / "runs"),
-        "--preview-dir",
-        str(preview_dir),
-        "--preview-cases",
-        "2",
-    ]
+            "--logdir",
+            str(tmp_path / "runs"),
+            "--preview-dir",
+            str(preview_dir),
+            "--preview-cases",
+            "2",
+        ]
     )
 
     optimized_cases, _ = load_offline_dataset(output_path)
@@ -49,6 +53,8 @@ def test_dataset_generate_main_names_run(tmp_path: Path) -> None:
         [
             "--num-cases",
             "1",
+            "--device",
+            "cpu",
             "--num-free-nodes",
             "6",
             "--optimization-steps",
@@ -71,6 +77,8 @@ def test_dataset_generate_can_run_sample_check(tmp_path: Path) -> None:
     dataset_generate_main(
         [
             "--just-check-sample",
+            "--device",
+            "cpu",
             "--sample-num-free-nodes",
             "6",
             "--sample-optimization-steps",
@@ -90,6 +98,8 @@ def test_visualize_dataset_main_renders_existing_dataset(tmp_path: Path) -> None
         [
             "--num-cases",
             "2",
+            "--device",
+            "cpu",
             "--num-free-nodes",
             "6",
             "--optimization-steps",
@@ -139,6 +149,8 @@ def test_train_supervised_main_writes_checkpoint(tmp_path: Path) -> None:
         [
             "--dataset-path",
             str(output_path),
+            "--device",
+            "cpu",
             "--batch-size",
             "2",
             "--num-steps",

@@ -15,7 +15,13 @@ from compliant_mechanism_synthesis.dataset.primitives import (
     PrimitiveConfig,
     sample_random_primitive,
 )
-from compliant_mechanism_synthesis.dataset.types import Analyses, OptimizedCases, Scaffolds, Structures
+from compliant_mechanism_synthesis.dataset.types import (
+    Analyses,
+    OptimizedCases,
+    Scaffolds,
+    Structures,
+)
+from compliant_mechanism_synthesis.utils import resolve_torch_device
 from compliant_mechanism_synthesis.visualization import write_dataset_visualizations
 
 
@@ -23,6 +29,7 @@ from compliant_mechanism_synthesis.visualization import write_dataset_visualizat
 class OfflineDatasetConfig:
     num_cases: int = 32
     seed: int = 7
+    device: str = "auto"
     output_path: str = "datasets/offline_dataset.pt"
     logdir: str = "runs/offline_dataset"
     preview_dir: str | None = None
@@ -31,8 +38,11 @@ class OfflineDatasetConfig:
     optimization: CaseOptimizationConfig = field(default_factory=CaseOptimizationConfig)
 
 
-def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> OptimizedCases:
+def generate_offline_dataset(
+    config: OfflineDatasetConfig | None = None,
+) -> OptimizedCases:
     config = config or OfflineDatasetConfig()
+    device = resolve_torch_device(config.device)
     output_path = Path(config.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     Path(config.logdir).mkdir(parents=True, exist_ok=True)
@@ -48,6 +58,7 @@ def generate_offline_dataset(config: OfflineDatasetConfig | None = None) -> Opti
             config=config.primitive,
             seed=primitive_seed,
         )
+        initial_structures = initial_structures.to(device)
         target = sample_target_stiffness(
             initial_structures,
             config=config.optimization,
@@ -137,7 +148,9 @@ def load_offline_dataset(
             long_beam_penalty=payload["last_analyses"]["long_beam_penalty"],
             thin_beam_penalty=payload["last_analyses"]["thin_beam_penalty"],
             thick_beam_penalty=payload["last_analyses"]["thick_beam_penalty"],
-            free_node_spacing_penalty=payload["last_analyses"]["free_node_spacing_penalty"],
+            free_node_spacing_penalty=payload["last_analyses"][
+                "free_node_spacing_penalty"
+            ],
         ),
         scaffolds=Scaffolds(
             positions=payload["scaffolds"]["positions"],
@@ -156,35 +169,38 @@ def _serialize_optimized_cases(
 ) -> dict[str, object]:
     optimized_cases.validate()
     if optimized_cases.scaffolds is None:
-        raise ValueError("offline datasets require scaffold metadata for primitive previews")
+        raise ValueError(
+            "offline datasets require scaffold metadata for primitive previews"
+        )
+    serialized = optimized_cases.to("cpu")
     return {
         "raw_structures": {
-            "positions": optimized_cases.raw_structures.positions,
-            "roles": optimized_cases.raw_structures.roles,
-            "adjacency": optimized_cases.raw_structures.adjacency,
+            "positions": serialized.raw_structures.positions,
+            "roles": serialized.raw_structures.roles,
+            "adjacency": serialized.raw_structures.adjacency,
         },
-        "target_stiffness": optimized_cases.target_stiffness,
+        "target_stiffness": serialized.target_stiffness,
         "optimized_structures": {
-            "positions": optimized_cases.optimized_structures.positions,
-            "roles": optimized_cases.optimized_structures.roles,
-            "adjacency": optimized_cases.optimized_structures.adjacency,
+            "positions": serialized.optimized_structures.positions,
+            "roles": serialized.optimized_structures.roles,
+            "adjacency": serialized.optimized_structures.adjacency,
         },
-        "initial_loss": optimized_cases.initial_loss,
-        "best_loss": optimized_cases.best_loss,
+        "initial_loss": serialized.initial_loss,
+        "best_loss": serialized.best_loss,
         "last_analyses": {
-            "generalized_stiffness": optimized_cases.last_analyses.generalized_stiffness,
-            "material_usage": optimized_cases.last_analyses.material_usage,
-            "short_beam_penalty": optimized_cases.last_analyses.short_beam_penalty,
-            "long_beam_penalty": optimized_cases.last_analyses.long_beam_penalty,
-            "thin_beam_penalty": optimized_cases.last_analyses.thin_beam_penalty,
-            "thick_beam_penalty": optimized_cases.last_analyses.thick_beam_penalty,
-            "free_node_spacing_penalty": optimized_cases.last_analyses.free_node_spacing_penalty,
+            "generalized_stiffness": serialized.last_analyses.generalized_stiffness,
+            "material_usage": serialized.last_analyses.material_usage,
+            "short_beam_penalty": serialized.last_analyses.short_beam_penalty,
+            "long_beam_penalty": serialized.last_analyses.long_beam_penalty,
+            "thin_beam_penalty": serialized.last_analyses.thin_beam_penalty,
+            "thick_beam_penalty": serialized.last_analyses.thick_beam_penalty,
+            "free_node_spacing_penalty": serialized.last_analyses.free_node_spacing_penalty,
         },
         "scaffolds": {
-            "positions": optimized_cases.scaffolds.positions,
-            "roles": optimized_cases.scaffolds.roles,
-            "adjacency": optimized_cases.scaffolds.adjacency,
-            "edge_primitive_types": optimized_cases.scaffolds.edge_primitive_types,
+            "positions": serialized.scaffolds.positions,
+            "roles": serialized.scaffolds.roles,
+            "adjacency": serialized.scaffolds.adjacency,
+            "edge_primitive_types": serialized.scaffolds.edge_primitive_types,
         },
         "config": asdict(config),
     }

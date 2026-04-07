@@ -15,6 +15,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Train the supervised refinement model with flow matching over the offline dataset.",
     )
     parser.add_argument("--dataset-path", required=True)
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-steps", type=int, default=10_000)
     parser.add_argument("--checkpoint-path", default="artifacts/supervised_refiner.pt")
@@ -30,6 +31,7 @@ def train_supervised_main(argv: list[str] | None = None) -> None:
     run_supervised_training(
         SupervisedTrainingConfig(
             dataset_path=args.dataset_path,
+            device=args.device,
             batch_size=args.batch_size,
             num_steps=args.num_steps,
             checkpoint_path=args.checkpoint_path,
