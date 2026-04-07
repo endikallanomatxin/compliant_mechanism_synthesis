@@ -38,7 +38,7 @@ class CurriculumConfig:
 @dataclass(frozen=True)
 class SupervisedTrainingConfig:
     dataset_path: str
-    batch_size: int = 16
+    batch_size: int = 64
     num_steps: int = 20_000
     learning_rate: float = 1e-4
     position_loss_weight: float = 1.0
