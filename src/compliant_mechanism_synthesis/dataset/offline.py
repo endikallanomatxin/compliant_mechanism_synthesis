@@ -12,7 +12,9 @@ from compliant_mechanism_synthesis.dataset.optimization import (
     sample_target_stiffness,
 )
 from compliant_mechanism_synthesis.dataset.primitives import (
+    CHAIN_PRIMITIVE_LIBRARY,
     PrimitiveConfig,
+    _intertwined_scaffold_edges,
     sample_random_primitive,
 )
 from compliant_mechanism_synthesis.dataset.types import (
@@ -31,7 +33,7 @@ class OfflineDatasetConfig:
     batch_size: int = 32
     seed: int = 7
     device: str = "auto"
-    output_path: str = "datasets/offline_dataset.pt"
+    output_path: str = "datasets/dataset.pt"
     logdir: str = "runs/offline_dataset"
     preview_dir: str | None = None
     preview_case_number: int = 8
@@ -144,6 +146,21 @@ def generate_offline_dataset(
 
     rng = random.Random(config.seed)
     primitive_config = config.primitive
+    if (
+        primitive_config.forced_segment_primitive_types is None
+        and primitive_config.forced_primitive_type is None
+    ):
+        primitive_config = replace(
+            primitive_config,
+            forced_segment_primitive_types=tuple(
+                rng.choice(CHAIN_PRIMITIVE_LIBRARY)
+                for _ in range(
+                    len(
+                        _intertwined_scaffold_edges(primitive_config.num_free_nodes + 2)
+                    )
+                )
+            ),
+        )
     if primitive_config.sample_sheet_helix_width_nodes:
         if (
             primitive_config.sheet_helix_width_nodes_min

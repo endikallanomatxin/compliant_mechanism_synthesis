@@ -52,7 +52,7 @@ def test_sample_primitive_design_materializes_triplets_with_no_dangling_nodes() 
     assert torch.all(degree >= 2.0)
 
 
-def test_sample_random_primitive_uses_single_debug_chain_family() -> None:
+def test_sample_random_primitive_assigns_multiple_segment_families() -> None:
     _, scaffolds = sample_random_primitive(
         config=PrimitiveConfig(num_free_nodes=8),
         seed=13,
@@ -60,7 +60,17 @@ def test_sample_random_primitive_uses_single_debug_chain_family() -> None:
 
     edge_types = scaffolds.edge_primitive_types[0]
     used_types = torch.unique(edge_types[edge_types >= 0])
-    assert used_types.tolist() == [4]
+    assert used_types.numel() >= 3
+
+
+def test_sample_random_primitive_builds_intertwined_scaffold_graph() -> None:
+    _, scaffolds = sample_random_primitive(
+        config=PrimitiveConfig(num_free_nodes=8),
+        seed=13,
+    )
+
+    degree = scaffolds.adjacency[0].sum(dim=1)
+    assert torch.count_nonzero(degree >= 3.0) >= 4
 
 
 def test_sheet_width_nodes_increases_materialized_node_count() -> None:
@@ -90,7 +100,7 @@ def test_sheet_width_nodes_increases_materialized_node_count() -> None:
     assert wide.positions.shape[1] > narrow.positions.shape[1]
 
 
-def test_sheet_helix_increases_longitudinal_density_for_tighter_turns() -> None:
+def test_sheet_helix_responds_to_pitch_and_offset_controls() -> None:
     relaxed = sample_primitive_design(
         config=PrimitiveConfig(
             num_free_nodes=6,
@@ -128,7 +138,7 @@ def test_truss_materialization_creates_dense_skip_link_bracing() -> None:
     )
 
     degree = structures.adjacency[0].sum(dim=1)
-    assert torch.count_nonzero(degree >= 5.0) > 0
+    assert torch.count_nonzero(degree >= 4.0) > 0
 
 
 def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) -> None:

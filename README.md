@@ -105,8 +105,8 @@ Render previews again from an existing dataset:
 
 ```bash
 uv run cms-dataset-visualize \
-  --dataset-path artifacts/offline_dataset.pt \
-  --output-dir artifacts/offline_dataset_preview
+  --dataset-path artifacts/dataset.pt \
+  --output-dir artifacts/dataset_preview
 ```
 
 Inspect a single optimized case via `cms-dataset-generate`:

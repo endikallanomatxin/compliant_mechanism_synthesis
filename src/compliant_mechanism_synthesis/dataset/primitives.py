@@ -21,7 +21,7 @@ CHAIN_PRIMITIVE_LIBRARY = (
 # During scaffold-to-mesh debugging we intentionally keep a single active
 # primitive family so we can inspect one geometry/conectivity pattern at a
 # time before re-introducing the others.
-ACTIVE_CHAIN_PRIMITIVE_LIBRARY = ("truss",)
+ACTIVE_CHAIN_PRIMITIVE_LIBRARY = CHAIN_PRIMITIVE_LIBRARY
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ class PrimitiveConfig:
     # This controls the sparse scaffolding graph, not the final number of free
     # FEM nodes. We keep the default sparse on purpose during primitive
     # debugging so the scaffold-to-mesh conversion remains visually readable.
-    num_free_nodes: int = 6
+    num_free_nodes: int = 18
     width: float = 0.18
     thickness: float = 0.10
     anchor_radius: float = 0.04
@@ -47,7 +47,7 @@ class PrimitiveConfig:
     mobile_anchor_z: float = 0.90
     target_edge_length: float = 0.05
     helix_radius: float = 0.06
-    helix_turns: float = 12.0
+    helix_turns: float = 4.0
     truss_target_edge_length_scale: float = 0.33
     sheet_width_nodes: int = 4
     sheet_width_distance: float = 0.02
@@ -56,9 +56,10 @@ class PrimitiveConfig:
     sheet_helix_width_nodes_max: int = 4
     sheet_helix_offset_distance_min: float = 0.06
     sheet_helix_offset_distance_max: float = 0.10
-    sheet_helix_pitch_distance: float = 0.16
+    sheet_helix_pitch_distance: float = 0.24
     sheet_helix_max_longitudinal_points: int = 128
     forced_primitive_type: str | None = None
+    forced_segment_primitive_types: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -171,30 +172,7 @@ def _sample_scaffold_connectivity(
         {"rod", "rod_helix", "sheet", "sheet_helix", "truss"}
     ):
         adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
-        remaining = list(range(1, num_nodes - 1))
-        order = [0]
-        current = 0
-        while remaining:
-            weights = []
-            for candidate in remaining:
-                distance = float(
-                    torch.linalg.vector_norm(
-                        centers[candidate] - centers[current]
-                    ).item()
-                )
-                forward_bias = max(
-                    float(centers[candidate, 0].item() - centers[current, 0].item()),
-                    0.02,
-                )
-                weights.append(
-                    _localized_edge_probability(distance, config) * forward_bias
-                )
-            next_index = rng.choices(remaining, weights=weights, k=1)[0]
-            order.append(next_index)
-            remaining.remove(next_index)
-            current = next_index
-        order.append(num_nodes - 1)
-        for source, target in zip(order[:-1], order[1:]):
+        for source, target in _intertwined_scaffold_edges(num_nodes):
             adjacency[source, target] = 1.0
             adjacency[target, source] = 1.0
         return adjacency
@@ -242,6 +220,17 @@ def _sample_scaffold_connectivity(
     return adjacency
 
 
+def _intertwined_scaffold_edges(num_nodes: int) -> list[tuple[int, int]]:
+    edges: list[tuple[int, int]] = []
+    for source in range(num_nodes - 1):
+        edges.append((source, source + 1))
+    for source in range(0, num_nodes - 2, 2):
+        edges.append((source, source + 2))
+    for source in range(1, num_nodes - 3, 2):
+        edges.append((source, source + 3))
+    return edges
+
+
 def _sample_chain_primitives(
     chains: list[list[int]],
     config: PrimitiveConfig,
@@ -253,14 +242,29 @@ def _sample_chain_primitives(
         and config.forced_primitive_type not in CHAIN_PRIMITIVE_LIBRARY
     ):
         raise ValueError("forced_primitive_type must be a known primitive family")
-    for chain in chains:
+    if config.forced_segment_primitive_types is not None:
+        for primitive_type in config.forced_segment_primitive_types:
+            if primitive_type not in CHAIN_PRIMITIVE_LIBRARY:
+                raise ValueError(
+                    "forced_segment_primitive_types must contain known primitive families"
+                )
+    primitive_types = []
+    if config.forced_segment_primitive_types is not None:
+        if len(config.forced_segment_primitive_types) != len(chains):
+            raise ValueError(
+                "forced_segment_primitive_types must match the number of scaffold segments"
+            )
+        primitive_types = list(config.forced_segment_primitive_types)
+    elif config.forced_primitive_type is not None:
+        primitive_types = [config.forced_primitive_type] * len(chains)
+    else:
+        primitive_types = [
+            rng.choice(CHAIN_PRIMITIVE_LIBRARY) for _ in range(len(chains))
+        ]
+
+    for chain, primitive_type in zip(chains, primitive_types):
         width_scale = rng.uniform(0.8, 1.15)
         thickness_scale = rng.uniform(0.45, 0.85)
-        primitive_type = (
-            config.forced_primitive_type
-            if config.forced_primitive_type is not None
-            else rng.choice(ACTIVE_CHAIN_PRIMITIVE_LIBRARY)
-        )
         sheet_width_nodes = config.sheet_width_nodes
         if primitive_type == "sheet_helix" and config.sample_sheet_helix_width_nodes:
             if config.sheet_helix_width_nodes_min > config.sheet_helix_width_nodes_max:
@@ -308,57 +312,14 @@ def _sample_chain_primitives(
     return assignments
 
 
-def _extract_primitive_chains(adjacency: torch.Tensor) -> list[list[int]]:
+def _extract_primitive_segments(adjacency: torch.Tensor) -> list[list[int]]:
     num_nodes = adjacency.shape[0]
-    degree = adjacency.sum(dim=1).to(dtype=torch.long)
-    visited_edges: set[tuple[int, int]] = set()
-    chains: list[list[int]] = []
-
-    def walk_chain(start: int, nxt: int) -> list[int]:
-        chain = [start, nxt]
-        previous = start
-        current = nxt
-        visited_edges.add(tuple(sorted((start, nxt))))
-        while degree[current].item() == 2:
-            neighbors = (
-                torch.nonzero(adjacency[current] > 0.0, as_tuple=False)
-                .flatten()
-                .tolist()
-            )
-            candidates = [neighbor for neighbor in neighbors if neighbor != previous]
-            if not candidates:
-                break
-            following = candidates[0]
-            edge_key = tuple(sorted((current, following)))
-            if edge_key in visited_edges:
-                break
-            chain.append(following)
-            visited_edges.add(edge_key)
-            previous, current = current, following
-        return chain
-
-    branch_nodes = [index for index in range(num_nodes) if degree[index].item() != 2]
-    for start in branch_nodes:
-        neighbors = (
-            torch.nonzero(adjacency[start] > 0.0, as_tuple=False).flatten().tolist()
-        )
-        for nxt in neighbors:
-            edge_key = tuple(sorted((start, nxt)))
-            if edge_key in visited_edges:
-                continue
-            chains.append(walk_chain(start, nxt))
-
-    for start in range(num_nodes):
-        neighbors = (
-            torch.nonzero(adjacency[start] > 0.0, as_tuple=False).flatten().tolist()
-        )
-        for nxt in neighbors:
-            edge_key = tuple(sorted((start, nxt)))
-            if edge_key in visited_edges:
-                continue
-            chains.append(walk_chain(start, nxt))
-
-    return chains
+    segments = []
+    for source in range(num_nodes):
+        for target in range(source + 1, num_nodes):
+            if adjacency[source, target] > 0.0:
+                segments.append([source, target])
+    return segments
 
 
 def _estimate_scaffold_tangent(
@@ -521,9 +482,11 @@ def _materialize_scaffold_node_triplets(
             raise ValueError(
                 "debugging path only supports the current primitive families"
             )
+        segment_num_points = _segment_num_points(assignment.primitive_type, config)
         chain_positions = _discretize_rod_chain(
             centers=centers[assignment.chain],
             target_edge_length=config.target_edge_length,
+            num_points=segment_num_points,
         )
         start_index = ensure_connection_node(assignment.chain[0])
         end_index = ensure_connection_node(assignment.chain[-1])
@@ -545,6 +508,7 @@ def _materialize_scaffold_node_triplets(
                 turns=config.helix_turns,
                 phase=assignment.sweep_phase,
                 target_edge_length=config.target_edge_length,
+                num_points=segment_num_points,
             )
             _materialize_single_rail(
                 chain_positions=helical_chain,
@@ -556,26 +520,6 @@ def _materialize_scaffold_node_triplets(
             continue
 
         if assignment.primitive_type == "truss":
-            truss_target_edge_length = max(
-                1e-6,
-                config.target_edge_length * config.truss_target_edge_length_scale,
-            )
-            truss_num_points = max(
-                chain_positions.shape[0],
-                int(
-                    math.ceil(
-                        (chain_positions.shape[0] - 1)
-                        * config.target_edge_length
-                        / truss_target_edge_length
-                    )
-                )
-                + 1,
-            )
-            chain_positions = _resample_polyline_by_spacing(
-                chain_positions,
-                target_edge_length=truss_target_edge_length,
-                num_points=truss_num_points,
-            )
             truss_positions = _build_truss_helix_positions(
                 chain_positions=chain_positions,
                 assignment=assignment,
@@ -595,6 +539,7 @@ def _materialize_scaffold_node_triplets(
                 assignment=assignment,
                 target_edge_length=config.target_edge_length,
                 max_longitudinal_points=config.sheet_helix_max_longitudinal_points,
+                num_points=segment_num_points,
             )
         else:
             sheet_centerline = chain_positions
@@ -680,13 +625,16 @@ def _resample_polyline_by_spacing(
     target_edge_length: float,
     num_points: int | None = None,
 ) -> torch.Tensor:
-    if polyline.shape[0] <= 2:
+    if polyline.shape[0] <= 1:
         return polyline
 
     segment_vectors = polyline[1:] - polyline[:-1]
     segment_lengths = torch.linalg.vector_norm(segment_vectors, dim=1)
     cumulative = torch.cat(
-        [torch.zeros(1, dtype=polyline.dtype), torch.cumsum(segment_lengths, dim=0)],
+        [
+            torch.zeros(1, dtype=polyline.dtype, device=polyline.device),
+            torch.cumsum(segment_lengths, dim=0),
+        ],
         dim=0,
     )
     total_length = float(cumulative[-1].item())
@@ -724,6 +672,7 @@ def _resample_polyline_by_spacing(
 def _discretize_rod_chain(
     centers: torch.Tensor,
     target_edge_length: float,
+    num_points: int | None = None,
 ) -> torch.Tensor:
     # Rods should read as one-dimensional members that follow the scaffold
     # trajectory. We therefore interpolate a smooth centerline through the
@@ -735,10 +684,13 @@ def _discretize_rod_chain(
     # to a fixed number of points derived from the fixed workspace span and the
     # requested target edge length. The curve geometry still comes from the
     # scaffold; only the sample count is normalized for batching.
-    workspace_span = float(torch.linalg.vector_norm(centers[-1] - centers[0]).item())
-    num_points = max(
-        2, int(math.ceil(workspace_span / max(target_edge_length, 1e-6))) + 1
-    )
+    if num_points is None:
+        workspace_span = float(
+            torch.linalg.vector_norm(centers[-1] - centers[0]).item()
+        )
+        num_points = max(
+            2, int(math.ceil(workspace_span / max(target_edge_length, 1e-6))) + 1
+        )
     return _resample_polyline_by_spacing(
         smoothed,
         target_edge_length,
@@ -759,6 +711,49 @@ def _materialize_single_rail(
         add_edge(previous_index, node_index)
         previous_index = node_index
     add_edge(previous_index, end_index)
+
+
+def _segment_num_points(
+    primitive_type: str,
+    config: PrimitiveConfig,
+) -> int:
+    nominal_segment_span = 0.76 / max(config.num_free_nodes + 1, 1)
+    if primitive_type == "rod":
+        effective_length = nominal_segment_span
+    elif primitive_type == "rod_helix":
+        effective_length = math.sqrt(
+            nominal_segment_span**2
+            + (2.0 * math.pi * config.helix_radius * abs(config.helix_turns)) ** 2
+        )
+    elif primitive_type == "sheet":
+        effective_length = max(nominal_segment_span, 2.5 * config.sheet_width_distance)
+    elif primitive_type == "sheet_helix":
+        effective_radius = 0.5 * (
+            config.sheet_helix_offset_distance_min
+            + config.sheet_helix_offset_distance_max
+        )
+        turns = nominal_segment_span / max(config.sheet_helix_pitch_distance, 1e-6)
+        effective_length = math.sqrt(
+            max(nominal_segment_span, 2.5 * config.sheet_width_distance) ** 2
+            + (2.0 * math.pi * effective_radius * abs(turns)) ** 2
+        )
+    elif primitive_type == "truss":
+        effective_length = nominal_segment_span / max(
+            config.truss_target_edge_length_scale,
+            1e-6,
+        )
+    else:
+        raise ValueError(f"unknown primitive type: {primitive_type}")
+
+    minimum_points = 2
+    if primitive_type in {"sheet", "sheet_helix"}:
+        minimum_points = 4
+    if primitive_type == "truss":
+        minimum_points = 5
+    return max(
+        minimum_points,
+        int(math.ceil(effective_length / max(config.target_edge_length, 1e-6))) + 1,
+    )
 
 
 def _estimate_polyline_tangent(
@@ -953,6 +948,7 @@ def _build_sheet_helix_centerline(
     assignment: ChainPrimitiveAssignment,
     target_edge_length: float,
     max_longitudinal_points: int,
+    num_points: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     control_offset_distances = torch.tensor(
         assignment.offset_distances,
@@ -965,10 +961,11 @@ def _build_sheet_helix_centerline(
     total_turns = base_arc_length / max(assignment.helix_pitch, 1e-6)
     helical_circumference_travel = abs(total_turns) * 2.0 * math.pi * effective_radius
     helical_length = math.sqrt(base_arc_length**2 + helical_circumference_travel**2)
-    num_points = max(
-        chain_positions.shape[0],
-        int(math.ceil(helical_length / max(target_edge_length, 1e-6))) + 1,
-    )
+    if num_points is None:
+        num_points = max(
+            chain_positions.shape[0],
+            int(math.ceil(helical_length / max(target_edge_length, 1e-6))) + 1,
+        )
     num_points = min(num_points, max_longitudinal_points)
     helix_support = _resample_polyline_by_spacing(
         chain_positions,
@@ -1102,6 +1099,7 @@ def _discretize_rod_helix_chain(
     turns: float,
     phase: float,
     target_edge_length: float,
+    num_points: int | None = None,
 ) -> torch.Tensor:
     centerline_span = float(
         torch.linalg.vector_norm(chain_positions[-1] - chain_positions[0]).item()
@@ -1112,9 +1110,10 @@ def _discretize_rod_helix_chain(
     # dataset still needs fixed tensor shapes across cases. We therefore
     # normalize the sample count against the expected helix geometry for the
     # whole family rather than the exact per-case arc length.
-    num_points = max(
-        2, int(math.ceil(helical_length / max(1e-6, target_edge_length))) + 1
-    )
+    if num_points is None:
+        num_points = max(
+            2, int(math.ceil(helical_length / max(1e-6, target_edge_length))) + 1
+        )
     helix_support = _resample_polyline_by_spacing(
         chain_positions,
         target_edge_length=target_edge_length,
@@ -1228,8 +1227,8 @@ def _sample_primitive_case(
     # final expanded mesh.
     scaffold_centers = _sample_random_scaffold_centers(config, rng)
     scaffold_adjacency = _sample_scaffold_connectivity(scaffold_centers, config, rng)
-    primitive_chains = _extract_primitive_chains(scaffold_adjacency)
-    primitive_assignments = _sample_chain_primitives(primitive_chains, config, rng)
+    primitive_segments = _extract_primitive_segments(scaffold_adjacency)
+    primitive_assignments = _sample_chain_primitives(primitive_segments, config, rng)
     styled_centers = _apply_chain_style_offsets(
         centers=scaffold_centers,
         adjacency=scaffold_adjacency,
