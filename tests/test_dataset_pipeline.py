@@ -121,14 +121,14 @@ def test_sheet_helix_increases_longitudinal_density_for_tighter_turns() -> None:
     assert tighter.positions.shape[1] > relaxed.positions.shape[1]
 
 
-def test_truss_materialization_creates_internal_triangular_bracing() -> None:
+def test_truss_materialization_creates_dense_skip_link_bracing() -> None:
     structures = sample_primitive_design(
         config=PrimitiveConfig(num_free_nodes=6),
         seed=23,
     )
 
     degree = structures.adjacency[0].sum(dim=1)
-    assert torch.count_nonzero(degree >= 4.0) > 0
+    assert torch.count_nonzero(degree >= 5.0) > 0
 
 
 def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) -> None:

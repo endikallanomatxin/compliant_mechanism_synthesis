@@ -555,12 +555,12 @@ def _materialize_scaffold_node_triplets(
             continue
 
         if assignment.primitive_type == "truss":
-            truss_sections = _build_truss_sections(
+            truss_positions = _build_truss_helix_positions(
                 chain_positions=chain_positions,
                 assignment=assignment,
             )
-            _materialize_truss_prism(
-                sections=truss_sections,
+            _materialize_truss_helix(
+                truss_positions=truss_positions,
                 add_node=add_node,
                 add_edge=add_edge,
                 start_index=start_index,
@@ -1018,11 +1018,11 @@ def _build_sheet_lateral_axes(
     return torch.stack(lateral_axes, dim=0)
 
 
-def _build_truss_sections(
+def _build_truss_helix_positions(
     chain_positions: torch.Tensor,
     assignment: ChainPrimitiveAssignment,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    sections = []
+) -> torch.Tensor:
+    positions = []
     for sample_index in range(chain_positions.shape[0]):
         tangent = _estimate_polyline_tangent(chain_positions, sample_index)
         _, normal_1, normal_2 = _orthonormal_frame(tangent)
@@ -1036,78 +1036,43 @@ def _build_truss_sections(
         twist = (
             1.0 - fraction
         ) * assignment.twist_start + fraction * assignment.twist_end
-        angle = assignment.sweep_phase + twist * math.pi
-        lateral_axis = math.cos(angle) * normal_1 + math.sin(angle) * normal_2
-        vertical_axis = torch.linalg.cross(tangent, lateral_axis)
-        if torch.linalg.vector_norm(vertical_axis).item() < 1e-8:
-            vertical_axis = normal_2
-        vertical_axis = vertical_axis / torch.linalg.vector_norm(
-            vertical_axis
-        ).clamp_min(1e-8)
-
+        base_angle = assignment.sweep_phase + twist * math.pi
+        triangle_phase = base_angle + (2.0 * math.pi / 3.0) * sample_index
         center = chain_positions[sample_index]
-        half_width = max(1.8 * width, 0.018)
-        top_height = max(2.4 * thickness, 0.022)
-        left = center - half_width * lateral_axis
-        right = center + half_width * lateral_axis
-        top = center + top_height * vertical_axis
-        sections.append((left, right, top))
-    return sections
+        radius = max(2.2 * max(width, thickness), 0.02)
+        offset = radius * (
+            math.cos(triangle_phase) * normal_1 + math.sin(triangle_phase) * normal_2
+        )
+        positions.append(center + offset)
+    return torch.stack(positions, dim=0)
 
 
-def _materialize_truss_prism(
-    sections: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+def _materialize_truss_helix(
+    truss_positions: torch.Tensor,
     add_node,
     add_edge,
     start_index: int,
     end_index: int,
 ) -> None:
-    if len(sections) <= 2:
+    if truss_positions.shape[0] <= 2:
         add_edge(start_index, end_index)
         return
 
-    section_node_indices: list[tuple[int, int, int]] = []
-    for left_position, right_position, top_position in sections[1:-1]:
-        left_index = add_node(left_position, NodeRole.FREE)
-        right_index = add_node(right_position, NodeRole.FREE)
-        top_index = add_node(top_position, NodeRole.FREE)
-        add_edge(left_index, right_index)
-        add_edge(left_index, top_index)
-        add_edge(right_index, top_index)
-        section_node_indices.append((left_index, right_index, top_index))
-
-    if not section_node_indices:
+    node_indices = [
+        add_node(position, NodeRole.FREE) for position in truss_positions[1:-1]
+    ]
+    if not node_indices:
         add_edge(start_index, end_index)
         return
 
-    first_left, first_right, first_top = section_node_indices[0]
-    add_edge(start_index, first_left)
-    add_edge(start_index, first_right)
-    add_edge(start_index, first_top)
-
-    for segment_index, (previous_section, current_section) in enumerate(
-        zip(section_node_indices[:-1], section_node_indices[1:])
-    ):
-        previous_left, previous_right, previous_top = previous_section
-        current_left, current_right, current_top = current_section
-
-        add_edge(previous_left, current_left)
-        add_edge(previous_right, current_right)
-        add_edge(previous_top, current_top)
-
-        if segment_index % 2 == 0:
-            add_edge(previous_left, current_right)
-            add_edge(previous_right, current_top)
-            add_edge(previous_top, current_left)
-        else:
-            add_edge(previous_right, current_left)
-            add_edge(previous_top, current_right)
-            add_edge(previous_left, current_top)
-
-    last_left, last_right, last_top = section_node_indices[-1]
-    add_edge(last_left, end_index)
-    add_edge(last_right, end_index)
-    add_edge(last_top, end_index)
+    ordered_indices = [start_index, *node_indices, end_index]
+    for current_index in range(1, len(ordered_indices)):
+        current_node = ordered_indices[current_index]
+        for offset in (1, 2, 3):
+            previous_index = current_index - offset
+            if previous_index < 0:
+                continue
+            add_edge(current_node, ordered_indices[previous_index])
 
 
 def _discretize_rod_helix_chain(
