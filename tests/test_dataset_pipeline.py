@@ -60,7 +60,20 @@ def test_sample_random_primitive_uses_single_debug_chain_family() -> None:
 
     edge_types = scaffolds.edge_primitive_types[0]
     used_types = torch.unique(edge_types[edge_types >= 0])
-    assert used_types.tolist() == [1]
+    assert used_types.tolist() == [2]
+
+
+def test_sheet_width_nodes_increases_materialized_node_count() -> None:
+    narrow = sample_primitive_design(
+        config=PrimitiveConfig(num_free_nodes=6, sheet_width_nodes=2),
+        seed=17,
+    )
+    wide = sample_primitive_design(
+        config=PrimitiveConfig(num_free_nodes=6, sheet_width_nodes=6),
+        seed=17,
+    )
+
+    assert wide.positions.shape[1] > narrow.positions.shape[1]
 
 
 def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) -> None:
