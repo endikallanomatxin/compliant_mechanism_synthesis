@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import random
@@ -46,12 +47,14 @@ class SupervisedTrainingConfig:
     dataset_path: str
     device: str = "auto"
     batch_size: int = 256
+    log_every_steps: int = 10
+    max_grad_norm: float = 1.0
     num_steps: int = 20_000
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-5
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.5
-    endpoint_loss_weight: float = 0.1
-    stiffness_loss_weight: float = 0.02
+    endpoint_loss_weight: float = 0.05
+    stiffness_loss_weight: float = 0.01
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
     seed: int = 7
@@ -485,6 +488,13 @@ def train_supervised_refiner(
     random.seed(train_config.seed)
     torch.manual_seed(train_config.seed)
 
+    if train_config.log_every_steps <= 0:
+        raise ValueError("log_every_steps must be positive")
+    if train_config.max_grad_norm <= 0.0:
+        raise ValueError("max_grad_norm must be positive")
+
+    dataset_cases = optimized_cases.raw_structures.batch_size
+    steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
     model = SupervisedRefiner(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
     history = {
@@ -501,8 +511,14 @@ def train_supervised_refiner(
     )
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=train_config.logdir)
+    print(
+        f"training started dataset_cases={dataset_cases} batch_size={train_config.batch_size} "
+        f"steps_per_epoch={steps_per_epoch} device={device}",
+        flush=True,
+    )
     try:
         step = 0
+        examples_seen = 0
         while step < train_config.num_steps:
             for minibatch_cases in iter_supervised_minibatches(
                 optimized_cases,
@@ -531,7 +547,13 @@ def train_supervised_refiner(
                 )
                 optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=train_config.max_grad_norm
+                    ).item()
+                )
+                clipped = grad_norm > train_config.max_grad_norm
+                clip_ratio = grad_norm / train_config.max_grad_norm
                 optimizer.step()
 
                 for name in history:
@@ -542,6 +564,27 @@ def train_supervised_refiner(
                 writer.add_scalar(
                     "train/flow_time_mean", float(batch.flow_times.mean().item()), step
                 )
+                writer.add_scalar("train/grad_norm", grad_norm, step)
+                writer.add_scalar("train/clip_ratio", clip_ratio, step)
+                writer.add_scalar("train/clipped", float(clipped), step)
+                examples_seen += minibatch_cases.raw_structures.batch_size
+                if (
+                    step % train_config.log_every_steps == 0
+                    or step == train_config.num_steps - 1
+                ):
+                    print(
+                        f"train step={step + 1}/{train_config.num_steps} "
+                        f"batch_cases={minibatch_cases.raw_structures.batch_size} "
+                        f"examples_seen={examples_seen} difficulty={difficulty:.3f} "
+                        f"loss_total={history['total'][-1]:.6f} "
+                        f"loss_position={history['position'][-1]:.6f} "
+                        f"loss_adjacency={history['adjacency'][-1]:.6f} "
+                        f"loss_endpoint={history['endpoint'][-1]:.6f} "
+                        f"loss_stiffness={history['stiffness'][-1]:.6f} "
+                        f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
+                        f"clip_ratio={clip_ratio:.3f}",
+                        flush=True,
+                    )
                 step += 1
                 if step >= train_config.num_steps:
                     break
