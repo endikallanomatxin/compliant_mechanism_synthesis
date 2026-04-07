@@ -322,72 +322,7 @@ def select_batch(
 ) -> OptimizedCases:
     if batch_indices.ndim != 1:
         raise ValueError("batch_indices must be one-dimensional")
-    return OptimizedCases(
-        raw_structures=Structures(
-            positions=optimized_cases.raw_structures.positions.index_select(
-                0, batch_indices
-            ),
-            roles=optimized_cases.raw_structures.roles.index_select(0, batch_indices),
-            adjacency=optimized_cases.raw_structures.adjacency.index_select(
-                0, batch_indices
-            ),
-        ),
-        target_stiffness=optimized_cases.target_stiffness.index_select(
-            0, batch_indices
-        ),
-        optimized_structures=Structures(
-            positions=optimized_cases.optimized_structures.positions.index_select(
-                0, batch_indices
-            ),
-            roles=optimized_cases.optimized_structures.roles.index_select(
-                0, batch_indices
-            ),
-            adjacency=optimized_cases.optimized_structures.adjacency.index_select(
-                0, batch_indices
-            ),
-        ),
-        initial_loss=optimized_cases.initial_loss.index_select(0, batch_indices),
-        best_loss=optimized_cases.best_loss.index_select(0, batch_indices),
-        last_analyses=Analyses(
-            generalized_stiffness=optimized_cases.last_analyses.generalized_stiffness.index_select(
-                0, batch_indices
-            ),
-            material_usage=optimized_cases.last_analyses.material_usage.index_select(
-                0, batch_indices
-            ),
-            short_beam_penalty=optimized_cases.last_analyses.short_beam_penalty.index_select(
-                0, batch_indices
-            ),
-            long_beam_penalty=optimized_cases.last_analyses.long_beam_penalty.index_select(
-                0, batch_indices
-            ),
-            thin_beam_penalty=optimized_cases.last_analyses.thin_beam_penalty.index_select(
-                0, batch_indices
-            ),
-            thick_beam_penalty=optimized_cases.last_analyses.thick_beam_penalty.index_select(
-                0, batch_indices
-            ),
-            free_node_spacing_penalty=optimized_cases.last_analyses.free_node_spacing_penalty.index_select(
-                0, batch_indices
-            ),
-        ),
-        scaffolds=(
-            None
-            if optimized_cases.scaffolds is None
-            else Scaffolds(
-                positions=optimized_cases.scaffolds.positions.index_select(
-                    0, batch_indices
-                ),
-                roles=optimized_cases.scaffolds.roles.index_select(0, batch_indices),
-                adjacency=optimized_cases.scaffolds.adjacency.index_select(
-                    0, batch_indices
-                ),
-                edge_primitive_types=optimized_cases.scaffolds.edge_primitive_types.index_select(
-                    0, batch_indices
-                ),
-            )
-        ),
-    )
+    return optimized_cases.index_select(batch_indices)
 
 
 def iter_supervised_minibatches(
@@ -399,15 +334,22 @@ def iter_supervised_minibatches(
     optimized_cases.validate()
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    indices = list(range(optimized_cases.raw_structures.batch_size))
-    if shuffle:
-        rng = random.Random(seed)
-        rng.shuffle(indices)
     index_device = optimized_cases.raw_structures.positions.device
-    for start in range(0, len(indices), batch_size):
-        batch_indices = torch.tensor(
-            indices[start : start + batch_size], dtype=torch.long, device=index_device
+    indices = torch.arange(
+        optimized_cases.raw_structures.batch_size,
+        device=index_device,
+        dtype=torch.long,
+    )
+    if shuffle:
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=index_device).manual_seed(seed)
+        permutation = torch.randperm(
+            indices.shape[0], device=index_device, generator=generator
         )
+        indices = indices.index_select(0, permutation)
+    for start in range(0, indices.shape[0], batch_size):
+        batch_indices = indices[start : start + batch_size]
         yield select_batch(optimized_cases, batch_indices)
 
 

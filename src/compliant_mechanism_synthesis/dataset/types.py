@@ -27,6 +27,13 @@ class Structures:
             adjacency=self.adjacency.to(device),
         )
 
+    def index_select(self, batch_indices: torch.Tensor) -> Structures:
+        return Structures(
+            positions=self.positions.index_select(0, batch_indices),
+            roles=self.roles.index_select(0, batch_indices),
+            adjacency=self.adjacency.index_select(0, batch_indices),
+        )
+
     def validate(self) -> None:
         _require_rank("positions", self.positions, 3)
         _require_rank("roles", self.roles, 2)
@@ -91,6 +98,16 @@ class Scaffolds:
             roles=self.roles.to(device),
             adjacency=self.adjacency.to(device),
             edge_primitive_types=self.edge_primitive_types.to(device),
+        )
+
+    def index_select(self, batch_indices: torch.Tensor) -> Scaffolds:
+        return Scaffolds(
+            positions=self.positions.index_select(0, batch_indices),
+            roles=self.roles.index_select(0, batch_indices),
+            adjacency=self.adjacency.index_select(0, batch_indices),
+            edge_primitive_types=self.edge_primitive_types.index_select(
+                0, batch_indices
+            ),
         )
 
     def validate(self) -> None:
@@ -176,6 +193,21 @@ class Analyses:
             free_node_spacing_penalty=self.free_node_spacing_penalty.to(device),
         )
 
+    def index_select(self, batch_indices: torch.Tensor) -> Analyses:
+        return Analyses(
+            generalized_stiffness=self.generalized_stiffness.index_select(
+                0, batch_indices
+            ),
+            material_usage=self.material_usage.index_select(0, batch_indices),
+            short_beam_penalty=self.short_beam_penalty.index_select(0, batch_indices),
+            long_beam_penalty=self.long_beam_penalty.index_select(0, batch_indices),
+            thin_beam_penalty=self.thin_beam_penalty.index_select(0, batch_indices),
+            thick_beam_penalty=self.thick_beam_penalty.index_select(0, batch_indices),
+            free_node_spacing_penalty=self.free_node_spacing_penalty.index_select(
+                0, batch_indices
+            ),
+        )
+
     def validate(self, batch_size: int) -> None:
         _require_rank("generalized_stiffness", self.generalized_stiffness, 3)
         if self.generalized_stiffness.shape != (batch_size, 6, 6):
@@ -213,6 +245,21 @@ class OptimizedCases:
             best_loss=self.best_loss.to(device),
             last_analyses=self.last_analyses.to(device),
             scaffolds=None if self.scaffolds is None else self.scaffolds.to(device),
+        )
+
+    def index_select(self, batch_indices: torch.Tensor) -> OptimizedCases:
+        return OptimizedCases(
+            raw_structures=self.raw_structures.index_select(batch_indices),
+            target_stiffness=self.target_stiffness.index_select(0, batch_indices),
+            optimized_structures=self.optimized_structures.index_select(batch_indices),
+            initial_loss=self.initial_loss.index_select(0, batch_indices),
+            best_loss=self.best_loss.index_select(0, batch_indices),
+            last_analyses=self.last_analyses.index_select(batch_indices),
+            scaffolds=(
+                None
+                if self.scaffolds is None
+                else self.scaffolds.index_select(batch_indices)
+            ),
         )
 
     def validate(self) -> None:
