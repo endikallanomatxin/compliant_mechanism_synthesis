@@ -32,7 +32,7 @@ def test_dataset_generate_main_generates_offline_dataset_and_preview(
             str(tmp_path / "runs"),
             "--preview-dir",
             str(preview_dir),
-            "--preview-cases",
+            "--preview-case-number",
             "2",
         ]
     )
@@ -42,6 +42,42 @@ def test_dataset_generate_main_generates_offline_dataset_and_preview(
     assert optimized_cases.optimized_structures.positions.shape[-1] == 3
     assert (preview_dir / "case_0000_primitives.png").exists()
     assert (preview_dir / "summary.txt").exists()
+
+
+def test_dataset_generate_main_samples_preview_subset_for_large_datasets(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "dataset_large.pt"
+    preview_dir = tmp_path / "preview_large"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "10",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_large"),
+            "--preview-dir",
+            str(preview_dir),
+            "--preview-case-number",
+            "8",
+            "--seed",
+            "11",
+        ]
+    )
+
+    summary = (preview_dir / "summary.txt").read_text(encoding="utf-8")
+    primitive_previews = list(preview_dir.glob("case_*_primitives.png"))
+    assert len(primitive_previews) == 8
+    assert "cases=10" in summary
+    assert "preview_cases=8" in summary
+    assert "preview_case_indices=" in summary
 
 
 def test_dataset_generate_main_names_run(tmp_path: Path) -> None:

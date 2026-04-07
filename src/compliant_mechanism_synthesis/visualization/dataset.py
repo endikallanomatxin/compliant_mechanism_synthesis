@@ -13,7 +13,9 @@ from compliant_mechanism_synthesis.visualization.plots import (
 )
 
 
-def _loss_improvement(initial_loss: torch.Tensor, best_loss: torch.Tensor) -> torch.Tensor:
+def _loss_improvement(
+    initial_loss: torch.Tensor, best_loss: torch.Tensor
+) -> torch.Tensor:
     safe_scale = initial_loss.abs().clamp_min(1e-6)
     return (initial_loss - best_loss) / safe_scale
 
@@ -22,6 +24,7 @@ def write_dataset_visualizations(
     optimized_cases: OptimizedCases,
     output_dir: str | Path,
     max_cases: int = 6,
+    case_indices: list[int] | None = None,
 ) -> Path:
     optimized_cases.validate()
 
@@ -42,16 +45,25 @@ def write_dataset_visualizations(
         raise ValueError("dataset visualizations require scaffold metadata")
 
     improvement = _loss_improvement(initial_loss, best_loss)
-    case_count = min(int(initial_positions.shape[0]), max_cases)
+    total_cases = int(initial_positions.shape[0])
+    if case_indices is None:
+        case_indices = list(range(min(total_cases, max_cases)))
+    else:
+        case_indices = list(case_indices)
+        for case_index in case_indices:
+            if case_index < 0 or case_index >= total_cases:
+                raise ValueError("case_indices must refer to valid dataset cases")
+    case_count = len(case_indices)
     summary_lines = [
-        f"cases={int(initial_positions.shape[0])}",
+        f"cases={total_cases}",
         f"preview_cases={case_count}",
+        f"preview_case_indices={','.join(str(index) for index in case_indices)}",
         f"mean_initial_loss={float(initial_loss.mean().item()):.6f}",
         f"mean_best_loss={float(best_loss.mean().item()):.6f}",
         f"mean_relative_improvement={float(improvement.mean().item()):.6f}",
     ]
 
-    for case_index in range(case_count):
+    for case_index in case_indices:
         title_prefix = f"case_{case_index:04d}"
         primitives_figure = plot_scaffold_primitives_3d(
             scaffolds.positions[case_index],
@@ -73,9 +85,15 @@ def write_dataset_visualizations(
             optimized_adjacency[case_index],
             title=f"{title_prefix}_optimized",
         )
-        primitives_figure.savefig(output_path / f"{title_prefix}_primitives.png", dpi=160, bbox_inches="tight")
-        initial_figure.savefig(output_path / f"{title_prefix}_initial.png", dpi=160, bbox_inches="tight")
-        optimized_figure.savefig(output_path / f"{title_prefix}_optimized.png", dpi=160, bbox_inches="tight")
+        primitives_figure.savefig(
+            output_path / f"{title_prefix}_primitives.png", dpi=160, bbox_inches="tight"
+        )
+        initial_figure.savefig(
+            output_path / f"{title_prefix}_initial.png", dpi=160, bbox_inches="tight"
+        )
+        optimized_figure.savefig(
+            output_path / f"{title_prefix}_optimized.png", dpi=160, bbox_inches="tight"
+        )
         plt.close(primitives_figure)
         plt.close(initial_figure)
         plt.close(optimized_figure)
@@ -90,7 +108,9 @@ def write_dataset_visualizations(
             ]
         )
 
-    (output_path / "summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    (output_path / "summary.txt").write_text(
+        "\n".join(summary_lines) + "\n", encoding="utf-8"
+    )
     return output_path
 
 

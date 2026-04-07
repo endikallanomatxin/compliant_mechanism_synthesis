@@ -24,14 +24,14 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="cms-dataset-generate",
         description="Generate and refine an offline dataset of 3D compliant-mechanism cases.",
     )
-    parser.add_argument("--num-cases", type=int, default=32)
+    parser.add_argument("--num-cases", type=int, default=1024)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-free-nodes", type=int, default=6)
     parser.add_argument("--optimization-steps", type=int, default=120)
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--logdir", default="datasets")
     parser.add_argument("--preview-dir", default=None)
-    parser.add_argument("--preview-cases", type=int, default=6)
+    parser.add_argument("--preview-case-number", type=int, default=8)
     parser.add_argument("--name", "-n", default="generated_dataset")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--just-check-sample", action="store_true")
@@ -67,7 +67,7 @@ def dataset_generate_main(argv: list[str] | None = None) -> None:
         output_path=str(resolved_output_path),
         logdir=str(logdir_path),
         preview_dir=preview_path,
-        preview_cases=args.preview_cases,
+        preview_case_number=args.preview_case_number,
         primitive=PrimitiveConfig(num_free_nodes=args.num_free_nodes),
         optimization=CaseOptimizationConfig(num_steps=args.optimization_steps),
     )

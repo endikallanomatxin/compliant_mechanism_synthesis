@@ -33,9 +33,24 @@ class OfflineDatasetConfig:
     output_path: str = "datasets/offline_dataset.pt"
     logdir: str = "runs/offline_dataset"
     preview_dir: str | None = None
-    preview_cases: int = 6
+    preview_case_number: int = 8
     primitive: PrimitiveConfig = PrimitiveConfig()
     optimization: CaseOptimizationConfig = field(default_factory=CaseOptimizationConfig)
+
+
+def _sample_preview_case_indices(
+    num_cases: int,
+    preview_case_number: int,
+    seed: int,
+) -> list[int]:
+    if num_cases < 0:
+        raise ValueError("num_cases must be non-negative")
+    if preview_case_number <= 0:
+        raise ValueError("preview_case_number must be positive")
+    if num_cases <= preview_case_number:
+        return list(range(num_cases))
+    rng = random.Random(seed)
+    return sorted(rng.sample(range(num_cases), k=preview_case_number))
 
 
 def generate_offline_dataset(
@@ -103,10 +118,15 @@ def generate_offline_dataset(
         if config.preview_dir is not None
         else output_path.parent / f"{output_path.stem}_preview"
     )
+    preview_case_indices = _sample_preview_case_indices(
+        num_cases=optimized_cases.raw_structures.batch_size,
+        preview_case_number=config.preview_case_number,
+        seed=config.seed,
+    )
     write_dataset_visualizations(
         optimized_cases=optimized_cases,
         output_dir=preview_dir,
-        max_cases=config.preview_cases,
+        case_indices=preview_case_indices,
     )
     return optimized_cases
 
