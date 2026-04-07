@@ -83,7 +83,8 @@ def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) 
 def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
     optimized_cases = generate_offline_dataset(
         OfflineDatasetConfig(
-            num_cases=2,
+            num_cases=3,
+            batch_size=2,
             output_path=str(tmp_path / "dataset.pt"),
             logdir=str(tmp_path / "runs"),
             primitive=PrimitiveConfig(num_free_nodes=6),
@@ -92,10 +93,14 @@ def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
     )
 
     loaded_cases, loaded_config = load_offline_dataset(tmp_path / "dataset.pt")
-    assert optimized_cases.optimized_structures.adjacency.shape[0] == 2
-    assert optimized_cases.optimized_structures.adjacency.shape[1] == optimized_cases.optimized_structures.num_nodes
-    assert loaded_cases.last_analyses.generalized_stiffness.shape == (2, 6, 6)
+    assert optimized_cases.optimized_structures.adjacency.shape[0] == 3
+    assert (
+        optimized_cases.optimized_structures.adjacency.shape[1]
+        == optimized_cases.optimized_structures.num_nodes
+    )
+    assert loaded_cases.last_analyses.generalized_stiffness.shape == (3, 6, 6)
     assert loaded_cases.scaffolds is not None
-    assert loaded_cases.scaffolds.positions.shape == (2, 8, 3)
-    assert loaded_config.num_cases == 2
+    assert loaded_cases.scaffolds.positions.shape == (3, 8, 3)
+    assert loaded_config.num_cases == 3
+    assert loaded_config.batch_size == 2
     assert (tmp_path / "dataset.pt").exists()

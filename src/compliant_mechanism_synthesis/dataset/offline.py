@@ -28,6 +28,7 @@ from compliant_mechanism_synthesis.visualization import write_dataset_visualizat
 @dataclass(frozen=True)
 class OfflineDatasetConfig:
     num_cases: int = 32
+    batch_size: int = 32
     seed: int = 7
     device: str = "auto"
     output_path: str = "datasets/offline_dataset.pt"
@@ -53,20 +54,111 @@ def _sample_preview_case_indices(
     return sorted(rng.sample(range(num_cases), k=preview_case_number))
 
 
+def _concatenate_structures(batches: list[Structures]) -> Structures:
+    return Structures(
+        positions=torch.cat([batch.positions for batch in batches], dim=0),
+        roles=torch.cat([batch.roles for batch in batches], dim=0),
+        adjacency=torch.cat([batch.adjacency for batch in batches], dim=0),
+    )
+
+
+def _concatenate_scaffolds(batches: list[Scaffolds]) -> Scaffolds:
+    return Scaffolds(
+        positions=torch.cat([batch.positions for batch in batches], dim=0),
+        roles=torch.cat([batch.roles for batch in batches], dim=0),
+        adjacency=torch.cat([batch.adjacency for batch in batches], dim=0),
+        edge_primitive_types=torch.cat(
+            [batch.edge_primitive_types for batch in batches],
+            dim=0,
+        ),
+    )
+
+
+def _concatenate_analyses(batches: list[Analyses]) -> Analyses:
+    return Analyses(
+        generalized_stiffness=torch.cat(
+            [batch.generalized_stiffness for batch in batches], dim=0
+        ),
+        material_usage=torch.cat([batch.material_usage for batch in batches], dim=0),
+        short_beam_penalty=torch.cat(
+            [batch.short_beam_penalty for batch in batches], dim=0
+        ),
+        long_beam_penalty=torch.cat(
+            [batch.long_beam_penalty for batch in batches], dim=0
+        ),
+        thin_beam_penalty=torch.cat(
+            [batch.thin_beam_penalty for batch in batches], dim=0
+        ),
+        thick_beam_penalty=torch.cat(
+            [batch.thick_beam_penalty for batch in batches], dim=0
+        ),
+        free_node_spacing_penalty=torch.cat(
+            [batch.free_node_spacing_penalty for batch in batches], dim=0
+        ),
+    )
+
+
+def _concatenate_optimized_case_batches(
+    optimized_batches: list[OptimizedCases],
+    scaffold_batches: list[Scaffolds],
+) -> OptimizedCases:
+    return OptimizedCases(
+        raw_structures=_concatenate_structures(
+            [batch.raw_structures for batch in optimized_batches]
+        ),
+        target_stiffness=torch.cat(
+            [batch.target_stiffness for batch in optimized_batches], dim=0
+        ),
+        optimized_structures=_concatenate_structures(
+            [batch.optimized_structures for batch in optimized_batches]
+        ),
+        initial_loss=torch.cat(
+            [batch.initial_loss for batch in optimized_batches], dim=0
+        ),
+        best_loss=torch.cat([batch.best_loss for batch in optimized_batches], dim=0),
+        last_analyses=_concatenate_analyses(
+            [batch.last_analyses for batch in optimized_batches]
+        ),
+        scaffolds=_concatenate_scaffolds(scaffold_batches),
+    )
+
+
 def generate_offline_dataset(
     config: OfflineDatasetConfig | None = None,
 ) -> OptimizedCases:
     config = config or OfflineDatasetConfig()
     device = resolve_torch_device(config.device)
+    if config.batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     output_path = Path(config.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     Path(config.logdir).mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(config.seed)
-    structure_batches: list[Structures] = []
+    current_structures: list[Structures] = []
+    current_scaffolds: list[Scaffolds] = []
+    current_targets: list[torch.Tensor] = []
+    optimized_batches: list[OptimizedCases] = []
     scaffold_batches: list[Scaffolds] = []
-    target_batches = []
-    for _case_index in range(config.num_cases):
+
+    def flush_batch(batch_index: int) -> None:
+        if not current_structures:
+            return
+        batch_structures = _concatenate_structures(current_structures)
+        batch_targets = torch.cat(current_targets, dim=0)
+        optimized_batch = optimize_cases(
+            structures=batch_structures,
+            target_stiffness=batch_targets,
+            config=config.optimization,
+            logdir=Path(config.logdir) / f"batch_{batch_index:04d}",
+        )
+        optimized_batches.append(optimized_batch)
+        scaffold_batches.append(_concatenate_scaffolds(current_scaffolds))
+        current_structures.clear()
+        current_scaffolds.clear()
+        current_targets.clear()
+
+    for case_index in range(config.num_cases):
         primitive_seed = rng.randrange(0, 2**31)
         target_seed = rng.randrange(0, 2**31)
         initial_structures, scaffold = sample_random_primitive(
@@ -79,37 +171,16 @@ def generate_offline_dataset(
             config=config.optimization,
             seed=target_seed,
         )
-        structure_batches.append(initial_structures)
-        scaffold_batches.append(scaffold)
-        target_batches.append(target.unsqueeze(0))
+        current_structures.append(initial_structures)
+        current_scaffolds.append(scaffold)
+        current_targets.append(target.unsqueeze(0))
+        if len(current_structures) == config.batch_size:
+            flush_batch(batch_index=len(optimized_batches))
 
-    raw_structures = Structures(
-        positions=torch.cat([item.positions for item in structure_batches], dim=0),
-        roles=torch.cat([item.roles for item in structure_batches], dim=0),
-        adjacency=torch.cat([item.adjacency for item in structure_batches], dim=0),
-    )
-    optimized_cases = optimize_cases(
-        structures=raw_structures,
-        target_stiffness=torch.cat(target_batches, dim=0),
-        config=config.optimization,
-        logdir=Path(config.logdir),
-    )
-    optimized_cases = OptimizedCases(
-        raw_structures=optimized_cases.raw_structures,
-        target_stiffness=optimized_cases.target_stiffness,
-        optimized_structures=optimized_cases.optimized_structures,
-        initial_loss=optimized_cases.initial_loss,
-        best_loss=optimized_cases.best_loss,
-        last_analyses=optimized_cases.last_analyses,
-        scaffolds=Scaffolds(
-            positions=torch.cat([item.positions for item in scaffold_batches], dim=0),
-            roles=torch.cat([item.roles for item in scaffold_batches], dim=0),
-            adjacency=torch.cat([item.adjacency for item in scaffold_batches], dim=0),
-            edge_primitive_types=torch.cat(
-                [item.edge_primitive_types for item in scaffold_batches],
-                dim=0,
-            ),
-        ),
+    flush_batch(batch_index=len(optimized_batches))
+    optimized_cases = _concatenate_optimized_case_batches(
+        optimized_batches=optimized_batches,
+        scaffold_batches=scaffold_batches,
     )
     optimized_cases.validate()
     save_offline_dataset(output_path, optimized_cases, config)

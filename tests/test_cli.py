@@ -53,6 +53,8 @@ def test_dataset_generate_main_samples_preview_subset_for_large_datasets(
         [
             "--num-cases",
             "10",
+            "--batch-size",
+            "3",
             "--device",
             "cpu",
             "--num-free-nodes",

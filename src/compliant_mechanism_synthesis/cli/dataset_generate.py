@@ -25,6 +25,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Generate and refine an offline dataset of 3D compliant-mechanism cases.",
     )
     parser.add_argument("--num-cases", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-free-nodes", type=int, default=6)
     parser.add_argument("--optimization-steps", type=int, default=120)
@@ -62,6 +63,7 @@ def dataset_generate_main(argv: list[str] | None = None) -> None:
     )
     config = OfflineDatasetConfig(
         num_cases=args.num_cases,
+        batch_size=args.batch_size,
         seed=args.seed,
         device=args.device,
         output_path=str(resolved_output_path),
