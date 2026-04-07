@@ -18,7 +18,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-steps", type=int, default=10_000)
-    parser.add_argument("--checkpoint-path", default="artifacts/supervised_refiner.pt")
+    parser.add_argument("--checkpoint-path", default=None)
     parser.add_argument("--logdir", default="runs/supervised")
     parser.add_argument("--name", "-n", default="supervised")
     return parser

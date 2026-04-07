@@ -52,7 +52,7 @@ class SupervisedTrainingConfig:
     adjacency_loss_weight: float = 0.5
     endpoint_loss_weight: float = 0.1
     stiffness_loss_weight: float = 0.02
-    checkpoint_path: str = "artifacts/supervised_refiner.pt"
+    checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
     seed: int = 7
 
@@ -495,7 +495,11 @@ def train_supervised_refiner(
         "endpoint": [],
         "stiffness": [],
     }
-    checkpoint_path = Path(train_config.checkpoint_path)
+    checkpoint_path = (
+        Path(train_config.checkpoint_path)
+        if train_config.checkpoint_path is not None
+        else Path(train_config.logdir) / "refiner.pt"
+    )
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=train_config.logdir)
     try:

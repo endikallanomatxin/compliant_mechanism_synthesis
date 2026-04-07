@@ -200,3 +200,48 @@ def test_train_supervised_main_writes_checkpoint(tmp_path: Path) -> None:
         ]
     )
     assert checkpoint_path.exists()
+
+
+def test_train_supervised_main_writes_default_checkpoint_inside_run_dir(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "dataset.pt"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_dataset"),
+        ]
+    )
+
+    runs_dir = tmp_path / "runs_supervised"
+    train_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--num-steps",
+            "6",
+            "--logdir",
+            str(runs_dir),
+            "--name",
+            "testrun",
+        ]
+    )
+
+    run_dirs = [entry for entry in runs_dir.iterdir() if entry.is_dir()]
+    assert len(run_dirs) == 1
+    assert run_dirs[0].name.endswith("-testrun")
+    assert (run_dirs[0] / "refiner.pt").exists()
