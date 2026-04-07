@@ -232,17 +232,14 @@ def assemble_global_stiffness(
         ],
         dim=1,
     )
-    batch_index = torch.arange(batch_size, device=positions.device).view(-1, 1, 1, 1)
-    row_index = dofs.view(1, -1, 12, 1)
-    col_index = dofs.view(1, -1, 1, 12)
-    stiffness.index_put_(
-        (
-            batch_index.expand(-1, dofs.shape[0], 12, 12).reshape(-1),
-            row_index.expand(batch_size, -1, 12, 12).reshape(-1),
-            col_index.expand(batch_size, -1, 12, 12).reshape(-1),
-        ),
-        element.reshape(-1),
-        accumulate=True,
+    total_dofs = 6 * num_nodes
+    element_linear_index = (dofs[:, :, None] * total_dofs + dofs[:, None, :]).reshape(
+        1, -1
+    )
+    stiffness.view(batch_size, -1).scatter_add_(
+        1,
+        element_linear_index.expand(batch_size, -1),
+        element.reshape(batch_size, -1),
     )
 
     diagonal = config.global_regularization * torch.ones(
