@@ -806,28 +806,18 @@ def _interpolate_scalar_controls(
         dtype=control_values.dtype,
         device=control_values.device,
     )
-    samples = []
-    for sample_position in sample_positions.tolist():
-        upper_index = 1
-        while (
-            upper_index < control_positions.shape[0] - 1
-            and float(control_positions[upper_index].item()) < sample_position
-        ):
-            upper_index += 1
-        lower_index = upper_index - 1
-        lower_position = float(control_positions[lower_index].item())
-        upper_position = float(control_positions[upper_index].item())
-        if upper_position - lower_position < 1e-8:
-            interpolated = control_values[lower_index]
-        else:
-            fraction = (sample_position - lower_position) / (
-                upper_position - lower_position
-            )
-            interpolated = (1.0 - fraction) * control_values[
-                lower_index
-            ] + fraction * control_values[upper_index]
-        samples.append(interpolated)
-    return torch.stack(samples, dim=0)
+    upper_index = (
+        torch.searchsorted(control_positions[1:], sample_positions, right=False) + 1
+    )
+    upper_index = upper_index.clamp_max(control_positions.shape[0] - 1)
+    lower_index = upper_index - 1
+    lower_position = control_positions.index_select(0, lower_index)
+    upper_position = control_positions.index_select(0, upper_index)
+    lower_values = control_values.index_select(0, lower_index)
+    upper_values = control_values.index_select(0, upper_index)
+    safe_denominator = (upper_position - lower_position).clamp_min(1e-8)
+    fraction = (sample_positions - lower_position) / safe_denominator
+    return torch.lerp(lower_values, upper_values, fraction)
 
 
 def _discretize_sheet_chain(
@@ -914,28 +904,18 @@ def _interpolate_control_vectors(
         dtype=control_vectors.dtype,
         device=control_vectors.device,
     )
-    samples = []
-    for sample_position in sample_positions.tolist():
-        upper_index = 1
-        while (
-            upper_index < control_positions.shape[0] - 1
-            and float(control_positions[upper_index].item()) < sample_position
-        ):
-            upper_index += 1
-        lower_index = upper_index - 1
-        lower_position = float(control_positions[lower_index].item())
-        upper_position = float(control_positions[upper_index].item())
-        if upper_position - lower_position < 1e-8:
-            interpolated = control_vectors[lower_index]
-        else:
-            fraction = (sample_position - lower_position) / (
-                upper_position - lower_position
-            )
-            interpolated = (1.0 - fraction) * control_vectors[
-                lower_index
-            ] + fraction * control_vectors[upper_index]
-        samples.append(interpolated)
-    stacked = torch.stack(samples, dim=0)
+    upper_index = (
+        torch.searchsorted(control_positions[1:], sample_positions, right=False) + 1
+    )
+    upper_index = upper_index.clamp_max(control_positions.shape[0] - 1)
+    lower_index = upper_index - 1
+    lower_position = control_positions.index_select(0, lower_index)
+    upper_position = control_positions.index_select(0, upper_index)
+    lower_vectors = control_vectors.index_select(0, lower_index)
+    upper_vectors = control_vectors.index_select(0, upper_index)
+    safe_denominator = (upper_position - lower_position).clamp_min(1e-8)
+    fraction = ((sample_positions - lower_position) / safe_denominator).unsqueeze(-1)
+    stacked = torch.lerp(lower_vectors, upper_vectors, fraction)
     return stacked / torch.linalg.vector_norm(stacked, dim=1, keepdim=True).clamp_min(
         1e-8
     )
