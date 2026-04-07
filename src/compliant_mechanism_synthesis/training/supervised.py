@@ -55,9 +55,9 @@ class SupervisedTrainingConfig:
     warmup_steps: int = 500
     min_learning_rate: float = 1e-6
     position_loss_weight: float = 1.0
-    adjacency_loss_weight: float = 0.4
-    endpoint_loss_weight: float = 0.04
-    stiffness_loss_weight: float = 0.008
+    adjacency_loss_weight: float = 0.35
+    endpoint_loss_weight: float = 0.03
+    stiffness_loss_weight: float = 0.006
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
     seed: int = 7
