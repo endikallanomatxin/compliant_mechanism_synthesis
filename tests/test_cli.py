@@ -82,6 +82,36 @@ def test_dataset_generate_main_samples_preview_subset_for_large_datasets(
     assert "preview_case_indices=" in summary
 
 
+def test_dataset_generate_main_logs_batch_progress(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_path = tmp_path / "dataset_progress.pt"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "3",
+            "--batch-size",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_progress"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert "dataset generation started" in captured.out
+    assert "dataset batch 1/2" in captured.out
+    assert "dataset batch 2/2" in captured.out
+
+
 def test_dataset_generate_main_names_run(tmp_path: Path) -> None:
     output_path = tmp_path / "dataset.pt"
     runs_dir = tmp_path / "runs_named"

@@ -133,6 +133,14 @@ def generate_offline_dataset(
     output_path = Path(config.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     Path(config.logdir).mkdir(parents=True, exist_ok=True)
+    total_batches = (config.num_cases + config.batch_size - 1) // config.batch_size
+    processed_cases = 0
+
+    print(
+        f"dataset generation started num_cases={config.num_cases} "
+        f"batch_size={config.batch_size} total_batches={total_batches}",
+        flush=True,
+    )
 
     rng = random.Random(config.seed)
     current_structures: list[Structures] = []
@@ -142,6 +150,7 @@ def generate_offline_dataset(
     scaffold_batches: list[Scaffolds] = []
 
     def flush_batch(batch_index: int) -> None:
+        nonlocal processed_cases
         if not current_structures:
             return
         batch_structures = _concatenate_structures(current_structures)
@@ -154,6 +163,13 @@ def generate_offline_dataset(
         )
         optimized_batches.append(optimized_batch)
         scaffold_batches.append(_concatenate_scaffolds(current_scaffolds))
+        processed_cases += batch_structures.batch_size
+        print(
+            f"dataset batch {batch_index + 1}/{total_batches} "
+            f"cases={processed_cases}/{config.num_cases} "
+            f"mean_best_loss={float(optimized_batch.best_loss.mean().item()):.6f}",
+            flush=True,
+        )
         current_structures.clear()
         current_scaffolds.clear()
         current_targets.clear()
