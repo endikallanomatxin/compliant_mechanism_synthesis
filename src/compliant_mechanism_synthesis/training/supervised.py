@@ -220,6 +220,7 @@ def analyze_structures(
     structures: Structures,
     frame_config: Frame3DConfig | None = None,
     geometry_config: GeometryPenaltyConfig | None = None,
+    profile: dict[str, float] | None = None,
 ) -> Analyses:
     frame_config = frame_config or Frame3DConfig()
     geometry_config = geometry_config or GeometryPenaltyConfig()
@@ -231,6 +232,7 @@ def analyze_structures(
             adjacency=structures.adjacency,
             frame_config=frame_config,
             penalty_config=geometry_config,
+            profile=profile,
         )
     )
 
@@ -262,6 +264,7 @@ def make_supervised_batch(
     curriculum: CurriculumConfig,
     difficulty: float,
     seed: int | None = None,
+    profile: dict[str, float] | None = None,
 ) -> SupervisedBatch:
     source_structures = sample_noisy_structures(
         optimized_cases=optimized_cases,
@@ -304,7 +307,7 @@ def make_supervised_batch(
     # gradient path: the flow batch is sampled from offline data, not from the
     # model's own predictions.
     with torch.no_grad():
-        current_analyses = analyze_structures(flow_structures)
+        current_analyses = analyze_structures(flow_structures, profile=profile)
     position_noise_levels, adjacency_noise_levels = _flow_noise_levels(
         source_structures=source_structures,
         oracle_structures=optimized_cases.optimized_structures,
@@ -435,11 +438,12 @@ def _training_losses(
     prediction: FlowPrediction,
     batch: SupervisedBatch,
     config: SupervisedTrainingConfig,
+    profile: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     position_loss = _position_velocity_loss(prediction, batch)
     adjacency_loss = _adjacency_velocity_loss(prediction, batch)
     endpoint_loss, estimated = _endpoint_loss(prediction, batch)
-    endpoint_analyses = analyze_structures(estimated)
+    endpoint_analyses = analyze_structures(estimated, profile=profile)
     stiffness_loss = torch.log1p(
         generalized_stiffness_error(
             endpoint_analyses.generalized_stiffness, batch.target_stiffness
@@ -530,11 +534,13 @@ def train_supervised_refiner(
                 learning_rate = _scheduled_learning_rate(step, train_config)
                 for parameter_group in optimizer.param_groups:
                     parameter_group["lr"] = learning_rate
+                batch_analysis_profile: dict[str, float] = {}
                 batch = make_supervised_batch(
                     optimized_cases=batch_cases,
                     curriculum=curriculum,
                     difficulty=difficulty,
                     seed=train_config.seed + step,
+                    profile=batch_analysis_profile,
                 )
                 _synchronize_device_if_needed(device)
                 batch_build_time = time.perf_counter()
@@ -548,8 +554,9 @@ def train_supervised_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 forward_time = time.perf_counter()
+                loss_analysis_profile: dict[str, float] = {}
                 total_loss, loss_terms = _training_losses(
-                    prediction, batch, train_config
+                    prediction, batch, train_config, profile=loss_analysis_profile
                 )
                 _synchronize_device_if_needed(device)
                 loss_time = time.perf_counter()
@@ -600,7 +607,21 @@ def train_supervised_refiner(
                         f"t_forward={forward_time - batch_build_time:.3f}s "
                         f"t_loss={loss_time - forward_time:.3f}s "
                         f"t_opt={optimizer_time - loss_time:.3f}s "
-                        f"t_total={optimizer_time - step_start_time:.3f}s",
+                        f"t_total={optimizer_time - step_start_time:.3f}s "
+                        f"t_batch_stiffness={batch_analysis_profile.get('stiffness', 0.0):.3f}s "
+                        f"t_batch_penalties={batch_analysis_profile.get('penalties', 0.0):.3f}s "
+                        f"t_batch_material={batch_analysis_profile.get('material_usage', 0.0):.3f}s "
+                        f"t_batch_assemble={batch_analysis_profile.get('assemble', 0.0):.3f}s "
+                        f"t_batch_transform={batch_analysis_profile.get('transform', 0.0):.3f}s "
+                        f"t_batch_reduce={batch_analysis_profile.get('reduce', 0.0):.3f}s "
+                        f"t_batch_solve={batch_analysis_profile.get('solve', 0.0):.3f}s "
+                        f"t_loss_stiffness={loss_analysis_profile.get('stiffness', 0.0):.3f}s "
+                        f"t_loss_penalties={loss_analysis_profile.get('penalties', 0.0):.3f}s "
+                        f"t_loss_material={loss_analysis_profile.get('material_usage', 0.0):.3f}s "
+                        f"t_loss_assemble={loss_analysis_profile.get('assemble', 0.0):.3f}s "
+                        f"t_loss_transform={loss_analysis_profile.get('transform', 0.0):.3f}s "
+                        f"t_loss_reduce={loss_analysis_profile.get('reduce', 0.0):.3f}s "
+                        f"t_loss_solve={loss_analysis_profile.get('solve', 0.0):.3f}s",
                         flush=True,
                     )
                 step += 1
