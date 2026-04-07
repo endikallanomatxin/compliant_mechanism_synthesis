@@ -45,7 +45,7 @@ class CurriculumConfig:
 class SupervisedTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 64
+    batch_size: int = 256
     num_steps: int = 20_000
     learning_rate: float = 1e-4
     position_loss_weight: float = 1.0
@@ -485,7 +485,6 @@ def train_supervised_refiner(
     random.seed(train_config.seed)
     torch.manual_seed(train_config.seed)
 
-    optimized_cases = optimized_cases.to(device)
     model = SupervisedRefiner(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
     history = {
@@ -511,6 +510,7 @@ def train_supervised_refiner(
                 shuffle=True,
                 seed=train_config.seed + step,
             ):
+                minibatch_cases = minibatch_cases.to(device)
                 difficulty = _difficulty_fraction(step, train_config.num_steps)
                 batch = make_supervised_batch(
                     optimized_cases=minibatch_cases,

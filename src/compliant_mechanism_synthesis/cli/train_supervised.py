@@ -10,16 +10,17 @@ from compliant_mechanism_synthesis.training import (
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    defaults = SupervisedTrainingConfig(dataset_path="")
     parser = argparse.ArgumentParser(
         prog="cms-train-supervised",
         description="Train the supervised refinement model with flow matching over the offline dataset.",
     )
     parser.add_argument("--dataset-path", required=True)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num-steps", type=int, default=10_000)
-    parser.add_argument("--checkpoint-path", default=None)
-    parser.add_argument("--logdir", default="runs/supervised")
+    parser.add_argument("--device", default=defaults.device)
+    parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    parser.add_argument("--num-steps", type=int, default=defaults.num_steps)
+    parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
+    parser.add_argument("--logdir", default=defaults.logdir)
     parser.add_argument("--name", "-n", default="supervised")
     return parser
 

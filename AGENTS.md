@@ -3,6 +3,7 @@
 - Use `uv` for all Python environment and run commands.
 - Keep Python code under `src/compliant_mechanism_synthesis/`.
 - Use TensorBoard for training and sampling logs. Default log directory: `runs/`.
+- Keep defaults defined in exactly one place. For CLI/config flows, config dataclasses are the source of truth and CLI parsers must read their defaults from those dataclasses rather than duplicating literals.
 - Preferred entrypoints:
   - `uv run cms-train ...`
   - `uv run cms-sample ...`

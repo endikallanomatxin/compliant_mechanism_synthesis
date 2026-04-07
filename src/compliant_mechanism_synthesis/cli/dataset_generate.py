@@ -20,26 +20,39 @@ from compliant_mechanism_synthesis.visualization import plot_design_3d
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    dataset_defaults = OfflineDatasetConfig()
+    primitive_defaults = PrimitiveConfig()
+    optimization_defaults = CaseOptimizationConfig()
     parser = argparse.ArgumentParser(
         prog="cms-dataset-generate",
         description="Generate and refine an offline dataset of 3D compliant-mechanism cases.",
     )
-    parser.add_argument("--num-cases", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--num-free-nodes", type=int, default=6)
-    parser.add_argument("--optimization-steps", type=int, default=120)
+    parser.add_argument("--num-cases", type=int, default=dataset_defaults.num_cases)
+    parser.add_argument("--batch-size", type=int, default=dataset_defaults.batch_size)
+    parser.add_argument("--device", default=dataset_defaults.device)
+    parser.add_argument(
+        "--num-free-nodes", type=int, default=primitive_defaults.num_free_nodes
+    )
+    parser.add_argument(
+        "--optimization-steps", type=int, default=optimization_defaults.num_steps
+    )
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--logdir", default="datasets")
     parser.add_argument("--preview-dir", default=None)
-    parser.add_argument("--preview-case-number", type=int, default=8)
+    parser.add_argument(
+        "--preview-case-number", type=int, default=dataset_defaults.preview_case_number
+    )
     parser.add_argument("--name", "-n", default="generated_dataset")
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--seed", type=int, default=dataset_defaults.seed)
     parser.add_argument("--just-check-sample", action="store_true")
-    parser.add_argument("--sample-num-free-nodes", type=int, default=6)
-    parser.add_argument("--sample-optimization-steps", type=int, default=120)
+    parser.add_argument(
+        "--sample-num-free-nodes", type=int, default=primitive_defaults.num_free_nodes
+    )
+    parser.add_argument(
+        "--sample-optimization-steps", type=int, default=optimization_defaults.num_steps
+    )
     parser.add_argument("--sample-output-dir", default="artifacts/sample_case")
-    parser.add_argument("--sample-seed", type=int, default=7)
+    parser.add_argument("--sample-seed", type=int, default=dataset_defaults.seed)
     return parser
 
 
@@ -54,7 +67,7 @@ def dataset_generate_main(argv: list[str] | None = None) -> None:
     resolved_output_path = (
         Path(args.output_path)
         if args.output_path is not None
-        else logdir_path / "offline_dataset.pt"
+        else logdir_path / "dataset.pt"
     )
     preview_path = (
         args.preview_dir
@@ -74,7 +87,7 @@ def dataset_generate_main(argv: list[str] | None = None) -> None:
         optimization=CaseOptimizationConfig(num_steps=args.optimization_steps),
     )
     generate_offline_dataset(config)
-    print(f"dataset={args.output_path}")
+    print(f"dataset={resolved_output_path}")
     print(f"visualizations={Path(preview_path)}")
     print(f"logs={logdir_path}")
 
