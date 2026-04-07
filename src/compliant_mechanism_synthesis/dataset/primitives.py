@@ -21,7 +21,7 @@ CHAIN_PRIMITIVE_LIBRARY = (
 # During scaffold-to-mesh debugging we intentionally keep a single active
 # primitive family so we can inspect one geometry/conectivity pattern at a
 # time before re-introducing the others.
-ACTIVE_CHAIN_PRIMITIVE_LIBRARY = ("sheet",)
+ACTIVE_CHAIN_PRIMITIVE_LIBRARY = ("truss",)
 
 
 @dataclass(frozen=True)
@@ -36,7 +36,7 @@ class PrimitiveConfig:
     # The final mesh primitives should read as thin composable parts rather
     # than a few oversized blobs. Using a 0.04 workspace-wide diameter keeps
     # the primitive family legible once many of them are composed together.
-    primitive_radius: float = 0.02
+    primitive_radius: float = 0.015
     neighbor_count: int = 3
     extra_connection_probability: float = 0.18
     connection_length_scale: float = 0.22
@@ -49,14 +49,26 @@ class PrimitiveConfig:
     helix_radius: float = 0.06
     helix_turns: float = 12.0
     sheet_width_nodes: int = 4
-    sheet_width_distance: float = 0.03
+    sheet_width_distance: float = 0.02
+    sample_sheet_helix_width_nodes: bool = True
+    sheet_helix_width_nodes_min: int = 2
+    sheet_helix_width_nodes_max: int = 4
+    sheet_helix_offset_distance_min: float = 0.06
+    sheet_helix_offset_distance_max: float = 0.10
+    sheet_helix_pitch_distance: float = 0.16
+    sheet_helix_max_longitudinal_points: int = 128
+    forced_primitive_type: str | None = None
 
 
 @dataclass(frozen=True)
 class ChainPrimitiveAssignment:
     chain: list[int]
     primitive_type: str
-    node_orientations: tuple[float, ...]
+    sheet_width_nodes: int
+    sheet_orientations: tuple[float, ...]
+    offset_distances: tuple[float, ...]
+    helix_phase: float
+    helix_pitch: float
     width_start: float
     width_end: float
     thickness_start: float
@@ -235,16 +247,48 @@ def _sample_chain_primitives(
     rng: random.Random,
 ) -> list[ChainPrimitiveAssignment]:
     assignments = []
+    if (
+        config.forced_primitive_type is not None
+        and config.forced_primitive_type not in CHAIN_PRIMITIVE_LIBRARY
+    ):
+        raise ValueError("forced_primitive_type must be a known primitive family")
     for chain in chains:
         width_scale = rng.uniform(0.8, 1.15)
         thickness_scale = rng.uniform(0.45, 0.85)
+        primitive_type = (
+            config.forced_primitive_type
+            if config.forced_primitive_type is not None
+            else rng.choice(ACTIVE_CHAIN_PRIMITIVE_LIBRARY)
+        )
+        sheet_width_nodes = config.sheet_width_nodes
+        if primitive_type == "sheet_helix" and config.sample_sheet_helix_width_nodes:
+            if config.sheet_helix_width_nodes_min > config.sheet_helix_width_nodes_max:
+                raise ValueError(
+                    "sheet_helix_width_nodes_min must be <= sheet_helix_width_nodes_max"
+                )
+            sheet_width_nodes = rng.randint(
+                config.sheet_helix_width_nodes_min,
+                config.sheet_helix_width_nodes_max,
+            )
         assignments.append(
             ChainPrimitiveAssignment(
                 chain=chain,
-                primitive_type=rng.choice(ACTIVE_CHAIN_PRIMITIVE_LIBRARY),
-                node_orientations=tuple(
+                primitive_type=primitive_type,
+                sheet_width_nodes=sheet_width_nodes,
+                sheet_orientations=tuple(
                     rng.uniform(0.0, 2.0 * math.pi) for _ in range(len(chain))
                 ),
+                offset_distances=tuple(
+                    rng.uniform(
+                        config.sheet_helix_offset_distance_min,
+                        config.sheet_helix_offset_distance_max,
+                    )
+                    if primitive_type == "sheet_helix"
+                    else 0.0
+                    for _ in range(len(chain))
+                ),
+                helix_phase=rng.uniform(0.0, 2.0 * math.pi),
+                helix_pitch=config.sheet_helix_pitch_distance,
                 width_start=config.primitive_radius
                 * width_scale
                 * rng.uniform(0.8, 1.1),
@@ -351,10 +395,9 @@ def _primitive_center_offset(
     if primitive_type == "sheet":
         return torch.zeros_like(normal_1)
     if primitive_type == "sheet_helix":
-        angle = sweep_phase + twist * math.pi
-        return 0.12 * width * (math.cos(angle) * normal_1 + math.sin(angle) * normal_2)
+        return torch.zeros_like(normal_1)
     if primitive_type == "truss":
-        return 0.12 * width * normal_1 - 0.12 * thickness * normal_2
+        return torch.zeros_like(normal_1)
     raise ValueError(f"unknown primitive type: {primitive_type}")
 
 
@@ -511,23 +554,42 @@ def _materialize_scaffold_node_triplets(
             )
             continue
 
+        if assignment.primitive_type == "truss":
+            truss_sections = _build_truss_sections(
+                chain_positions=chain_positions,
+                assignment=assignment,
+            )
+            _materialize_truss_prism(
+                sections=truss_sections,
+                add_node=add_node,
+                add_edge=add_edge,
+                start_index=start_index,
+                end_index=end_index,
+            )
+            continue
+
+        if assignment.primitive_type == "sheet_helix":
+            sheet_centerline, radial_axes = _build_sheet_helix_centerline(
+                chain_positions=chain_positions,
+                assignment=assignment,
+                target_edge_length=config.target_edge_length,
+                max_longitudinal_points=config.sheet_helix_max_longitudinal_points,
+            )
+        else:
+            sheet_centerline = chain_positions
+            radial_axes = None
         lateral_axes = _build_sheet_lateral_axes(
-            centers=centers,
-            adjacency=adjacency,
+            chain_positions=sheet_centerline,
             assignment=assignment,
-            num_samples=chain_positions.shape[0],
+            radial_axes=radial_axes,
         )
         sheet_rows = _discretize_sheet_chain(
-            chain_positions=chain_positions,
+            chain_positions=sheet_centerline,
             lateral_axes=lateral_axes,
             sheet_width_distance=config.sheet_width_distance,
-            sheet_width_nodes=config.sheet_width_nodes,
-            helix_turns=(
-                config.helix_turns
-                if assignment.primitive_type == "sheet_helix"
-                else 0.0
-            ),
-            helix_phase=assignment.sweep_phase,
+            sheet_width_nodes=assignment.sheet_width_nodes,
+            helix_turns=0.0,
+            helix_phase=0.0,
         )
         _materialize_sheet_lattice(
             rows=sheet_rows,
@@ -692,6 +754,68 @@ def _estimate_polyline_tangent(
     return tangent
 
 
+def _cumulative_arc_lengths(polyline: torch.Tensor) -> torch.Tensor:
+    if polyline.shape[0] <= 1:
+        return torch.zeros(
+            (polyline.shape[0],), dtype=polyline.dtype, device=polyline.device
+        )
+    segment_lengths = torch.linalg.vector_norm(polyline[1:] - polyline[:-1], dim=1)
+    return torch.cat(
+        [
+            torch.zeros((1,), dtype=polyline.dtype, device=polyline.device),
+            torch.cumsum(segment_lengths, dim=0),
+        ],
+        dim=0,
+    )
+
+
+def _interpolate_scalar_controls(
+    control_values: torch.Tensor,
+    num_samples: int,
+) -> torch.Tensor:
+    if control_values.shape[0] == num_samples:
+        return control_values
+    if control_values.shape[0] == 1:
+        return control_values.repeat(num_samples)
+
+    control_positions = torch.linspace(
+        0.0,
+        1.0,
+        steps=control_values.shape[0],
+        dtype=control_values.dtype,
+        device=control_values.device,
+    )
+    sample_positions = torch.linspace(
+        0.0,
+        1.0,
+        steps=num_samples,
+        dtype=control_values.dtype,
+        device=control_values.device,
+    )
+    samples = []
+    for sample_position in sample_positions.tolist():
+        upper_index = 1
+        while (
+            upper_index < control_positions.shape[0] - 1
+            and float(control_positions[upper_index].item()) < sample_position
+        ):
+            upper_index += 1
+        lower_index = upper_index - 1
+        lower_position = float(control_positions[lower_index].item())
+        upper_position = float(control_positions[upper_index].item())
+        if upper_position - lower_position < 1e-8:
+            interpolated = control_values[lower_index]
+        else:
+            fraction = (sample_position - lower_position) / (
+                upper_position - lower_position
+            )
+            interpolated = (1.0 - fraction) * control_values[
+                lower_index
+            ] + fraction * control_values[upper_index]
+        samples.append(interpolated)
+    return torch.stack(samples, dim=0)
+
+
 def _discretize_sheet_chain(
     chain_positions: torch.Tensor,
     lateral_axes: torch.Tensor,
@@ -803,19 +927,187 @@ def _interpolate_control_vectors(
     )
 
 
-def _build_sheet_lateral_axes(
-    centers: torch.Tensor,
-    adjacency: torch.Tensor,
+def _build_sheet_helix_centerline(
+    chain_positions: torch.Tensor,
     assignment: ChainPrimitiveAssignment,
-    num_samples: int,
-) -> torch.Tensor:
-    control_axes = []
-    for local_index, node_index in enumerate(assignment.chain):
-        tangent = _estimate_scaffold_tangent(centers, adjacency, node_index)
+    target_edge_length: float,
+    max_longitudinal_points: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    control_offset_distances = torch.tensor(
+        assignment.offset_distances,
+        dtype=chain_positions.dtype,
+        device=chain_positions.device,
+    )
+    base_arc_lengths = _cumulative_arc_lengths(chain_positions)
+    base_arc_length = float(base_arc_lengths[-1].item())
+    effective_radius = float(control_offset_distances.abs().max().item())
+    total_turns = base_arc_length / max(assignment.helix_pitch, 1e-6)
+    helical_circumference_travel = abs(total_turns) * 2.0 * math.pi * effective_radius
+    helical_length = math.sqrt(base_arc_length**2 + helical_circumference_travel**2)
+    num_points = max(
+        chain_positions.shape[0],
+        int(math.ceil(helical_length / max(target_edge_length, 1e-6))) + 1,
+    )
+    num_points = min(num_points, max_longitudinal_points)
+    helix_support = _resample_polyline_by_spacing(
+        chain_positions,
+        target_edge_length=target_edge_length,
+        num_points=num_points,
+    )
+    offset_distances = _interpolate_scalar_controls(
+        control_offset_distances.to(
+            dtype=helix_support.dtype, device=helix_support.device
+        ),
+        helix_support.shape[0],
+    )
+    arc_lengths = _cumulative_arc_lengths(helix_support)
+    centers = []
+    radial_axes = []
+    for sample_index in range(helix_support.shape[0]):
+        tangent = _estimate_polyline_tangent(helix_support, sample_index)
         _, normal_1, normal_2 = _orthonormal_frame(tangent)
-        angle = assignment.node_orientations[local_index]
-        control_axes.append(math.cos(angle) * normal_1 + math.sin(angle) * normal_2)
-    return _interpolate_control_vectors(torch.stack(control_axes, dim=0), num_samples)
+        angle = assignment.helix_phase + 2.0 * math.pi * float(
+            arc_lengths[sample_index].item()
+        ) / max(assignment.helix_pitch, 1e-6)
+        radial_axis = math.cos(angle) * normal_1 + math.sin(angle) * normal_2
+        centers.append(
+            helix_support[sample_index] + offset_distances[sample_index] * radial_axis
+        )
+        radial_axes.append(radial_axis)
+    return torch.stack(centers, dim=0), torch.stack(radial_axes, dim=0)
+
+
+def _build_sheet_lateral_axes(
+    chain_positions: torch.Tensor,
+    assignment: ChainPrimitiveAssignment,
+    radial_axes: torch.Tensor | None = None,
+) -> torch.Tensor:
+    orientation_angles = _interpolate_scalar_controls(
+        torch.tensor(
+            assignment.sheet_orientations,
+            dtype=chain_positions.dtype,
+            device=chain_positions.device,
+        ),
+        chain_positions.shape[0],
+    )
+    lateral_axes = []
+    for sample_index in range(chain_positions.shape[0]):
+        tangent = _estimate_polyline_tangent(chain_positions, sample_index)
+        _, normal_1, normal_2 = _orthonormal_frame(tangent)
+        if radial_axes is None:
+            lateral_axis = (
+                math.cos(float(orientation_angles[sample_index].item())) * normal_1
+                + math.sin(float(orientation_angles[sample_index].item())) * normal_2
+            )
+        else:
+            radial_axis = radial_axes[sample_index]
+            circumferential_axis = torch.linalg.cross(radial_axis, tangent)
+            if torch.linalg.vector_norm(circumferential_axis).item() < 1e-8:
+                circumferential_axis = normal_1
+            circumferential_axis = circumferential_axis / torch.linalg.vector_norm(
+                circumferential_axis
+            ).clamp_min(1e-8)
+            orientation = float(orientation_angles[sample_index].item())
+            lateral_axis = (
+                math.cos(orientation) * circumferential_axis
+                + math.sin(orientation) * radial_axis
+            )
+        lateral_axes.append(
+            lateral_axis / torch.linalg.vector_norm(lateral_axis).clamp_min(1e-8)
+        )
+    return torch.stack(lateral_axes, dim=0)
+
+
+def _build_truss_sections(
+    chain_positions: torch.Tensor,
+    assignment: ChainPrimitiveAssignment,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    sections = []
+    for sample_index in range(chain_positions.shape[0]):
+        tangent = _estimate_polyline_tangent(chain_positions, sample_index)
+        _, normal_1, normal_2 = _orthonormal_frame(tangent)
+        fraction = sample_index / max(chain_positions.shape[0] - 1, 1)
+        width = (
+            1.0 - fraction
+        ) * assignment.width_start + fraction * assignment.width_end
+        thickness = (
+            1.0 - fraction
+        ) * assignment.thickness_start + fraction * assignment.thickness_end
+        twist = (
+            1.0 - fraction
+        ) * assignment.twist_start + fraction * assignment.twist_end
+        angle = assignment.sweep_phase + twist * math.pi
+        lateral_axis = math.cos(angle) * normal_1 + math.sin(angle) * normal_2
+        vertical_axis = torch.linalg.cross(tangent, lateral_axis)
+        if torch.linalg.vector_norm(vertical_axis).item() < 1e-8:
+            vertical_axis = normal_2
+        vertical_axis = vertical_axis / torch.linalg.vector_norm(
+            vertical_axis
+        ).clamp_min(1e-8)
+
+        center = chain_positions[sample_index]
+        half_width = max(1.8 * width, 0.018)
+        top_height = max(2.4 * thickness, 0.022)
+        left = center - half_width * lateral_axis
+        right = center + half_width * lateral_axis
+        top = center + top_height * vertical_axis
+        sections.append((left, right, top))
+    return sections
+
+
+def _materialize_truss_prism(
+    sections: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    add_node,
+    add_edge,
+    start_index: int,
+    end_index: int,
+) -> None:
+    if len(sections) <= 2:
+        add_edge(start_index, end_index)
+        return
+
+    section_node_indices: list[tuple[int, int, int]] = []
+    for left_position, right_position, top_position in sections[1:-1]:
+        left_index = add_node(left_position, NodeRole.FREE)
+        right_index = add_node(right_position, NodeRole.FREE)
+        top_index = add_node(top_position, NodeRole.FREE)
+        add_edge(left_index, right_index)
+        add_edge(left_index, top_index)
+        add_edge(right_index, top_index)
+        section_node_indices.append((left_index, right_index, top_index))
+
+    if not section_node_indices:
+        add_edge(start_index, end_index)
+        return
+
+    first_left, first_right, first_top = section_node_indices[0]
+    add_edge(start_index, first_left)
+    add_edge(start_index, first_right)
+    add_edge(start_index, first_top)
+
+    for segment_index, (previous_section, current_section) in enumerate(
+        zip(section_node_indices[:-1], section_node_indices[1:])
+    ):
+        previous_left, previous_right, previous_top = previous_section
+        current_left, current_right, current_top = current_section
+
+        add_edge(previous_left, current_left)
+        add_edge(previous_right, current_right)
+        add_edge(previous_top, current_top)
+
+        if segment_index % 2 == 0:
+            add_edge(previous_left, current_right)
+            add_edge(previous_right, current_top)
+            add_edge(previous_top, current_left)
+        else:
+            add_edge(previous_right, current_left)
+            add_edge(previous_top, current_right)
+            add_edge(previous_left, current_top)
+
+    last_left, last_right, last_top = section_node_indices[-1]
+    add_edge(last_left, end_index)
+    add_edge(last_right, end_index)
+    add_edge(last_top, end_index)
 
 
 def _discretize_rod_helix_chain(

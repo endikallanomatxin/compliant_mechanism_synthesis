@@ -10,7 +10,10 @@ from compliant_mechanism_synthesis.dataset import (
     PrimitiveConfig,
     generate_offline_dataset,
 )
-from compliant_mechanism_synthesis.models import SupervisedRefiner, SupervisedRefinerConfig
+from compliant_mechanism_synthesis.models import (
+    SupervisedRefiner,
+    SupervisedRefinerConfig,
+)
 from compliant_mechanism_synthesis.training import (
     CurriculumConfig,
     SupervisedTrainingConfig,
@@ -26,9 +29,21 @@ def _build_cases(tmp_path: Path):
     generate_offline_dataset(
         OfflineDatasetConfig(
             num_cases=4,
+            device="cpu",
             output_path=str(path),
             logdir=str(tmp_path / "runs"),
-            primitive=PrimitiveConfig(num_free_nodes=6),
+            primitive=PrimitiveConfig(
+                num_free_nodes=6,
+                forced_primitive_type="sheet_helix",
+                sheet_width_nodes=2,
+                sample_sheet_helix_width_nodes=False,
+                sheet_helix_width_nodes_min=2,
+                sheet_helix_width_nodes_max=2,
+                sheet_helix_offset_distance_min=0.05,
+                sheet_helix_offset_distance_max=0.07,
+                sheet_helix_pitch_distance=0.30,
+                sheet_helix_max_longitudinal_points=32,
+            ),
             optimization=CaseOptimizationConfig(num_steps=4),
         )
     )
@@ -37,7 +52,11 @@ def _build_cases(tmp_path: Path):
 
 def test_supervised_refiner_preserves_structure_shapes(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
-    model = SupervisedRefiner(SupervisedRefinerConfig(hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=4))
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=4
+        )
+    )
     prediction = model(
         cases.raw_structures,
         cases.target_stiffness,
@@ -49,13 +68,18 @@ def test_supervised_refiner_preserves_structure_shapes(tmp_path: Path) -> None:
     assert prediction.adjacency.shape == cases.raw_structures.adjacency.shape
 
 
-def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(tmp_path: Path) -> None:
+def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
+    tmp_path: Path,
+) -> None:
     cases = _build_cases(tmp_path)
     _, summary = train_supervised_refiner(
         optimized_cases=cases,
-        model_config=SupervisedRefinerConfig(hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=4),
+        model_config=SupervisedRefinerConfig(
+            hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=4
+        ),
         train_config=SupervisedTrainingConfig(
             dataset_path=str(tmp_path / "dataset.pt"),
+            device="cpu",
             batch_size=2,
             num_steps=16,
             learning_rate=5e-4,
@@ -73,7 +97,9 @@ def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(tm
 
 def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
-    config = SupervisedRefinerConfig(hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=4)
+    config = SupervisedRefinerConfig(
+        hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=4
+    )
     baseline = SupervisedRefiner(config)
     batch = make_supervised_batch(
         optimized_cases=cases,
@@ -94,6 +120,7 @@ def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) 
         model_config=config,
         train_config=SupervisedTrainingConfig(
             dataset_path=str(tmp_path / "dataset.pt"),
+            device="cpu",
             batch_size=2,
             num_steps=20,
             learning_rate=5e-4,
@@ -111,10 +138,29 @@ def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) 
         adjacency_noise_levels=batch.adjacency_noise_levels,
     )
 
-    baseline_position_error = (baseline_prediction.position_velocity - batch.target_position_velocity).square().mean()
-    trained_position_error = (trained_prediction.position_velocity - batch.target_position_velocity).square().mean()
-    baseline_adjacency_error = (baseline_prediction.adjacency_velocity - batch.target_adjacency_velocity).square().mean()
-    trained_adjacency_error = (trained_prediction.adjacency_velocity - batch.target_adjacency_velocity).square().mean()
+    baseline_position_error = (
+        (baseline_prediction.position_velocity - batch.target_position_velocity)
+        .square()
+        .mean()
+    )
+    trained_position_error = (
+        (trained_prediction.position_velocity - batch.target_position_velocity)
+        .square()
+        .mean()
+    )
+    baseline_adjacency_error = (
+        (baseline_prediction.adjacency_velocity - batch.target_adjacency_velocity)
+        .square()
+        .mean()
+    )
+    trained_adjacency_error = (
+        (trained_prediction.adjacency_velocity - batch.target_adjacency_velocity)
+        .square()
+        .mean()
+    )
 
-    assert trained_position_error + trained_adjacency_error < baseline_position_error + baseline_adjacency_error
+    assert (
+        trained_position_error + trained_adjacency_error
+        < baseline_position_error + baseline_adjacency_error
+    )
     assert trained_adjacency_error < baseline_adjacency_error

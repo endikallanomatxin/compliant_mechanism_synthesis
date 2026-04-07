@@ -6,7 +6,10 @@ import math
 import torch
 
 from compliant_mechanism_synthesis.roles import NodeRole, role_masks
-from compliant_mechanism_synthesis.tensor_ops import symmetrize_matrix, upper_triangle_edge_index
+from compliant_mechanism_synthesis.tensor_ops import (
+    symmetrize_matrix,
+    upper_triangle_edge_index,
+)
 
 
 @dataclass(frozen=True)
@@ -71,7 +74,9 @@ def beam_radii(adjacency: torch.Tensor, config: Frame3DConfig) -> torch.Tensor:
     return adjacency.clamp_min(0.0) * config.radius_max
 
 
-def _section_properties(radius: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _section_properties(
+    radius: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     area = math.pi * radius.square()
     bending_inertia = math.pi * radius.pow(4) / 4.0
     polar_inertia = math.pi * radius.pow(4) / 2.0
@@ -91,7 +96,9 @@ def _local_axes(delta: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
     x_axis = delta / length.unsqueeze(-1)
     reference = _choose_reference_axis(x_axis)
     y_axis = torch.linalg.cross(reference, x_axis, dim=-1)
-    y_axis = y_axis / torch.linalg.vector_norm(y_axis, dim=-1, keepdim=True).clamp_min(1e-8)
+    y_axis = y_axis / torch.linalg.vector_norm(y_axis, dim=-1, keepdim=True).clamp_min(
+        1e-8
+    )
     z_axis = torch.linalg.cross(x_axis, y_axis, dim=-1)
     return torch.stack([x_axis, y_axis, z_axis], dim=-2)
 
@@ -258,7 +265,9 @@ def _skew(vector: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _reduction_transform(positions: torch.Tensor, roles: torch.Tensor) -> tuple[torch.Tensor, int]:
+def _reduction_transform(
+    positions: torch.Tensor, roles: torch.Tensor
+) -> tuple[torch.Tensor, int]:
     batch_size, num_nodes, _ = positions.shape
     fixed_mask, mobile_mask, free_mask = role_masks(roles)
 
@@ -283,7 +292,9 @@ def _reduction_transform(positions: torch.Tensor, roles: torch.Tensor) -> tuple[
         for dof in range(6):
             transform[:, 6 * free_indices + dof, 6 * free_slots + dof] = 1.0
 
-    mobile_positions = positions[:, mobile_indices] if mobile_indices.numel() else positions[:, :0]
+    mobile_positions = (
+        positions[:, mobile_indices] if mobile_indices.numel() else positions[:, :0]
+    )
     centroid = mobile_positions.mean(dim=1, keepdim=True)
     offsets = mobile_positions - centroid
     rigid_base = 6 * free_count
@@ -292,15 +303,21 @@ def _reduction_transform(positions: torch.Tensor, roles: torch.Tensor) -> tuple[
         device=positions.device,
         dtype=positions.dtype,
     )
-    rigid_map[..., :3, :3] = torch.eye(3, device=positions.device, dtype=positions.dtype)
+    rigid_map[..., :3, :3] = torch.eye(
+        3, device=positions.device, dtype=positions.dtype
+    )
     # A rigid body's nodal translations are the body translation plus the
     # infinitesimal rotation crossed with each node's offset from the centroid.
     rigid_map[..., :3, 3:] = -_skew(offsets)
-    rigid_map[..., 3:, 3:] = torch.eye(3, device=positions.device, dtype=positions.dtype)
+    rigid_map[..., 3:, 3:] = torch.eye(
+        3, device=positions.device, dtype=positions.dtype
+    )
 
     for local_node, node_index in enumerate(mobile_indices.tolist()):
         start = 6 * node_index
-        transform[:, start : start + 6, rigid_base : rigid_base + 6] = rigid_map[:, local_node]
+        transform[:, start : start + 6, rigid_base : rigid_base + 6] = rigid_map[
+            :, local_node
+        ]
 
     return transform, free_count
 
@@ -333,7 +350,16 @@ def effective_output_stiffness(
             dtype=positions.dtype,
         )
     )
-    relaxed_coupling = torch.linalg.solve(regularized_free, coupling)
+    # Avoid batched GPU solves here: for these reduced systems PyTorch may route
+    # to batched LAPACK/MAGMA paths that emit performance warnings on larger
+    # matrices. Solving per case keeps the output stable and quiet.
+    relaxed_coupling = torch.stack(
+        [
+            torch.linalg.solve(regularized_free[index], coupling[index])
+            for index in range(positions.shape[0])
+        ],
+        dim=0,
+    )
     effective = output_block - coupling.transpose(-1, -2) @ relaxed_coupling
     return symmetrize_matrix(effective)
 
@@ -373,38 +399,56 @@ def geometry_penalties(
     radius = beam_radii(edge_activation, frame_config)
 
     safe_active_count = active_mask.sum(dim=-1).clamp_min(1)
-    short_penalty = torch.where(
-        active_mask,
-        (penalty_config.min_length - length).clamp_min(0.0).square(),
-        torch.zeros_like(length),
-    ).sum(dim=-1) / safe_active_count
-    long_penalty = torch.where(
-        active_mask,
-        (length - penalty_config.max_length).clamp_min(0.0).square(),
-        torch.zeros_like(length),
-    ).sum(dim=-1) / safe_active_count
-    thin_penalty = torch.where(
-        active_mask,
-        (penalty_config.min_radius - radius).clamp_min(0.0).square(),
-        torch.zeros_like(radius),
-    ).sum(dim=-1) / safe_active_count
-    thick_penalty = torch.where(
-        active_mask,
-        (radius - penalty_config.max_radius).clamp_min(0.0).square(),
-        torch.zeros_like(radius),
-    ).sum(dim=-1) / safe_active_count
+    short_penalty = (
+        torch.where(
+            active_mask,
+            (penalty_config.min_length - length).clamp_min(0.0).square(),
+            torch.zeros_like(length),
+        ).sum(dim=-1)
+        / safe_active_count
+    )
+    long_penalty = (
+        torch.where(
+            active_mask,
+            (length - penalty_config.max_length).clamp_min(0.0).square(),
+            torch.zeros_like(length),
+        ).sum(dim=-1)
+        / safe_active_count
+    )
+    thin_penalty = (
+        torch.where(
+            active_mask,
+            (penalty_config.min_radius - radius).clamp_min(0.0).square(),
+            torch.zeros_like(radius),
+        ).sum(dim=-1)
+        / safe_active_count
+    )
+    thick_penalty = (
+        torch.where(
+            active_mask,
+            (radius - penalty_config.max_radius).clamp_min(0.0).square(),
+            torch.zeros_like(radius),
+        ).sum(dim=-1)
+        / safe_active_count
+    )
 
     _, _, free_mask = role_masks(roles)
     free_positions = positions
     pairwise = torch.linalg.vector_norm(
-        (free_positions[:, :, None, :] - free_positions[:, None, :, :]) * frame_config.workspace_size,
+        (free_positions[:, :, None, :] - free_positions[:, None, :, :])
+        * frame_config.workspace_size,
         dim=-1,
     )
     valid_pairs = free_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
     valid_pairs = torch.triu(valid_pairs, diagonal=1)
-    spacing_violation = (penalty_config.min_free_spacing - pairwise).clamp_min(0.0).square()
+    spacing_violation = (
+        (penalty_config.min_free_spacing - pairwise).clamp_min(0.0).square()
+    )
     free_pair_count = valid_pairs.sum(dim=(1, 2)).clamp_min(1)
-    spacing_penalty = spacing_violation.masked_fill(~valid_pairs, 0.0).sum(dim=(1, 2)) / free_pair_count
+    spacing_penalty = (
+        spacing_violation.masked_fill(~valid_pairs, 0.0).sum(dim=(1, 2))
+        / free_pair_count
+    )
 
     return {
         "short_beam_penalty": short_penalty,

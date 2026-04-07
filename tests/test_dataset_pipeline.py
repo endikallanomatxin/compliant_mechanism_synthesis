@@ -60,20 +60,75 @@ def test_sample_random_primitive_uses_single_debug_chain_family() -> None:
 
     edge_types = scaffolds.edge_primitive_types[0]
     used_types = torch.unique(edge_types[edge_types >= 0])
-    assert used_types.tolist() == [2]
+    assert used_types.tolist() == [4]
 
 
 def test_sheet_width_nodes_increases_materialized_node_count() -> None:
     narrow = sample_primitive_design(
-        config=PrimitiveConfig(num_free_nodes=6, sheet_width_nodes=2),
+        config=PrimitiveConfig(
+            num_free_nodes=6,
+            sheet_width_nodes=2,
+            forced_primitive_type="sheet_helix",
+            sample_sheet_helix_width_nodes=False,
+            sheet_helix_width_nodes_min=2,
+            sheet_helix_width_nodes_max=2,
+        ),
         seed=17,
     )
     wide = sample_primitive_design(
-        config=PrimitiveConfig(num_free_nodes=6, sheet_width_nodes=6),
+        config=PrimitiveConfig(
+            num_free_nodes=6,
+            sheet_width_nodes=4,
+            forced_primitive_type="sheet_helix",
+            sample_sheet_helix_width_nodes=False,
+            sheet_helix_width_nodes_min=4,
+            sheet_helix_width_nodes_max=4,
+        ),
         seed=17,
     )
 
     assert wide.positions.shape[1] > narrow.positions.shape[1]
+
+
+def test_sheet_helix_increases_longitudinal_density_for_tighter_turns() -> None:
+    relaxed = sample_primitive_design(
+        config=PrimitiveConfig(
+            num_free_nodes=6,
+            forced_primitive_type="sheet_helix",
+            sample_sheet_helix_width_nodes=False,
+            sheet_helix_width_nodes_min=2,
+            sheet_helix_width_nodes_max=2,
+            sheet_helix_offset_distance_min=0.04,
+            sheet_helix_offset_distance_max=0.04,
+            sheet_helix_pitch_distance=0.40,
+        ),
+        seed=19,
+    )
+    tighter = sample_primitive_design(
+        config=PrimitiveConfig(
+            num_free_nodes=6,
+            forced_primitive_type="sheet_helix",
+            sample_sheet_helix_width_nodes=False,
+            sheet_helix_width_nodes_min=2,
+            sheet_helix_width_nodes_max=2,
+            sheet_helix_offset_distance_min=0.20,
+            sheet_helix_offset_distance_max=0.20,
+            sheet_helix_pitch_distance=0.10,
+        ),
+        seed=19,
+    )
+
+    assert tighter.positions.shape[1] > relaxed.positions.shape[1]
+
+
+def test_truss_materialization_creates_internal_triangular_bracing() -> None:
+    structures = sample_primitive_design(
+        config=PrimitiveConfig(num_free_nodes=6),
+        seed=23,
+    )
+
+    degree = structures.adjacency[0].sum(dim=1)
+    assert torch.count_nonzero(degree >= 4.0) > 0
 
 
 def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) -> None:
@@ -98,6 +153,7 @@ def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
         OfflineDatasetConfig(
             num_cases=3,
             batch_size=2,
+            device="cpu",
             output_path=str(tmp_path / "dataset.pt"),
             logdir=str(tmp_path / "runs"),
             primitive=PrimitiveConfig(num_free_nodes=6),

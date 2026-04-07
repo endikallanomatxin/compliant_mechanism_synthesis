@@ -28,6 +28,7 @@ def _build_cases(tmp_path: Path):
     generate_offline_dataset(
         OfflineDatasetConfig(
             num_cases=3,
+            device="cpu",
             output_path=str(path),
             logdir=str(tmp_path / "runs"),
             primitive=PrimitiveConfig(num_free_nodes=6),
@@ -46,24 +47,37 @@ def test_make_supervised_batch_returns_noisy_structures(tmp_path: Path) -> None:
         seed=7,
     )
 
-    assert batch.noisy_structures.positions.shape == optimized_cases.raw_structures.positions.shape
+    assert (
+        batch.noisy_structures.positions.shape
+        == optimized_cases.raw_structures.positions.shape
+    )
     assert batch.target_stiffness.shape == optimized_cases.target_stiffness.shape
-    assert not torch.allclose(batch.noisy_structures.positions, batch.oracle_structures.positions)
+    assert not torch.allclose(
+        batch.noisy_structures.positions, batch.oracle_structures.positions
+    )
 
 
 def test_iter_supervised_minibatches_covers_all_cases(tmp_path: Path) -> None:
     _, optimized_cases = _build_cases(tmp_path)
-    minibatches = list(iter_supervised_minibatches(optimized_cases, batch_size=2, shuffle=False))
+    minibatches = list(
+        iter_supervised_minibatches(optimized_cases, batch_size=2, shuffle=False)
+    )
 
     assert len(minibatches) == 2
     assert sum(batch.raw_structures.batch_size for batch in minibatches) == 3
 
 
-def test_evaluate_refinement_step_compares_noisy_refined_and_oracle(tmp_path: Path) -> None:
+def test_evaluate_refinement_step_compares_noisy_refined_and_oracle(
+    tmp_path: Path,
+) -> None:
     _, optimized_cases = _build_cases(tmp_path)
 
-    def oracle_refiner(noisy_structures: Structures, _target_stiffness: torch.Tensor) -> Structures:
-        return select_batch(optimized_cases, torch.arange(optimized_cases.raw_structures.batch_size)).optimized_structures
+    def oracle_refiner(
+        noisy_structures: Structures, _target_stiffness: torch.Tensor
+    ) -> Structures:
+        return select_batch(
+            optimized_cases, torch.arange(optimized_cases.raw_structures.batch_size)
+        ).optimized_structures
 
     metrics = evaluate_refinement_step(
         refiner=oracle_refiner,
@@ -72,7 +86,9 @@ def test_evaluate_refinement_step_compares_noisy_refined_and_oracle(tmp_path: Pa
         seed=3,
     )
 
-    relative_gap = abs(metrics.refined_target_error - metrics.oracle_target_error) / max(
+    relative_gap = abs(
+        metrics.refined_target_error - metrics.oracle_target_error
+    ) / max(
         metrics.oracle_target_error,
         1e-6,
     )
@@ -84,5 +100,7 @@ def test_analyze_structures_matches_dataset_batch_shape(tmp_path: Path) -> None:
     _, optimized_cases = _build_cases(tmp_path)
     analyses = analyze_structures(optimized_cases.optimized_structures)
 
-    assert analyses.generalized_stiffness.shape == optimized_cases.target_stiffness.shape
+    assert (
+        analyses.generalized_stiffness.shape == optimized_cases.target_stiffness.shape
+    )
     assert analyses.material_usage.shape == optimized_cases.initial_loss.shape

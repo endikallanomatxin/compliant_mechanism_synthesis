@@ -65,7 +65,7 @@ def plot_design_3d(
             label=style["label"],
             color=style["color"],
             marker=style["marker"],
-            s=50,
+            s=24,
             depthshade=False,
         )
 
@@ -100,7 +100,11 @@ def plot_scaffold_primitives_3d(
             if float(adjacency[i, j].item()) <= 0.0:
                 continue
             primitive_index = int(edge_primitive_types[i, j].item())
-            color = "#666666" if primitive_index < 0 else PRIMITIVE_TYPE_COLORS[primitive_index % len(PRIMITIVE_TYPE_COLORS)]
+            color = (
+                "#666666"
+                if primitive_index < 0
+                else PRIMITIVE_TYPE_COLORS[primitive_index % len(PRIMITIVE_TYPE_COLORS)]
+            )
             if primitive_index >= 0:
                 used_labels.add(primitive_index)
             ax.plot(
@@ -122,7 +126,7 @@ def plot_scaffold_primitives_3d(
             positions[mask, 2].numpy(),
             color=style["color"],
             marker=style["marker"],
-            s=70 if role != NodeRole.FREE else 45,
+            s=26 if role != NodeRole.FREE else 18,
             depthshade=False,
         )
 
@@ -143,7 +147,7 @@ def plot_scaffold_primitives_3d(
             color=style["color"],
             marker=style["marker"],
             linestyle="None",
-            markersize=7,
+            markersize=5,
             label=style["label"],
         )
         for _, style in ROLE_STYLE.items()

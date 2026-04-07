@@ -201,6 +201,8 @@ def test_train_supervised_main_writes_checkpoint(tmp_path: Path) -> None:
         [
             "--num-cases",
             "2",
+            "--device",
+            "cpu",
             "--num-free-nodes",
             "6",
             "--optimization-steps",

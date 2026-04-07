@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 import random
 
@@ -143,6 +143,23 @@ def generate_offline_dataset(
     )
 
     rng = random.Random(config.seed)
+    primitive_config = config.primitive
+    if primitive_config.sample_sheet_helix_width_nodes:
+        if (
+            primitive_config.sheet_helix_width_nodes_min
+            > primitive_config.sheet_helix_width_nodes_max
+        ):
+            raise ValueError(
+                "sheet_helix_width_nodes_min must be <= sheet_helix_width_nodes_max"
+            )
+        primitive_config = replace(
+            primitive_config,
+            sheet_width_nodes=rng.randint(
+                primitive_config.sheet_helix_width_nodes_min,
+                primitive_config.sheet_helix_width_nodes_max,
+            ),
+            sample_sheet_helix_width_nodes=False,
+        )
     current_structures: list[Structures] = []
     current_scaffolds: list[Scaffolds] = []
     current_targets: list[torch.Tensor] = []
@@ -178,7 +195,7 @@ def generate_offline_dataset(
         primitive_seed = rng.randrange(0, 2**31)
         target_seed = rng.randrange(0, 2**31)
         initial_structures, scaffold = sample_random_primitive(
-            config=config.primitive,
+            config=primitive_config,
             seed=primitive_seed,
         )
         initial_structures = initial_structures.to(device)
