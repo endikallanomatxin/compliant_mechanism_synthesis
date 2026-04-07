@@ -648,25 +648,23 @@ def _resample_polyline_by_spacing(
         num_points = num_segments + 1
     else:
         num_points = max(2, num_points)
-    targets = torch.linspace(0.0, total_length, steps=num_points, dtype=polyline.dtype)
-    resampled = []
-    segment_index = 0
-    for target in targets.tolist():
-        while (
-            segment_index < segment_lengths.shape[0] - 1
-            and float(cumulative[segment_index + 1].item()) < target
-        ):
-            segment_index += 1
-        start = polyline[segment_index]
-        end = polyline[segment_index + 1]
-        start_distance = float(cumulative[segment_index].item())
-        end_distance = float(cumulative[segment_index + 1].item())
-        if end_distance - start_distance < 1e-8:
-            resampled.append(start)
-            continue
-        fraction = (target - start_distance) / (end_distance - start_distance)
-        resampled.append((1.0 - fraction) * start + fraction * end)
-    return torch.stack(resampled, dim=0)
+    targets = torch.linspace(
+        0.0,
+        total_length,
+        steps=num_points,
+        dtype=polyline.dtype,
+        device=polyline.device,
+    )
+    segment_index = torch.searchsorted(cumulative[1:], targets, right=False)
+    segment_index = segment_index.clamp_max(segment_lengths.shape[0] - 1)
+
+    start = polyline.index_select(0, segment_index)
+    end = polyline.index_select(0, segment_index + 1)
+    start_distance = cumulative.index_select(0, segment_index)
+    end_distance = cumulative.index_select(0, segment_index + 1)
+    safe_denominator = (end_distance - start_distance).clamp_min(1e-8)
+    fraction = ((targets - start_distance) / safe_denominator).unsqueeze(-1)
+    return torch.lerp(start, end, fraction)
 
 
 def _discretize_rod_chain(
