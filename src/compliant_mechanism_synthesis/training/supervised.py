@@ -47,7 +47,7 @@ class CurriculumConfig:
 class SupervisedTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 256
+    batch_size: int = 128
     log_every_steps: int = 10
     max_grad_norm: float = 1.0
     num_steps: int = 20_000
