@@ -39,7 +39,7 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class CurriculumConfig:
     initial_mix: float = 0.15
     final_mix: float = 1.0
-    position_noise: float = 0.01
+    position_noise: float = 0.008
     adjacency_noise: float = 0.04
 
 
@@ -55,9 +55,9 @@ class SupervisedTrainingConfig:
     warmup_steps: int = 500
     min_learning_rate: float = 1e-6
     position_loss_weight: float = 1.0
-    adjacency_loss_weight: float = 0.5
-    endpoint_loss_weight: float = 0.05
-    stiffness_loss_weight: float = 0.01
+    adjacency_loss_weight: float = 0.4
+    endpoint_loss_weight: float = 0.04
+    stiffness_loss_weight: float = 0.008
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
     seed: int = 7
