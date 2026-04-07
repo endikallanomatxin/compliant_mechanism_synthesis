@@ -51,6 +51,8 @@ class SupervisedTrainingConfig:
     max_grad_norm: float = 1.0
     num_steps: int = 20_000
     learning_rate: float = 1e-5
+    warmup_steps: int = 500
+    min_learning_rate: float = 1e-6
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.5
     endpoint_loss_weight: float = 0.05
@@ -89,6 +91,39 @@ def _difficulty_fraction(step: int, total_steps: int) -> float:
     if total_steps <= 1:
         return 1.0
     return min(max(step / (total_steps - 1), 0.0), 1.0)
+
+
+def _scheduled_learning_rate(
+    step: int,
+    config: SupervisedTrainingConfig,
+) -> float:
+    if config.num_steps <= 0:
+        raise ValueError("num_steps must be positive")
+    if config.learning_rate <= 0.0:
+        raise ValueError("learning_rate must be positive")
+    if config.min_learning_rate < 0.0:
+        raise ValueError("min_learning_rate must be non-negative")
+    if config.min_learning_rate > config.learning_rate:
+        raise ValueError("min_learning_rate must be <= learning_rate")
+    if config.warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+
+    warmup_steps = min(config.warmup_steps, config.num_steps)
+    if warmup_steps > 0 and step < warmup_steps:
+        warmup_fraction = (step + 1) / warmup_steps
+        return config.min_learning_rate + warmup_fraction * (
+            config.learning_rate - config.min_learning_rate
+        )
+
+    if config.num_steps <= warmup_steps + 1:
+        return config.learning_rate
+
+    anneal_progress = (step - warmup_steps) / (config.num_steps - warmup_steps - 1)
+    anneal_progress = min(max(anneal_progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * anneal_progress))
+    return config.min_learning_rate + cosine * (
+        config.learning_rate - config.min_learning_rate
+    )
 
 
 def load_supervised_cases(dataset_path: str) -> OptimizedCases:
@@ -492,6 +527,12 @@ def train_supervised_refiner(
         raise ValueError("log_every_steps must be positive")
     if train_config.max_grad_norm <= 0.0:
         raise ValueError("max_grad_norm must be positive")
+    if train_config.warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    if train_config.min_learning_rate < 0.0:
+        raise ValueError("min_learning_rate must be non-negative")
+    if train_config.min_learning_rate > train_config.learning_rate:
+        raise ValueError("min_learning_rate must be <= learning_rate")
 
     dataset_cases = optimized_cases.raw_structures.batch_size
     steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
@@ -513,7 +554,9 @@ def train_supervised_refiner(
     writer = SummaryWriter(log_dir=train_config.logdir)
     print(
         f"training started dataset_cases={dataset_cases} batch_size={train_config.batch_size} "
-        f"steps_per_epoch={steps_per_epoch} device={device}",
+        f"steps_per_epoch={steps_per_epoch} device={device} "
+        f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
+        f"min_learning_rate={train_config.min_learning_rate}",
         flush=True,
     )
     try:
@@ -528,6 +571,9 @@ def train_supervised_refiner(
             ):
                 minibatch_cases = minibatch_cases.to(device)
                 difficulty = _difficulty_fraction(step, train_config.num_steps)
+                learning_rate = _scheduled_learning_rate(step, train_config)
+                for parameter_group in optimizer.param_groups:
+                    parameter_group["lr"] = learning_rate
                 batch = make_supervised_batch(
                     optimized_cases=minibatch_cases,
                     curriculum=curriculum,
@@ -564,6 +610,7 @@ def train_supervised_refiner(
                 writer.add_scalar(
                     "train/flow_time_mean", float(batch.flow_times.mean().item()), step
                 )
+                writer.add_scalar("train/learning_rate", learning_rate, step)
                 writer.add_scalar("train/grad_norm", grad_norm, step)
                 writer.add_scalar("train/clip_ratio", clip_ratio, step)
                 writer.add_scalar("train/clipped", float(clipped), step)
@@ -576,6 +623,7 @@ def train_supervised_refiner(
                         f"train step={step + 1}/{train_config.num_steps} "
                         f"batch_cases={minibatch_cases.raw_structures.batch_size} "
                         f"examples_seen={examples_seen} difficulty={difficulty:.3f} "
+                        f"learning_rate={learning_rate:.8f} "
                         f"loss_total={history['total'][-1]:.6f} "
                         f"loss_position={history['position'][-1]:.6f} "
                         f"loss_adjacency={history['adjacency'][-1]:.6f} "

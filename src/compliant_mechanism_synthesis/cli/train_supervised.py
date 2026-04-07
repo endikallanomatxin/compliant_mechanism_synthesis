@@ -21,6 +21,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-every-steps", type=int, default=defaults.log_every_steps)
     parser.add_argument("--num-steps", type=int, default=defaults.num_steps)
     parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
+    parser.add_argument("--warmup-steps", type=int, default=defaults.warmup_steps)
+    parser.add_argument(
+        "--min-learning-rate", type=float, default=defaults.min_learning_rate
+    )
     parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
     parser.add_argument("--logdir", default=defaults.logdir)
     parser.add_argument("--name", "-n", default="supervised")
@@ -39,6 +43,8 @@ def train_supervised_main(argv: list[str] | None = None) -> None:
             log_every_steps=args.log_every_steps,
             num_steps=args.num_steps,
             learning_rate=args.learning_rate,
+            warmup_steps=args.warmup_steps,
+            min_learning_rate=args.min_learning_rate,
             checkpoint_path=args.checkpoint_path,
             logdir=str(logdir_path),
         )

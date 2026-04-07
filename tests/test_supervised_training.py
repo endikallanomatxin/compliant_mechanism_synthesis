@@ -22,6 +22,7 @@ from compliant_mechanism_synthesis.training import (
     load_supervised_cases,
     train_supervised_refiner,
 )
+from compliant_mechanism_synthesis.training.supervised import _scheduled_learning_rate
 
 
 def _build_cases(tmp_path: Path):
@@ -66,6 +67,23 @@ def test_supervised_refiner_preserves_structure_shapes(tmp_path: Path) -> None:
 
     assert prediction.positions.shape == cases.raw_structures.positions.shape
     assert prediction.adjacency.shape == cases.raw_structures.adjacency.shape
+
+
+def test_scheduled_learning_rate_warms_up_then_cosine_decays() -> None:
+    config = SupervisedTrainingConfig(
+        dataset_path="dataset.pt",
+        num_steps=10,
+        learning_rate=1e-3,
+        warmup_steps=2,
+        min_learning_rate=1e-4,
+    )
+
+    learning_rates = [_scheduled_learning_rate(step, config) for step in range(10)]
+
+    assert learning_rates[0] < learning_rates[1]
+    assert learning_rates[1] == config.learning_rate
+    assert learning_rates[-1] == config.min_learning_rate
+    assert learning_rates[2] > learning_rates[5] > learning_rates[8]
 
 
 def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
