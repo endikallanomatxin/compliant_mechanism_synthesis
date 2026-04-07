@@ -289,8 +289,10 @@ def _reduction_transform(
 
     if free_count > 0:
         free_slots = torch.arange(free_count, device=positions.device)
-        for dof in range(6):
-            transform[:, 6 * free_indices + dof, 6 * free_slots + dof] = 1.0
+        dof_offsets = torch.arange(6, device=positions.device)
+        free_rows = (6 * free_indices[:, None] + dof_offsets[None, :]).reshape(-1)
+        free_cols = (6 * free_slots[:, None] + dof_offsets[None, :]).reshape(-1)
+        transform[:, free_rows, free_cols] = 1.0
 
     mobile_positions = (
         positions[:, mobile_indices] if mobile_indices.numel() else positions[:, :0]
@@ -313,11 +315,21 @@ def _reduction_transform(
         3, device=positions.device, dtype=positions.dtype
     )
 
-    for local_node, node_index in enumerate(mobile_indices.tolist()):
-        start = 6 * node_index
-        transform[:, start : start + 6, rigid_base : rigid_base + 6] = rigid_map[
-            :, local_node
+    mobile_count = mobile_indices.numel()
+    if mobile_count > 0:
+        batch_index = torch.arange(batch_size, device=positions.device)[
+            :, None, None, None
         ]
+        mobile_rows = (
+            6 * mobile_indices[:, None]
+            + torch.arange(6, device=positions.device)[None, :]
+        )
+        rigid_cols = rigid_base + torch.arange(6, device=positions.device)
+        transform[
+            batch_index,
+            mobile_rows[None, :, :, None],
+            rigid_cols[None, None, None, :],
+        ] = rigid_map
 
     return transform, free_count
 
