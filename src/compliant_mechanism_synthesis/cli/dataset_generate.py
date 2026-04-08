@@ -112,16 +112,16 @@ def _run_sample_check(args: argparse.Namespace) -> None:
         config=optimization,
         logdir=output_dir / "tensorboard_cases",
     )
-    _dump_sample_figures(result, output_dir)
+    _dump_sample_figures(initial_structures, result, output_dir)
     print(f"initial_loss={float(result.initial_loss[0].item()):.6f}")
     print(f"best_loss={float(result.best_loss[0].item()):.6f}")
 
 
-def _dump_sample_figures(result, output_dir: Path) -> None:
+def _dump_sample_figures(initial_structures, result, output_dir: Path) -> None:
     initial_figure = plot_design_3d(
-        result.raw_structures.positions[0],
-        result.raw_structures.roles[0],
-        result.raw_structures.adjacency[0],
+        initial_structures.positions[0],
+        initial_structures.roles[0],
+        initial_structures.adjacency[0],
         title="initial",
     )
     optimized_figure = plot_design_3d(

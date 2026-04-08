@@ -34,9 +34,6 @@ def write_dataset_visualizations(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    initial_positions = optimized_cases.raw_structures.positions
-    initial_roles = optimized_cases.raw_structures.roles
-    initial_adjacency = optimized_cases.raw_structures.adjacency
     optimized_positions = optimized_cases.optimized_structures.positions
     optimized_roles = optimized_cases.optimized_structures.roles
     optimized_adjacency = optimized_cases.optimized_structures.adjacency
@@ -48,7 +45,7 @@ def write_dataset_visualizations(
         raise ValueError("dataset visualizations require scaffold metadata")
 
     improvement = _loss_improvement(initial_loss, best_loss)
-    total_cases = int(initial_positions.shape[0])
+    total_cases = int(optimized_positions.shape[0])
     if case_indices is None:
         case_indices = list(range(min(total_cases, max_cases)))
     else:
@@ -76,11 +73,11 @@ def write_dataset_visualizations(
             primitive_labels=CHAIN_PRIMITIVE_LIBRARY,
             title=f"{title_prefix}_primitives",
         )
-        initial_figure = plot_design_3d(
-            initial_positions[case_index],
-            initial_roles[case_index],
-            initial_adjacency[case_index],
-            title=f"{title_prefix}_initial",
+        scaffold_figure = plot_design_3d(
+            scaffolds.positions[case_index],
+            scaffolds.roles[case_index],
+            scaffolds.adjacency[case_index],
+            title=f"{title_prefix}_scaffold",
         )
         optimized_figure = plot_design_3d(
             optimized_positions[case_index],
@@ -91,14 +88,14 @@ def write_dataset_visualizations(
         primitives_figure.savefig(
             output_path / f"{title_prefix}_primitives.png", dpi=160, bbox_inches="tight"
         )
-        initial_figure.savefig(
-            output_path / f"{title_prefix}_initial.png", dpi=160, bbox_inches="tight"
+        scaffold_figure.savefig(
+            output_path / f"{title_prefix}_scaffold.png", dpi=160, bbox_inches="tight"
         )
         optimized_figure.savefig(
             output_path / f"{title_prefix}_optimized.png", dpi=160, bbox_inches="tight"
         )
         plt.close(primitives_figure)
-        plt.close(initial_figure)
+        plt.close(scaffold_figure)
         plt.close(optimized_figure)
 
         summary_lines.extend(

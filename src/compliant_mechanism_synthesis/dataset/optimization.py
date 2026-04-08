@@ -360,11 +360,6 @@ def optimize_cases(
     )
     best_breakdown = _loss_breakdown(best_structures, target_stiffness, config)
     result = OptimizedCases(
-        raw_structures=Structures(
-            positions=initial_structures.positions.detach().cpu().clone(),
-            roles=initial_structures.roles.detach().cpu().clone(),
-            adjacency=initial_structures.adjacency.detach().cpu().clone(),
-        ),
         target_stiffness=target_stiffness.detach().cpu().clone(),
         optimized_structures=best_structures,
         initial_loss=initial_loss.detach().cpu(),

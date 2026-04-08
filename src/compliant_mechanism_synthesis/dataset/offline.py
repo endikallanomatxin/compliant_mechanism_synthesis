@@ -135,9 +135,6 @@ def _concatenate_optimized_case_batches(
     scaffold_batches: list[Scaffolds],
 ) -> OptimizedCases:
     return OptimizedCases(
-        raw_structures=_concatenate_structures(
-            [batch.raw_structures for batch in optimized_batches]
-        ),
         target_stiffness=torch.cat(
             [batch.target_stiffness for batch in optimized_batches], dim=0
         ),
@@ -270,7 +267,7 @@ def generate_offline_dataset(
         else output_path.parent / f"{output_path.stem}_preview"
     )
     preview_case_indices = _sample_preview_case_indices(
-        num_cases=optimized_cases.raw_structures.batch_size,
+        num_cases=optimized_cases.optimized_structures.batch_size,
         preview_case_number=config.preview_case_number,
         seed=config.seed,
     )
@@ -299,11 +296,6 @@ def load_offline_dataset(
 ) -> tuple[OptimizedCases, OfflineDatasetConfig]:
     payload = torch.load(Path(path), map_location="cpu")
     optimized_cases = OptimizedCases(
-        raw_structures=Structures(
-            positions=payload["raw_structures"]["positions"],
-            roles=payload["raw_structures"]["roles"],
-            adjacency=payload["raw_structures"]["adjacency"],
-        ),
         target_stiffness=payload["target_stiffness"],
         optimized_structures=Structures(
             positions=payload["optimized_structures"]["positions"],
@@ -350,11 +342,6 @@ def _serialize_optimized_cases(
         )
     serialized = optimized_cases.to("cpu")
     return {
-        "raw_structures": {
-            "positions": serialized.raw_structures.positions,
-            "roles": serialized.raw_structures.roles,
-            "adjacency": serialized.raw_structures.adjacency,
-        },
         "target_stiffness": serialized.target_stiffness,
         "optimized_structures": {
             "positions": serialized.optimized_structures.positions,

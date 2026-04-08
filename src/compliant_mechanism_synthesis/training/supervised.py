@@ -37,10 +37,10 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 
 @dataclass(frozen=True)
 class CurriculumConfig:
+    # Blend factor between the optimized oracle and a Gaussian structure-noise
+    # sample drawn from dataset statistics in normalized design space.
     initial_mix: float = 0.15
     final_mix: float = 1.0
-    position_noise: float = 0.008
-    adjacency_noise: float = 0.04
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,27 @@ def load_supervised_cases(dataset_path: str) -> OptimizedCases:
     return optimized_cases
 
 
+def _dataset_position_statistics(
+    optimized_cases: OptimizedCases,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    positions = optimized_cases.optimized_structures.positions
+    mean = positions.mean(dim=0, keepdim=True)
+    std = positions.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-3)
+    return mean, std
+
+
+def _dataset_adjacency_statistics(
+    optimized_cases: OptimizedCases,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    adjacency = optimized_cases.optimized_structures.adjacency
+    mean = adjacency.mean(dim=0, keepdim=True)
+    std = adjacency.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-3)
+    diagonal = torch.arange(adjacency.shape[1], device=adjacency.device)
+    mean[:, diagonal, diagonal] = 0.0
+    std[:, diagonal, diagonal] = 1e-3
+    return mean, std
+
+
 def sample_noisy_structures(
     optimized_cases: OptimizedCases,
     curriculum: CurriculumConfig,
@@ -150,55 +171,44 @@ def sample_noisy_structures(
         curriculum.final_mix - curriculum.initial_mix
     )
 
-    base_positions = optimized_cases.optimized_structures.positions + mix * (
-        optimized_cases.raw_structures.positions
-        - optimized_cases.optimized_structures.positions
-    )
-    base_adjacency = optimized_cases.optimized_structures.adjacency + mix * (
-        optimized_cases.raw_structures.adjacency
-        - optimized_cases.optimized_structures.adjacency
-    )
-
+    oracle_positions = optimized_cases.optimized_structures.positions
+    oracle_adjacency = optimized_cases.optimized_structures.adjacency
     generator = None
     if seed is not None:
-        generator = torch.Generator(device=base_positions.device).manual_seed(seed)
-
-    position_noise = (
-        curriculum.position_noise
-        * difficulty
-        * torch.randn(
-            base_positions.shape,
-            generator=generator,
-            device=base_positions.device,
-            dtype=base_positions.dtype,
-        )
+        generator = torch.Generator(device=oracle_positions.device).manual_seed(seed)
+    position_mean, position_std = _dataset_position_statistics(optimized_cases)
+    adjacency_mean, adjacency_std = _dataset_adjacency_statistics(optimized_cases)
+    sampled_positions = position_mean + position_std * torch.randn(
+        oracle_positions.shape,
+        generator=generator,
+        device=oracle_positions.device,
+        dtype=oracle_positions.dtype,
     )
-    adjacency_noise = (
-        curriculum.adjacency_noise
-        * difficulty
-        * torch.randn(
-            base_adjacency.shape,
-            generator=generator,
-            device=base_adjacency.device,
-            dtype=base_adjacency.dtype,
-        )
+    sampled_adjacency = adjacency_mean + adjacency_std * torch.randn(
+        oracle_adjacency.shape,
+        generator=generator,
+        device=oracle_adjacency.device,
+        dtype=oracle_adjacency.dtype,
     )
-
-    noisy_positions = (base_positions + position_noise).clamp(0.0, 1.0)
+    noisy_positions = torch.lerp(oracle_positions, sampled_positions, mix).clamp(
+        0.0, 1.0
+    )
     noisy_adjacency = enforce_role_adjacency_constraints(
-        symmetrize_matrix((base_adjacency + adjacency_noise).clamp(0.0, 1.0)),
-        optimized_cases.raw_structures.roles,
+        symmetrize_matrix(
+            torch.lerp(oracle_adjacency, sampled_adjacency, mix).clamp(0.0, 1.0)
+        ),
+        optimized_cases.optimized_structures.roles,
     )
 
-    _, _, free_mask = role_masks(optimized_cases.raw_structures.roles)
+    _, _, free_mask = role_masks(optimized_cases.optimized_structures.roles)
     free_mask = free_mask.unsqueeze(-1).to(dtype=noisy_positions.dtype)
     noisy_positions = (
-        optimized_cases.raw_structures.positions * (1.0 - free_mask)
+        optimized_cases.optimized_structures.positions * (1.0 - free_mask)
         + noisy_positions * free_mask
     )
     structures = Structures(
         positions=noisy_positions,
-        roles=optimized_cases.raw_structures.roles,
+        roles=optimized_cases.optimized_structures.roles,
         adjacency=noisy_adjacency,
     )
     structures.validate()
@@ -281,7 +291,7 @@ def make_supervised_batch(
             device=source_structures.positions.device
         ).manual_seed(seed + 10_000)
     flow_times = torch.rand(
-        (optimized_cases.raw_structures.batch_size,),
+        (optimized_cases.optimized_structures.batch_size,),
         generator=generator,
         device=source_structures.positions.device,
         dtype=source_structures.positions.dtype,
@@ -351,9 +361,9 @@ def iter_supervised_batches(
     optimized_cases.validate()
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    index_device = optimized_cases.raw_structures.positions.device
+    index_device = optimized_cases.optimized_structures.positions.device
     indices = torch.arange(
-        optimized_cases.raw_structures.batch_size,
+        optimized_cases.optimized_structures.batch_size,
         device=index_device,
         dtype=torch.long,
     )
@@ -509,7 +519,7 @@ def train_supervised_refiner(
     if train_config.min_learning_rate > train_config.learning_rate:
         raise ValueError("min_learning_rate must be <= learning_rate")
 
-    dataset_cases = optimized_cases.raw_structures.batch_size
+    dataset_cases = optimized_cases.optimized_structures.batch_size
     steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
     model = SupervisedRefiner(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
@@ -623,14 +633,14 @@ def train_supervised_refiner(
                 writer.add_scalar("train/gradients/grad_norm", grad_norm, step)
                 writer.add_scalar("train/gradients/clip_ratio", clip_ratio, step)
                 writer.add_scalar("train/gradients/clipped", float(clipped), step)
-                examples_seen += batch_cases.raw_structures.batch_size
+                examples_seen += batch_cases.optimized_structures.batch_size
                 if (
                     step % train_config.log_every_steps == 0
                     or step == train_config.num_steps - 1
                 ):
                     print(
                         f"train step={step + 1}/{train_config.num_steps} "
-                        f"batch_cases={batch_cases.raw_structures.batch_size} "
+                        f"batch_cases={batch_cases.optimized_structures.batch_size} "
                         f"examples_seen={examples_seen} difficulty={difficulty:.3f} "
                         f"learning_rate={learning_rate:.8f} "
                         f"loss_total={history['total_loss'][-1]:.6f} "

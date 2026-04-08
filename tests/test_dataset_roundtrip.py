@@ -27,10 +27,6 @@ def test_offline_dataset_roundtrip_preserves_shapes(tmp_path: Path) -> None:
     loaded_cases, _ = load_offline_dataset(path)
 
     assert (
-        loaded_cases.raw_structures.positions.shape
-        == generated.raw_structures.positions.shape
-    )
-    assert (
         loaded_cases.optimized_structures.adjacency.shape
         == generated.optimized_structures.adjacency.shape
     )

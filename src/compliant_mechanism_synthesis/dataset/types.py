@@ -272,7 +272,6 @@ class Analyses:
 
 @dataclass(frozen=True)
 class OptimizedCases:
-    raw_structures: Structures
     target_stiffness: torch.Tensor
     optimized_structures: Structures
     initial_loss: torch.Tensor
@@ -282,7 +281,6 @@ class OptimizedCases:
 
     def to(self, device: torch.device | str) -> OptimizedCases:
         return OptimizedCases(
-            raw_structures=self.raw_structures.to(device),
             target_stiffness=self.target_stiffness.to(device),
             optimized_structures=self.optimized_structures.to(device),
             initial_loss=self.initial_loss.to(device),
@@ -293,7 +291,6 @@ class OptimizedCases:
 
     def index_select(self, batch_indices: torch.Tensor) -> OptimizedCases:
         return OptimizedCases(
-            raw_structures=self.raw_structures.index_select(batch_indices),
             target_stiffness=self.target_stiffness.index_select(0, batch_indices),
             optimized_structures=self.optimized_structures.index_select(batch_indices),
             initial_loss=self.initial_loss.index_select(0, batch_indices),
@@ -307,9 +304,8 @@ class OptimizedCases:
         )
 
     def validate(self) -> None:
-        self.raw_structures.validate()
         self.optimized_structures.validate()
-        batch_size = self.raw_structures.batch_size
+        batch_size = self.optimized_structures.batch_size
         _require_rank("target_stiffness", self.target_stiffness, 3)
         if self.target_stiffness.shape != (batch_size, 6, 6):
             raise ValueError("target_stiffness must have shape [batch, 6, 6]")
@@ -326,7 +322,6 @@ class OptimizedCases:
 
     def slice(self, index: int) -> OptimizedCases:
         return OptimizedCases(
-            raw_structures=self.raw_structures.slice(index),
             target_stiffness=self.target_stiffness[index : index + 1],
             optimized_structures=self.optimized_structures.slice(index),
             initial_loss=self.initial_loss[index : index + 1],

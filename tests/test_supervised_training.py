@@ -60,7 +60,7 @@ def test_supervised_refiner_preserves_structure_shapes(tmp_path: Path) -> None:
         )
     )
     prediction = model(
-        cases.raw_structures,
+        cases.optimized_structures,
         cases.target_stiffness,
         analysis_fn=analyze_structures,
         num_steps=2,
@@ -68,8 +68,8 @@ def test_supervised_refiner_preserves_structure_shapes(tmp_path: Path) -> None:
         style_analyses=cases.last_analyses,
     )
 
-    assert prediction.positions.shape == cases.raw_structures.positions.shape
-    assert prediction.adjacency.shape == cases.raw_structures.adjacency.shape
+    assert prediction.positions.shape == cases.optimized_structures.positions.shape
+    assert prediction.adjacency.shape == cases.optimized_structures.adjacency.shape
 
 
 def test_scheduled_learning_rate_warms_up_then_cosine_decays() -> None:

@@ -19,6 +19,7 @@ from compliant_mechanism_synthesis.training import (
     iter_supervised_batches,
     load_supervised_cases,
     make_supervised_batch,
+    sample_noisy_structures,
     select_batch,
 )
 
@@ -49,19 +50,19 @@ def test_make_supervised_batch_returns_noisy_structures(tmp_path: Path) -> None:
 
     assert (
         batch.noisy_structures.positions.shape
-        == optimized_cases.raw_structures.positions.shape
+        == optimized_cases.optimized_structures.positions.shape
     )
     assert batch.target_stiffness.shape == optimized_cases.target_stiffness.shape
     assert batch.current_analyses.nodal_displacements is not None
     assert batch.current_analyses.nodal_displacements.shape[:2] == (
-        optimized_cases.raw_structures.batch_size,
-        optimized_cases.raw_structures.positions.shape[1],
+        optimized_cases.optimized_structures.batch_size,
+        optimized_cases.optimized_structures.positions.shape[1],
     )
     assert batch.current_analyses.edge_von_mises is not None
     assert batch.current_analyses.edge_von_mises.shape[:3] == (
-        optimized_cases.raw_structures.batch_size,
-        optimized_cases.raw_structures.positions.shape[1],
-        optimized_cases.raw_structures.positions.shape[1],
+        optimized_cases.optimized_structures.batch_size,
+        optimized_cases.optimized_structures.positions.shape[1],
+        optimized_cases.optimized_structures.positions.shape[1],
     )
     assert not torch.allclose(
         batch.noisy_structures.positions, batch.oracle_structures.positions
@@ -76,6 +77,38 @@ def test_make_supervised_batch_returns_noisy_structures(tmp_path: Path) -> None:
     )
 
 
+def test_sample_noisy_structures_is_seeded_gaussian_from_dataset_stats(
+    tmp_path: Path,
+) -> None:
+    _, optimized_cases = _build_cases(tmp_path)
+    curriculum = CurriculumConfig(initial_mix=0.25, final_mix=0.75)
+    structures_a = sample_noisy_structures(
+        optimized_cases=optimized_cases,
+        curriculum=curriculum,
+        difficulty=1.0,
+        seed=7,
+    )
+    structures_b = sample_noisy_structures(
+        optimized_cases=optimized_cases,
+        curriculum=curriculum,
+        difficulty=1.0,
+        seed=7,
+    )
+    structures_c = sample_noisy_structures(
+        optimized_cases=optimized_cases,
+        curriculum=curriculum,
+        difficulty=1.0,
+        seed=8,
+    )
+
+    assert torch.allclose(structures_a.positions, structures_b.positions)
+    assert torch.allclose(structures_a.adjacency, structures_b.adjacency)
+    assert not torch.allclose(structures_a.positions, structures_c.positions)
+    assert not torch.allclose(
+        structures_a.positions, optimized_cases.optimized_structures.positions
+    )
+
+
 def test_iter_supervised_batches_covers_all_cases(tmp_path: Path) -> None:
     _, optimized_cases = _build_cases(tmp_path)
     batches = list(
@@ -83,7 +116,7 @@ def test_iter_supervised_batches_covers_all_cases(tmp_path: Path) -> None:
     )
 
     assert len(batches) == 2
-    assert sum(batch.raw_structures.batch_size for batch in batches) == 3
+    assert sum(batch.optimized_structures.batch_size for batch in batches) == 3
 
 
 def test_evaluate_refinement_step_compares_noisy_refined_and_oracle(
@@ -95,7 +128,8 @@ def test_evaluate_refinement_step_compares_noisy_refined_and_oracle(
         noisy_structures: Structures, _target_stiffness: torch.Tensor
     ) -> Structures:
         return select_batch(
-            optimized_cases, torch.arange(optimized_cases.raw_structures.batch_size)
+            optimized_cases,
+            torch.arange(optimized_cases.optimized_structures.batch_size),
         ).optimized_structures
 
     metrics = evaluate_refinement_step(
