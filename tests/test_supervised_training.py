@@ -266,3 +266,40 @@ def test_predict_flow_ignores_style_inputs_when_style_token_disabled(
 
     assert prediction.position_velocity.shape == batch.target_position_velocity.shape
     assert prediction.adjacency_velocity.shape == batch.target_adjacency_velocity.shape
+
+
+def test_predict_flow_stabilizes_large_mechanics_inputs(tmp_path: Path) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            latent_dim=32,
+            num_attention_layers=3,
+            num_heads=4,
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        curriculum=CurriculumConfig(),
+        difficulty=0.5,
+        seed=17,
+    )
+    huge_displacements = torch.full_like(
+        batch.current_analyses.nodal_displacements, 1e25
+    )
+    huge_stresses = torch.full_like(batch.current_analyses.edge_von_mises, 1e30)
+
+    prediction = model.predict_flow(
+        structures=batch.flow_structures,
+        target_stiffness=batch.target_stiffness,
+        current_stiffness=batch.current_analyses.generalized_stiffness,
+        nodal_displacements=huge_displacements,
+        edge_von_mises=huge_stresses,
+        flow_times=batch.flow_times,
+        position_noise_levels=batch.position_noise_levels,
+        adjacency_noise_levels=batch.adjacency_noise_levels,
+        style_structures=batch.oracle_structures,
+    )
+
+    assert torch.isfinite(prediction.position_velocity).all()
+    assert torch.isfinite(prediction.adjacency_velocity).all()

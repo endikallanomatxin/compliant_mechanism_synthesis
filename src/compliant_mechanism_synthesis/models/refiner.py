@@ -29,6 +29,11 @@ def sinusoidal_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
     return embedding
 
 
+def _signed_log1p_features(values: torch.Tensor) -> torch.Tensor:
+    safe_values = torch.nan_to_num(values, nan=0.0, posinf=1e30, neginf=-1e30)
+    return torch.sign(safe_values) * torch.log1p(safe_values.abs())
+
+
 @dataclass(frozen=True)
 class FlowPrediction:
     position_velocity: torch.Tensor
@@ -369,12 +374,16 @@ class SupervisedRefiner(nn.Module):
         )
         residual_stiffness = target_stiffness - current_stiffness
         hidden = self.position_mlp(positions) + self.nodal_displacement_mlp(
-            nodal_displacements
+            _signed_log1p_features(nodal_displacements)
         )
         hidden = hidden + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
         edge_stress_conditioning = self.edge_von_mises_mlp(
-            torch.log1p(edge_von_mises.clamp_min(0.0))
+            torch.log1p(
+                torch.nan_to_num(
+                    edge_von_mises, nan=0.0, posinf=1e30, neginf=0.0
+                ).clamp_min(0.0)
+            )
         ).permute(0, 3, 1, 2)
 
         mechanics_features = torch.cat(
