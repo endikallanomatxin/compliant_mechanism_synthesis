@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from compliant_mechanism_synthesis.dataset import (
@@ -63,6 +64,7 @@ def test_supervised_refiner_preserves_structure_shapes(tmp_path: Path) -> None:
         cases.target_stiffness,
         analysis_fn=analyze_structures,
         num_steps=2,
+        style_structures=cases.optimized_structures,
     )
 
     assert prediction.positions.shape == cases.raw_structures.positions.shape
@@ -132,6 +134,7 @@ def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) 
         flow_times=batch.flow_times,
         position_noise_levels=batch.position_noise_levels,
         adjacency_noise_levels=batch.adjacency_noise_levels,
+        style_structures=batch.oracle_structures,
     )
     trained, _ = train_supervised_refiner(
         optimized_cases=cases,
@@ -154,6 +157,7 @@ def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) 
         flow_times=batch.flow_times,
         position_noise_levels=batch.position_noise_levels,
         adjacency_noise_levels=batch.adjacency_noise_levels,
+        style_structures=batch.oracle_structures,
     )
 
     baseline_position_error = (
@@ -182,3 +186,75 @@ def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) 
         < baseline_position_error + baseline_adjacency_error
     )
     assert trained_adjacency_error < baseline_adjacency_error
+
+
+def test_predict_flow_rejects_mismatched_style_roles(tmp_path: Path) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=4
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        curriculum=CurriculumConfig(),
+        difficulty=0.5,
+        seed=11,
+    )
+    mismatched_roles = batch.oracle_structures.roles.clone()
+    mismatched_roles[:, 0] = mismatched_roles[:, 1]
+
+    with pytest.raises(ValueError, match="same node roles"):
+        model.predict_flow(
+            structures=batch.flow_structures,
+            target_stiffness=batch.target_stiffness,
+            current_stiffness=batch.current_analyses.generalized_stiffness,
+            flow_times=batch.flow_times,
+            position_noise_levels=batch.position_noise_levels,
+            adjacency_noise_levels=batch.adjacency_noise_levels,
+            style_structures=type(batch.oracle_structures)(
+                positions=batch.oracle_structures.positions,
+                roles=mismatched_roles,
+                adjacency=batch.oracle_structures.adjacency,
+            ),
+        )
+
+
+def test_predict_flow_ignores_style_inputs_when_style_token_disabled(
+    tmp_path: Path,
+) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            latent_dim=32,
+            num_attention_layers=3,
+            num_heads=4,
+            use_style_token=False,
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        curriculum=CurriculumConfig(),
+        difficulty=0.5,
+        seed=13,
+    )
+    mismatched_roles = batch.oracle_structures.roles.clone()
+    mismatched_roles[:, 0] = mismatched_roles[:, 1]
+
+    prediction = model.predict_flow(
+        structures=batch.flow_structures,
+        target_stiffness=batch.target_stiffness,
+        current_stiffness=batch.current_analyses.generalized_stiffness,
+        flow_times=batch.flow_times,
+        position_noise_levels=batch.position_noise_levels,
+        adjacency_noise_levels=batch.adjacency_noise_levels,
+        style_structures=type(batch.oracle_structures)(
+            positions=batch.oracle_structures.positions,
+            roles=mismatched_roles,
+            adjacency=batch.oracle_structures.adjacency,
+        ),
+    )
+
+    assert prediction.position_velocity.shape == batch.target_position_velocity.shape
+    assert prediction.adjacency_velocity.shape == batch.target_adjacency_velocity.shape

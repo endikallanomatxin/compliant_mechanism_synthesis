@@ -39,6 +39,7 @@ def evaluate_refinement_step(
             batch.noisy_structures,
             batch.target_stiffness,
             analysis_fn=analyze_structures,
+            style_structures=batch.oracle_structures,
         )
     else:
         refined_structures = refiner(batch.noisy_structures, batch.target_stiffness)

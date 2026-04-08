@@ -55,6 +55,14 @@ def test_make_supervised_batch_returns_noisy_structures(tmp_path: Path) -> None:
     assert not torch.allclose(
         batch.noisy_structures.positions, batch.oracle_structures.positions
     )
+    assert torch.allclose(
+        batch.target_position_velocity,
+        batch.oracle_structures.positions - batch.flow_structures.positions,
+    )
+    assert torch.allclose(
+        batch.target_adjacency_velocity,
+        batch.oracle_structures.adjacency - batch.flow_structures.adjacency,
+    )
 
 
 def test_iter_supervised_batches_covers_all_cases(tmp_path: Path) -> None:

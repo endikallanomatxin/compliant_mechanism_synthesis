@@ -9,6 +9,7 @@ from compliant_mechanism_synthesis.cli import (
 )
 from compliant_mechanism_synthesis.dataset import load_offline_dataset
 import pytest
+import torch
 
 
 def test_dataset_generate_main_generates_offline_dataset_and_preview(
@@ -277,3 +278,46 @@ def test_train_supervised_main_writes_default_checkpoint_inside_run_dir(
     assert len(run_dirs) == 1
     assert run_dirs[0].name.endswith("-testrun")
     assert (run_dirs[0] / "refiner.pt").exists()
+
+
+def test_train_supervised_main_can_disable_style_token(tmp_path: Path) -> None:
+    output_path = tmp_path / "dataset.pt"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_dataset"),
+        ]
+    )
+
+    checkpoint_path = tmp_path / "refiner_no_style.pt"
+    train_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--num-steps",
+            "4",
+            "--no-style-token",
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--logdir",
+            str(tmp_path / "runs_supervised_no_style"),
+        ]
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    assert checkpoint["model_config"]["use_style_token"] is False
+    assert checkpoint["train_config"]["use_style_token"] is False

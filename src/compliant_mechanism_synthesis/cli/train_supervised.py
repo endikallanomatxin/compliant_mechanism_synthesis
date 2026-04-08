@@ -15,6 +15,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="cms-train-supervised",
         description="Train the supervised refinement model with flow matching over the offline dataset.",
     )
+    parser.set_defaults(use_style_token=defaults.use_style_token)
     parser.add_argument("--dataset-path", required=True)
     parser.add_argument("--device", default=defaults.device)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
@@ -24,6 +25,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-steps", type=int, default=defaults.warmup_steps)
     parser.add_argument(
         "--min-learning-rate", type=float, default=defaults.min_learning_rate
+    )
+    parser.add_argument(
+        "--no-style-token",
+        dest="use_style_token",
+        action="store_false",
+        help="Disable oracle style-token conditioning during supervised training.",
     )
     parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
     parser.add_argument("--logdir", default=defaults.logdir)
@@ -45,6 +52,7 @@ def train_supervised_main(argv: list[str] | None = None) -> None:
             learning_rate=args.learning_rate,
             warmup_steps=args.warmup_steps,
             min_learning_rate=args.min_learning_rate,
+            use_style_token=args.use_style_token,
             checkpoint_path=args.checkpoint_path,
             logdir=str(logdir_path),
         )

@@ -47,17 +47,18 @@ class CurriculumConfig:
 class SupervisedTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 128
+    batch_size: int = 64
     log_every_steps: int = 10
     max_grad_norm: float = 1.0
-    num_steps: int = 20_000
+    num_steps: int = 4_096
     learning_rate: float = 1e-5
     warmup_steps: int = 500
     min_learning_rate: float = 1e-6
+    use_style_token: bool = True
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.35
     endpoint_loss_weight: float = 0.03
-    stiffness_loss_weight: float = 0.006
+    stiffness_loss_weight: float = 0.0
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
     seed: int = 7
@@ -283,8 +284,9 @@ def make_supervised_batch(
         device=source_structures.positions.device,
         dtype=source_structures.positions.dtype,
     )
-    # Conditional flow matching trains on points along the straight transport
-    # path from the noisy source structure to the optimized oracle.
+    # Sample supervision on points along the straight path from the noisy
+    # source structure to the optimized oracle, but train the model to predict
+    # the residual correction from the current flow state to the oracle.
     interpolation = flow_times[:, None, None]
     flow_positions = torch.lerp(
         source_structures.positions,
@@ -323,9 +325,9 @@ def make_supervised_batch(
         position_noise_levels=position_noise_levels,
         adjacency_noise_levels=adjacency_noise_levels,
         target_position_velocity=optimized_cases.optimized_structures.positions
-        - source_structures.positions,
+        - flow_structures.positions,
         target_adjacency_velocity=optimized_cases.optimized_structures.adjacency
-        - source_structures.adjacency,
+        - flow_structures.adjacency,
     )
 
 
@@ -403,20 +405,18 @@ def _endpoint_loss(
 ) -> tuple[torch.Tensor, Structures]:
     _, _, free_mask = role_masks(batch.flow_structures.roles)
     free_mask = free_mask.unsqueeze(-1).to(dtype=prediction.position_velocity.dtype)
-    remaining = (1.0 - batch.flow_times)[:, None, None]
     estimated_positions = (
-        batch.flow_structures.positions
-        + remaining * prediction.position_velocity * free_mask
+        batch.flow_structures.positions + prediction.position_velocity * free_mask
     ).clamp(0.0, 1.0)
     estimated_adjacency = enforce_role_adjacency_constraints(
-        (
-            batch.flow_structures.adjacency + remaining * prediction.adjacency_velocity
-        ).clamp(0.0, 1.0),
+        (batch.flow_structures.adjacency + prediction.adjacency_velocity).clamp(
+            0.0, 1.0
+        ),
         batch.flow_structures.roles,
     )
-    # This endpoint estimate is an inexpensive consistency term: if the
-    # predicted flow is locally correct, integrating the remaining segment of
-    # the path should land near the optimized structure.
+    # The supervised target is the residual from the current flow state to the
+    # optimized oracle, so a locally correct prediction should land on the
+    # oracle in one step.
     estimated = Structures(
         positions=estimated_positions,
         roles=batch.flow_structures.roles,
@@ -443,12 +443,15 @@ def _training_losses(
     position_error = _position_velocity_loss(prediction, batch)
     adjacency_error = _adjacency_velocity_loss(prediction, batch)
     endpoint_error, estimated = _endpoint_loss(prediction, batch)
-    endpoint_analyses = analyze_structures(estimated, profile=profile)
-    stiffness_error = torch.log1p(
-        generalized_stiffness_error(
-            endpoint_analyses.generalized_stiffness, batch.target_stiffness
+    if config.stiffness_loss_weight > 0.0:
+        endpoint_analyses = analyze_structures(estimated, profile=profile)
+        stiffness_error = torch.log1p(
+            generalized_stiffness_error(
+                endpoint_analyses.generalized_stiffness, batch.target_stiffness
+            )
         )
-    )
+    else:
+        stiffness_error = endpoint_error.new_zeros(endpoint_error.shape)
     loss_contributions = {
         "position_error_loss_contribution": config.position_loss_weight
         * position_error,
@@ -483,8 +486,10 @@ def train_supervised_refiner(
     curriculum: CurriculumConfig | None = None,
 ) -> tuple[SupervisedRefiner, SupervisedTrainingSummary]:
     optimized_cases.validate()
-    model_config = model_config or SupervisedRefinerConfig()
     train_config = train_config or SupervisedTrainingConfig(dataset_path="")
+    model_config = model_config or SupervisedRefinerConfig(
+        use_style_token=train_config.use_style_token
+    )
     curriculum = curriculum or CurriculumConfig()
     device = resolve_torch_device(train_config.device)
 
@@ -523,6 +528,7 @@ def train_supervised_refiner(
     print(
         f"training started dataset_cases={dataset_cases} batch_size={train_config.batch_size} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
+        f"use_style_token={'yes' if model.config.use_style_token else 'no'} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
         f"min_learning_rate={train_config.min_learning_rate}",
         flush=True,
@@ -563,6 +569,11 @@ def train_supervised_refiner(
                     flow_times=batch.flow_times,
                     position_noise_levels=batch.position_noise_levels,
                     adjacency_noise_levels=batch.adjacency_noise_levels,
+                    style_structures=(
+                        batch.oracle_structures
+                        if model.config.use_style_token
+                        else None
+                    ),
                 )
                 _synchronize_device_if_needed(device)
                 forward_time = time.perf_counter()
