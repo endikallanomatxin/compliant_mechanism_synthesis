@@ -578,6 +578,9 @@ def train_supervised_refiner(
                         if model.config.use_style_token
                         else None
                     ),
+                    style_analyses=(
+                        batch.oracle_analyses if model.config.use_style_token else None
+                    ),
                 )
                 _synchronize_device_if_needed(device)
                 forward_time = time.perf_counter()

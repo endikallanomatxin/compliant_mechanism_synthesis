@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from compliant_mechanism_synthesis.dataset.types import Structures
+from compliant_mechanism_synthesis.dataset.types import Analyses, Structures
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.tensor_ops import (
     distance_affinity,
@@ -206,9 +206,34 @@ class StyleTokenEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
         )
+        self.nodal_displacement_mlp = nn.Sequential(
+            nn.Linear(18, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
+        )
+        self.edge_von_mises_mlp = nn.Sequential(
+            nn.Linear(6, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, config.num_heads),
+        )
         self.role_embedding = nn.Embedding(3, style_hidden_dim)
+        self.mechanics_condition_mlp = nn.Sequential(
+            nn.Linear(63, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
+        )
+        self.time_mlp = nn.Sequential(
+            nn.Linear(style_hidden_dim, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
+        )
+        self.noise_condition_mlp = nn.Sequential(
+            nn.Linear(3, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
+        )
         self.input_norm = nn.LayerNorm(style_hidden_dim)
-        layer_modes = ("distance", "connectivity", "free")
+        layer_modes = ("distance", "connectivity", "stress", "free")
         self.layers = nn.ModuleList(
             [
                 GraphAttentionBlock(
@@ -228,15 +253,63 @@ class StyleTokenEncoder(nn.Module):
         self.dropout = nn.Dropout(config.style_token_dropout)
         self.noise_std = config.style_token_noise_std
 
-    def forward(self, structures: Structures) -> torch.Tensor:
-        hidden = self.position_mlp(structures.positions)
+    def forward(
+        self,
+        structures: Structures,
+        analyses: Analyses,
+        target_stiffness: torch.Tensor,
+        flow_times: torch.Tensor,
+        position_noise_levels: torch.Tensor,
+        adjacency_noise_levels: torch.Tensor,
+    ) -> torch.Tensor:
+        if analyses.nodal_displacements is None:
+            raise ValueError("style analyses must provide nodal_displacements")
+        if analyses.edge_von_mises is None:
+            raise ValueError("style analyses must provide edge_von_mises")
+        hidden = self.position_mlp(structures.positions) + self.nodal_displacement_mlp(
+            _signed_log1p_features(analyses.nodal_displacements)
+        )
         hidden = hidden + self.role_embedding(structures.roles)
         hidden = self.input_norm(hidden)
+        residual_stiffness = target_stiffness - analyses.generalized_stiffness
+        mechanics_features = torch.cat(
+            [
+                symmetric_matrix_unique_values(target_stiffness),
+                symmetric_matrix_unique_values(analyses.generalized_stiffness),
+                symmetric_matrix_unique_values(residual_stiffness),
+            ],
+            dim=1,
+        )
+        hidden = hidden + self.mechanics_condition_mlp(mechanics_features)[:, None, :]
+        hidden = (
+            hidden
+            + self.time_mlp(sinusoidal_embedding(flow_times, self.hidden_dim))[
+                :, None, :
+            ]
+        )
+        noise_features = torch.stack(
+            [flow_times, position_noise_levels, adjacency_noise_levels],
+            dim=1,
+        )
+        hidden = hidden + self.noise_condition_mlp(noise_features)[:, None, :]
+        edge_stress_conditioning = self.edge_von_mises_mlp(
+            torch.log1p(
+                torch.nan_to_num(
+                    analyses.edge_von_mises,
+                    nan=0.0,
+                    posinf=1e30,
+                    neginf=0.0,
+                ).clamp_min(0.0)
+            )
+        ).permute(0, 3, 1, 2)
         for layer in self.layers:
             hidden = layer(
                 hidden,
                 structures.adjacency,
                 structures.positions,
+                edge_head_conditioning=(
+                    edge_stress_conditioning if layer.mode == "stress" else None
+                ),
             )
         hidden = self.final_norm(hidden)
         token = self.token_proj(hidden.mean(dim=1, keepdim=True))
@@ -325,10 +398,13 @@ class SupervisedRefiner(nn.Module):
         position_noise_levels: torch.Tensor,
         adjacency_noise_levels: torch.Tensor,
         style_structures: Structures | None = None,
+        style_analyses: Analyses | None = None,
     ) -> FlowPrediction:
         structures.validate()
         if self.config.use_style_token and style_structures is not None:
             style_structures.validate()
+        if self.config.use_style_token and style_analyses is not None:
+            style_analyses.validate(structures.batch_size)
         if target_stiffness.shape != (structures.batch_size, 6, 6):
             raise ValueError("target_stiffness must have shape [batch, 6, 6]")
         if current_stiffness.shape != (structures.batch_size, 6, 6):
@@ -346,6 +422,12 @@ class SupervisedRefiner(nn.Module):
             6,
         ):
             raise ValueError("edge_von_mises must have shape [batch, nodes, nodes, 6]")
+        if (
+            self.config.use_style_token
+            and style_structures is not None
+            and style_analyses is None
+        ):
+            raise ValueError("style_analyses must be provided with style_structures")
         if (
             self.config.use_style_token
             and style_structures is not None
@@ -414,7 +496,18 @@ class SupervisedRefiner(nn.Module):
         if self.config.use_style_token and style_structures is not None:
             if self.style_token_encoder is None:
                 raise RuntimeError("style token encoder is not initialized")
-            style_context = self.style_token_encoder(style_structures)
+            if style_analyses is None:
+                raise RuntimeError("style analyses are required for style conditioning")
+            style_flow_times = torch.ones_like(flow_times)
+            style_noise = torch.zeros_like(flow_times)
+            style_context = self.style_token_encoder(
+                structures=style_structures,
+                analyses=style_analyses,
+                target_stiffness=target_stiffness,
+                flow_times=style_flow_times,
+                position_noise_levels=style_noise,
+                adjacency_noise_levels=style_noise,
+            )
 
         for layer in self.layers:
             hidden = layer(
@@ -462,13 +555,22 @@ class SupervisedRefiner(nn.Module):
         analysis_fn,
         num_steps: int | None = None,
         style_structures: Structures | None = None,
+        style_analyses: Analyses | None = None,
     ) -> Structures:
         source_structures.validate()
         if self.config.use_style_token and style_structures is not None:
             style_structures.validate()
+        if self.config.use_style_token and style_analyses is not None:
+            style_analyses.validate(source_structures.batch_size)
         num_steps = num_steps or self.config.num_integration_steps
         if num_steps <= 0:
             raise ValueError("num_steps must be positive")
+        if (
+            self.config.use_style_token
+            and style_structures is not None
+            and style_analyses is None
+        ):
+            style_analyses = analysis_fn(style_structures)
         if (
             self.config.use_style_token
             and style_structures is not None
@@ -514,6 +616,7 @@ class SupervisedRefiner(nn.Module):
                 position_noise_levels=remaining * initial_position_gap,
                 adjacency_noise_levels=remaining * initial_adjacency_gap,
                 style_structures=style_structures,
+                style_analyses=style_analyses,
             )
             step_size = 1.0 / num_steps
             positions = (
@@ -540,6 +643,7 @@ class SupervisedRefiner(nn.Module):
         analysis_fn,
         num_steps: int | None = None,
         style_structures: Structures | None = None,
+        style_analyses: Analyses | None = None,
     ) -> Structures:
         return self.rollout(
             source_structures=source_structures,
@@ -547,4 +651,5 @@ class SupervisedRefiner(nn.Module):
             analysis_fn=analysis_fn,
             num_steps=num_steps,
             style_structures=style_structures,
+            style_analyses=style_analyses,
         )
