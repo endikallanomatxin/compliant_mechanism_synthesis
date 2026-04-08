@@ -57,6 +57,12 @@ def test_make_supervised_batch_returns_noisy_structures(tmp_path: Path) -> None:
         optimized_cases.raw_structures.batch_size,
         optimized_cases.raw_structures.positions.shape[1],
     )
+    assert batch.current_analyses.edge_von_mises is not None
+    assert batch.current_analyses.edge_von_mises.shape[:3] == (
+        optimized_cases.raw_structures.batch_size,
+        optimized_cases.raw_structures.positions.shape[1],
+        optimized_cases.raw_structures.positions.shape[1],
+    )
     assert not torch.allclose(
         batch.noisy_structures.positions, batch.oracle_structures.positions
     )

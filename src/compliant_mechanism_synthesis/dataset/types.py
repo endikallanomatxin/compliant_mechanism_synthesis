@@ -182,6 +182,7 @@ class Analyses:
     thick_beam_penalty: torch.Tensor
     free_node_spacing_penalty: torch.Tensor
     nodal_displacements: torch.Tensor | None = None
+    edge_von_mises: torch.Tensor | None = None
 
     def to(self, device: torch.device | str) -> Analyses:
         return Analyses(
@@ -196,6 +197,9 @@ class Analyses:
                 None
                 if self.nodal_displacements is None
                 else self.nodal_displacements.to(device)
+            ),
+            edge_von_mises=(
+                None if self.edge_von_mises is None else self.edge_von_mises.to(device)
             ),
         )
 
@@ -216,6 +220,11 @@ class Analyses:
                 None
                 if self.nodal_displacements is None
                 else self.nodal_displacements.index_select(0, batch_indices)
+            ),
+            edge_von_mises=(
+                None
+                if self.edge_von_mises is None
+                else self.edge_von_mises.index_select(0, batch_indices)
             ),
         )
 
@@ -244,6 +253,20 @@ class Analyses:
             if self.nodal_displacements.shape[2] != 18:
                 raise ValueError(
                     "nodal_displacements must have shape [batch, nodes, 18]"
+                )
+        if self.edge_von_mises is not None:
+            _require_rank("edge_von_mises", self.edge_von_mises, 4)
+            if self.edge_von_mises.shape[0] != batch_size:
+                raise ValueError(
+                    "edge_von_mises must have shape [batch, nodes, nodes, 6]"
+                )
+            if self.edge_von_mises.shape[1] != self.edge_von_mises.shape[2]:
+                raise ValueError(
+                    "edge_von_mises must have shape [batch, nodes, nodes, 6]"
+                )
+            if self.edge_von_mises.shape[3] != 6:
+                raise ValueError(
+                    "edge_von_mises must have shape [batch, nodes, nodes, 6]"
                 )
 
 
@@ -332,6 +355,11 @@ class OptimizedCases:
                     None
                     if self.last_analyses.nodal_displacements is None
                     else self.last_analyses.nodal_displacements[index : index + 1]
+                ),
+                edge_von_mises=(
+                    None
+                    if self.last_analyses.edge_von_mises is None
+                    else self.last_analyses.edge_von_mises[index : index + 1]
                 ),
             ),
             scaffolds=None if self.scaffolds is None else self.scaffolds.slice(index),

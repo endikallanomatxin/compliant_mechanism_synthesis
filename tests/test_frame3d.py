@@ -110,6 +110,9 @@ def test_mechanical_terms_include_nodal_displacements() -> None:
     nodal_displacements = terms["nodal_displacements"]
     assert nodal_displacements.shape == (1, positions.shape[1], 18)
     assert torch.isfinite(nodal_displacements).all()
+    edge_von_mises = terms["edge_von_mises"]
+    assert edge_von_mises.shape == (1, positions.shape[1], positions.shape[1], 6)
+    assert torch.isfinite(edge_von_mises).all()
 
 
 def test_plot_design_3d_returns_a_figure() -> None:

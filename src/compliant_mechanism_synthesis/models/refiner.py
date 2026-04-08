@@ -56,8 +56,8 @@ class GraphAttentionBlock(nn.Module):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
-        if mode not in {"distance", "connectivity", "free"}:
-            raise ValueError("mode must be distance, connectivity, or free")
+        if mode not in {"distance", "connectivity", "stress", "free"}:
+            raise ValueError("mode must be distance, connectivity, stress, or free")
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
@@ -83,6 +83,8 @@ class GraphAttentionBlock(nn.Module):
             return None
         if self.mode == "connectivity":
             return adjacency
+        if self.mode == "stress":
+            return None
         return distance_affinity(positions, length_scale=0.22)
 
     def forward(
@@ -91,6 +93,7 @@ class GraphAttentionBlock(nn.Module):
         adjacency: torch.Tensor,
         positions: torch.Tensor,
         context_tokens: torch.Tensor | None = None,
+        edge_head_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, num_nodes, _ = hidden.shape
         normalized = self.norm1(hidden)
@@ -135,6 +138,25 @@ class GraphAttentionBlock(nn.Module):
             else:
                 conditioning_bias = 2.0 * conditioning - 1.0
             logits = logits + conditioning_bias[:, None, :, :]
+
+        if edge_head_conditioning is not None:
+            if context_tokens is not None:
+                context_count = context_tokens.shape[1]
+                edge_head_conditioning = torch.cat(
+                    [
+                        edge_head_conditioning,
+                        torch.zeros(
+                            batch,
+                            self.num_heads,
+                            num_nodes,
+                            context_count,
+                            device=edge_head_conditioning.device,
+                            dtype=edge_head_conditioning.dtype,
+                        ),
+                    ],
+                    dim=-1,
+                )
+            logits = logits + edge_head_conditioning
 
         weights = torch.softmax(logits, dim=-1)
         if conditioning is not None:
@@ -233,6 +255,11 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
+        self.edge_von_mises_mlp = nn.Sequential(
+            nn.Linear(6, self.config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.num_heads),
+        )
         self.role_embedding = nn.Embedding(3, self.config.hidden_dim)
         self.mechanics_condition_mlp = nn.Sequential(
             nn.Linear(63, self.config.hidden_dim),
@@ -253,7 +280,7 @@ class SupervisedRefiner(nn.Module):
             StyleTokenEncoder(self.config) if self.config.use_style_token else None
         )
         self.input_norm = nn.LayerNorm(self.config.hidden_dim)
-        layer_modes = ("distance", "connectivity", "free")
+        layer_modes = ("distance", "connectivity", "stress", "free")
         self.layers = nn.ModuleList(
             [
                 GraphAttentionBlock(
@@ -284,6 +311,7 @@ class SupervisedRefiner(nn.Module):
         target_stiffness: torch.Tensor,
         current_stiffness: torch.Tensor,
         nodal_displacements: torch.Tensor,
+        edge_von_mises: torch.Tensor,
         flow_times: torch.Tensor,
         position_noise_levels: torch.Tensor,
         adjacency_noise_levels: torch.Tensor,
@@ -302,6 +330,13 @@ class SupervisedRefiner(nn.Module):
             18,
         ):
             raise ValueError("nodal_displacements must have shape [batch, nodes, 18]")
+        if edge_von_mises.shape != (
+            structures.batch_size,
+            structures.positions.shape[1],
+            structures.positions.shape[1],
+            6,
+        ):
+            raise ValueError("edge_von_mises must have shape [batch, nodes, nodes, 6]")
         if (
             self.config.use_style_token
             and style_structures is not None
@@ -338,6 +373,9 @@ class SupervisedRefiner(nn.Module):
         )
         hidden = hidden + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
+        edge_stress_conditioning = self.edge_von_mises_mlp(
+            torch.log1p(edge_von_mises.clamp_min(0.0))
+        ).permute(0, 3, 1, 2)
 
         mechanics_features = torch.cat(
             [
@@ -366,7 +404,13 @@ class SupervisedRefiner(nn.Module):
             style_context = self.style_token_encoder(style_structures)
 
         for layer in self.layers:
-            hidden = layer(hidden, current_adjacency, positions, style_context)
+            hidden = layer(
+                hidden,
+                current_adjacency,
+                positions,
+                style_context,
+                edge_stress_conditioning if layer.mode == "stress" else None,
+            )
 
         hidden = self.final_norm(hidden)
         position_velocity = self.position_head(hidden)
@@ -440,6 +484,8 @@ class SupervisedRefiner(nn.Module):
             analyses = analysis_fn(current)
             if analyses.nodal_displacements is None:
                 raise ValueError("analysis_fn must provide nodal_displacements")
+            if analyses.edge_von_mises is None:
+                raise ValueError("analysis_fn must provide edge_von_mises")
             flow_time = current.positions.new_full(
                 (current.batch_size,),
                 (step + 0.5) / num_steps,
@@ -450,6 +496,7 @@ class SupervisedRefiner(nn.Module):
                 target_stiffness=target_stiffness,
                 current_stiffness=analyses.generalized_stiffness,
                 nodal_displacements=analyses.nodal_displacements,
+                edge_von_mises=analyses.edge_von_mises,
                 flow_times=flow_time,
                 position_noise_levels=remaining * initial_position_gap,
                 adjacency_noise_levels=remaining * initial_adjacency_gap,

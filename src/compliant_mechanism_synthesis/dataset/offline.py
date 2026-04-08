@@ -78,17 +78,30 @@ def _concatenate_scaffolds(batches: list[Scaffolds]) -> Scaffolds:
 
 def _concatenate_analyses(batches: list[Analyses]) -> Analyses:
     nodal_displacements = None
+    edge_von_mises = None
     has_nodal_displacements = [
         batch.nodal_displacements is not None for batch in batches
     ]
+    has_edge_von_mises = [batch.edge_von_mises is not None for batch in batches]
     if any(has_nodal_displacements) and not all(has_nodal_displacements):
         raise ValueError("all analyses must consistently include nodal_displacements")
+    if any(has_edge_von_mises) and not all(has_edge_von_mises):
+        raise ValueError("all analyses must consistently include edge_von_mises")
     if batches and all(has_nodal_displacements):
         nodal_displacements = torch.cat(
             [
                 batch.nodal_displacements
                 for batch in batches
                 if batch.nodal_displacements is not None
+            ],
+            dim=0,
+        )
+    if batches and all(has_edge_von_mises):
+        edge_von_mises = torch.cat(
+            [
+                batch.edge_von_mises
+                for batch in batches
+                if batch.edge_von_mises is not None
             ],
             dim=0,
         )
@@ -113,6 +126,7 @@ def _concatenate_analyses(batches: list[Analyses]) -> Analyses:
             [batch.free_node_spacing_penalty for batch in batches], dim=0
         ),
         nodal_displacements=nodal_displacements,
+        edge_von_mises=edge_von_mises,
     )
 
 
@@ -312,6 +326,7 @@ def load_offline_dataset(
                 "nodal_displacements",
                 payload["last_analyses"].get("nodal_mechanics"),
             ),
+            edge_von_mises=payload["last_analyses"].get("edge_von_mises"),
         ),
         scaffolds=Scaffolds(
             positions=payload["scaffolds"]["positions"],
@@ -357,6 +372,7 @@ def _serialize_optimized_cases(
             "thick_beam_penalty": serialized.last_analyses.thick_beam_penalty,
             "free_node_spacing_penalty": serialized.last_analyses.free_node_spacing_penalty,
             "nodal_displacements": serialized.last_analyses.nodal_displacements,
+            "edge_von_mises": serialized.last_analyses.edge_von_mises,
         },
         "scaffolds": {
             "positions": serialized.scaffolds.positions,

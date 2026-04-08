@@ -189,32 +189,10 @@ def _frame_transform(rotation: torch.Tensor) -> torch.Tensor:
     return transform
 
 
-def assemble_global_stiffness(
-    positions: torch.Tensor,
-    adjacency: torch.Tensor,
-    config: Frame3DConfig | None = None,
-) -> torch.Tensor:
-    config = config or Frame3DConfig()
-    adjacency = symmetrize_matrix(adjacency.float().clamp_min(0.0))
-    batch_size, num_nodes, spatial_dim = positions.shape
-    if spatial_dim != 3:
-        raise ValueError("assemble_global_stiffness expects 3D positions")
-
-    edge_i, edge_j = upper_triangle_edge_index(num_nodes, positions.device)
-    delta = (positions[:, edge_j] - positions[:, edge_i]) * config.workspace_size
-    length = torch.linalg.vector_norm(delta, dim=-1).clamp_min(config.minimum_length)
-    radius = beam_radii(adjacency[:, edge_i, edge_j], config)
-    area, iy, iz, polar_inertia = _section_properties(radius)
-    local = _frame_local_stiffness(length, area, iy, iz, polar_inertia, config)
-    rotation = _local_axes(delta, length)
-    transform = _frame_transform(rotation)
-    element = transform.transpose(-1, -2) @ local @ transform
-
-    stiffness = torch.zeros(
-        (batch_size, 6 * num_nodes, 6 * num_nodes),
-        device=positions.device,
-        dtype=positions.dtype,
-    )
+def _element_dofs(
+    num_nodes: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    edge_i, edge_j = upper_triangle_edge_index(num_nodes, device)
     dofs = torch.stack(
         [
             6 * edge_i + 0,
@@ -231,6 +209,35 @@ def assemble_global_stiffness(
             6 * edge_j + 5,
         ],
         dim=1,
+    )
+    return edge_i, edge_j, dofs
+
+
+def assemble_global_stiffness(
+    positions: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: Frame3DConfig | None = None,
+) -> torch.Tensor:
+    config = config or Frame3DConfig()
+    adjacency = symmetrize_matrix(adjacency.float().clamp_min(0.0))
+    batch_size, num_nodes, spatial_dim = positions.shape
+    if spatial_dim != 3:
+        raise ValueError("assemble_global_stiffness expects 3D positions")
+
+    edge_i, edge_j, dofs = _element_dofs(num_nodes, positions.device)
+    delta = (positions[:, edge_j] - positions[:, edge_i]) * config.workspace_size
+    length = torch.linalg.vector_norm(delta, dim=-1).clamp_min(config.minimum_length)
+    radius = beam_radii(adjacency[:, edge_i, edge_j], config)
+    area, iy, iz, polar_inertia = _section_properties(radius)
+    local = _frame_local_stiffness(length, area, iy, iz, polar_inertia, config)
+    rotation = _local_axes(delta, length)
+    transform = _frame_transform(rotation)
+    element = transform.transpose(-1, -2) @ local @ transform
+
+    stiffness = torch.zeros(
+        (batch_size, 6 * num_nodes, 6 * num_nodes),
+        device=positions.device,
+        dtype=positions.dtype,
     )
     total_dofs = 6 * num_nodes
     element_linear_index = (dofs[:, :, None] * total_dofs + dofs[:, None, :]).reshape(
@@ -395,13 +402,80 @@ def _canonical_generalized_loads(
     return torch.diag(load_scale).expand(batch_size, -1, -1)
 
 
+def _edge_von_mises_matrix(
+    positions: torch.Tensor,
+    adjacency: torch.Tensor,
+    full_response: torch.Tensor,
+    config: Frame3DConfig,
+) -> torch.Tensor:
+    batch_size, num_nodes, _ = positions.shape
+    edge_i, edge_j, dofs = _element_dofs(num_nodes, positions.device)
+    delta = (positions[:, edge_j] - positions[:, edge_i]) * config.workspace_size
+    length = torch.linalg.vector_norm(delta, dim=-1).clamp_min(config.minimum_length)
+    radius = beam_radii(adjacency[:, edge_i, edge_j], config)
+    area, iy, iz, polar_inertia = _section_properties(radius)
+    local = _frame_local_stiffness(length, area, iy, iz, polar_inertia, config)
+    rotation = _local_axes(delta, length)
+    transform = _frame_transform(rotation)
+
+    element_displacements = full_response[:, dofs.reshape(-1), :].view(
+        batch_size, dofs.shape[0], 12, 6
+    )
+    local_displacements = transform @ element_displacements
+    local_forces = local @ local_displacements
+
+    area = area.clamp_min(1e-12)
+    polar_inertia = polar_inertia.clamp_min(1e-12)
+    bending_inertia = iy.clamp_min(1e-12)
+    radius = radius.clamp_min(1e-12)
+
+    axial_a = local_forces[..., 0, :].abs() / area.unsqueeze(-1)
+    axial_b = local_forces[..., 6, :].abs() / area.unsqueeze(-1)
+    torsion_a = (
+        local_forces[..., 3, :].abs()
+        * radius.unsqueeze(-1)
+        / polar_inertia.unsqueeze(-1)
+    )
+    torsion_b = (
+        local_forces[..., 9, :].abs()
+        * radius.unsqueeze(-1)
+        / polar_inertia.unsqueeze(-1)
+    )
+    bending_a = (
+        radius.unsqueeze(-1)
+        * torch.sqrt(
+            local_forces[..., 4, :].square() + local_forces[..., 5, :].square()
+        )
+        / bending_inertia.unsqueeze(-1)
+    )
+    bending_b = (
+        radius.unsqueeze(-1)
+        * torch.sqrt(
+            local_forces[..., 10, :].square() + local_forces[..., 11, :].square()
+        )
+        / bending_inertia.unsqueeze(-1)
+    )
+    von_mises_a = torch.sqrt((axial_a + bending_a).square() + 3.0 * torsion_a.square())
+    von_mises_b = torch.sqrt((axial_b + bending_b).square() + 3.0 * torsion_b.square())
+    edge_von_mises = torch.maximum(von_mises_a, von_mises_b)
+
+    edge_matrix = torch.zeros(
+        (batch_size, num_nodes, num_nodes, 6),
+        device=positions.device,
+        dtype=positions.dtype,
+    )
+    edge_matrix[:, edge_i, edge_j, :] = edge_von_mises
+    edge_matrix[:, edge_j, edge_i, :] = edge_von_mises
+    return edge_matrix
+
+
 def _output_response_summary(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
     config: Frame3DConfig,
     profile: dict[str, float] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if positions.device.type == "cuda":
         torch.cuda.synchronize(positions.device)
     assemble_start_time = time.perf_counter()
@@ -468,7 +542,17 @@ def _output_response_summary(
     batch_size, num_nodes, _ = positions.shape
     nodal_response = full_response.view(batch_size, num_nodes, 6, 6)[:, :, :3, :]
     nodal_displacements = (nodal_response / config.workspace_size).permute(0, 1, 3, 2)
-    return effective, nodal_displacements.reshape(batch_size, num_nodes, 18)
+    edge_von_mises = _edge_von_mises_matrix(
+        positions=positions,
+        adjacency=adjacency,
+        full_response=full_response,
+        config=config,
+    )
+    return (
+        effective,
+        nodal_displacements.reshape(batch_size, num_nodes, 18),
+        edge_von_mises,
+    )
 
 
 def effective_output_stiffness(
@@ -479,7 +563,7 @@ def effective_output_stiffness(
     profile: dict[str, float] | None = None,
 ) -> torch.Tensor:
     config = config or Frame3DConfig()
-    effective, _ = _output_response_summary(
+    effective, _, _ = _output_response_summary(
         positions,
         roles,
         adjacency,
@@ -596,7 +680,7 @@ def mechanical_terms(
     if positions.device.type == "cuda":
         torch.cuda.synchronize(positions.device)
     stiffness_start_time = time.perf_counter()
-    stiffness, nodal_displacements = _output_response_summary(
+    stiffness, nodal_displacements, edge_von_mises = _output_response_summary(
         positions=positions,
         roles=roles,
         adjacency=adjacency,
@@ -629,5 +713,6 @@ def mechanical_terms(
         "generalized_stiffness": stiffness,
         "material_usage": usage,
         "nodal_displacements": nodal_displacements,
+        "edge_von_mises": edge_von_mises,
         **penalties,
     }

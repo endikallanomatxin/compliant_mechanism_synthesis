@@ -184,6 +184,13 @@ def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
         loaded_cases.optimized_structures.num_nodes,
         18,
     )
+    assert loaded_cases.last_analyses.edge_von_mises is not None
+    assert loaded_cases.last_analyses.edge_von_mises.shape == (
+        3,
+        loaded_cases.optimized_structures.num_nodes,
+        loaded_cases.optimized_structures.num_nodes,
+        6,
+    )
     assert loaded_cases.scaffolds is not None
     assert loaded_cases.scaffolds.positions.shape == (3, 8, 3)
     assert loaded_config.num_cases == 3

@@ -44,6 +44,12 @@ def test_offline_dataset_roundtrip_preserves_shapes(tmp_path: Path) -> None:
         loaded_cases.last_analyses.nodal_displacements.shape
         == generated.last_analyses.nodal_displacements.shape
     )
+    assert loaded_cases.last_analyses.edge_von_mises is not None
+    assert generated.last_analyses.edge_von_mises is not None
+    assert (
+        loaded_cases.last_analyses.edge_von_mises.shape
+        == generated.last_analyses.edge_von_mises.shape
+    )
     assert loaded_cases.scaffolds is not None
     assert generated.scaffolds is not None
     assert (

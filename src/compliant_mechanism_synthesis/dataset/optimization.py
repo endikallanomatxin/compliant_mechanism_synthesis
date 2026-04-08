@@ -254,6 +254,7 @@ def _loss_breakdown(
     breakdown["thick_beam_penalty"] = terms["thick_beam_penalty"]
     breakdown["free_node_spacing_penalty"] = terms["free_node_spacing_penalty"]
     breakdown["nodal_displacements"] = terms["nodal_displacements"]
+    breakdown["edge_von_mises"] = terms["edge_von_mises"]
     return breakdown
 
 
@@ -381,6 +382,7 @@ def optimize_cases(
             .detach()
             .cpu(),
             nodal_displacements=best_breakdown["nodal_displacements"].detach().cpu(),
+            edge_von_mises=best_breakdown["edge_von_mises"].detach().cpu(),
         ),
     )
     result = result.to("cpu")
