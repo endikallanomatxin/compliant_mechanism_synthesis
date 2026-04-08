@@ -300,9 +300,13 @@ class SupervisedRefiner(nn.Module):
         self.position_head = nn.Sequential(
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
             nn.Linear(self.config.hidden_dim, 3),
         )
         self.node_latent_head = nn.Sequential(
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.latent_dim),
