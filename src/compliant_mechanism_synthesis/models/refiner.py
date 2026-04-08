@@ -283,7 +283,7 @@ class SupervisedRefiner(nn.Module):
         super().__init__()
         self.config = config or SupervisedRefinerConfig()
         self.position_mlp = nn.Sequential(
-            nn.Linear(9, self.config.hidden_dim),
+            nn.Linear(21, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
@@ -337,6 +337,7 @@ class SupervisedRefiner(nn.Module):
         structures: Structures,
         target_stiffness: torch.Tensor,
         current_stiffness: torch.Tensor,
+        nodal_mechanics: torch.Tensor,
         flow_times: torch.Tensor,
         position_noise_levels: torch.Tensor,
         adjacency_noise_levels: torch.Tensor,
@@ -349,6 +350,12 @@ class SupervisedRefiner(nn.Module):
             raise ValueError("target_stiffness must have shape [batch, 6, 6]")
         if current_stiffness.shape != (structures.batch_size, 6, 6):
             raise ValueError("current_stiffness must have shape [batch, 6, 6]")
+        if nodal_mechanics.shape != (
+            structures.batch_size,
+            structures.positions.shape[1],
+            18,
+        ):
+            raise ValueError("nodal_mechanics must have shape [batch, nodes, 18]")
         if (
             self.config.use_style_token
             and style_structures is not None
@@ -384,7 +391,7 @@ class SupervisedRefiner(nn.Module):
             torch.cat(
                 [
                     positions,
-                    _node_context_features(positions, roles, current_adjacency),
+                    nodal_mechanics,
                 ],
                 dim=-1,
             )
@@ -491,6 +498,8 @@ class SupervisedRefiner(nn.Module):
 
         for step in range(num_steps):
             analyses = analysis_fn(current)
+            if analyses.nodal_mechanics is None:
+                raise ValueError("analysis_fn must provide nodal_mechanics")
             flow_time = current.positions.new_full(
                 (current.batch_size,),
                 (step + 0.5) / num_steps,
@@ -500,6 +509,7 @@ class SupervisedRefiner(nn.Module):
                 structures=current,
                 target_stiffness=target_stiffness,
                 current_stiffness=analyses.generalized_stiffness,
+                nodal_mechanics=analyses.nodal_mechanics,
                 flow_times=flow_time,
                 position_noise_levels=remaining * initial_position_gap,
                 adjacency_noise_levels=remaining * initial_adjacency_gap,

@@ -181,6 +181,7 @@ class Analyses:
     thin_beam_penalty: torch.Tensor
     thick_beam_penalty: torch.Tensor
     free_node_spacing_penalty: torch.Tensor
+    nodal_mechanics: torch.Tensor | None = None
 
     def to(self, device: torch.device | str) -> Analyses:
         return Analyses(
@@ -191,6 +192,11 @@ class Analyses:
             thin_beam_penalty=self.thin_beam_penalty.to(device),
             thick_beam_penalty=self.thick_beam_penalty.to(device),
             free_node_spacing_penalty=self.free_node_spacing_penalty.to(device),
+            nodal_mechanics=(
+                None
+                if self.nodal_mechanics is None
+                else self.nodal_mechanics.to(device)
+            ),
         )
 
     def index_select(self, batch_indices: torch.Tensor) -> Analyses:
@@ -205,6 +211,11 @@ class Analyses:
             thick_beam_penalty=self.thick_beam_penalty.index_select(0, batch_indices),
             free_node_spacing_penalty=self.free_node_spacing_penalty.index_select(
                 0, batch_indices
+            ),
+            nodal_mechanics=(
+                None
+                if self.nodal_mechanics is None
+                else self.nodal_mechanics.index_select(0, batch_indices)
             ),
         )
 
@@ -224,6 +235,12 @@ class Analyses:
             _require_rank(name, value, 1)
             if value.shape[0] != batch_size:
                 raise ValueError(f"{name} must have shape [batch]")
+        if self.nodal_mechanics is not None:
+            _require_rank("nodal_mechanics", self.nodal_mechanics, 3)
+            if self.nodal_mechanics.shape[0] != batch_size:
+                raise ValueError("nodal_mechanics must have shape [batch, nodes, 18]")
+            if self.nodal_mechanics.shape[2] != 18:
+                raise ValueError("nodal_mechanics must have shape [batch, nodes, 18]")
 
 
 @dataclass(frozen=True)
@@ -307,6 +324,11 @@ class OptimizedCases:
                 free_node_spacing_penalty=self.last_analyses.free_node_spacing_penalty[
                     index : index + 1
                 ],
+                nodal_mechanics=(
+                    None
+                    if self.last_analyses.nodal_mechanics is None
+                    else self.last_analyses.nodal_mechanics[index : index + 1]
+                ),
             ),
             scaffolds=None if self.scaffolds is None else self.scaffolds.slice(index),
         )

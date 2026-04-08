@@ -87,13 +87,29 @@ def test_mechanical_terms_backward_is_finite() -> None:
         adjacency=adjacency,
         frame_config=Frame3DConfig(),
     )
-    loss = terms["generalized_stiffness"].square().mean() + terms["material_usage"].mean()
+    loss = (
+        terms["generalized_stiffness"].square().mean() + terms["material_usage"].mean()
+    )
     loss.backward()
 
     assert positions.grad is not None
     assert adjacency.grad is not None
     assert torch.isfinite(positions.grad).all()
     assert torch.isfinite(adjacency.grad).all()
+
+
+def test_mechanical_terms_include_nodal_mechanics() -> None:
+    positions, roles, adjacency = _sample_design()
+    terms = mechanical_terms(
+        positions=positions,
+        roles=roles,
+        adjacency=adjacency,
+        frame_config=Frame3DConfig(),
+    )
+
+    nodal_mechanics = terms["nodal_mechanics"]
+    assert nodal_mechanics.shape == (1, positions.shape[1], 18)
+    assert torch.isfinite(nodal_mechanics).all()
 
 
 def test_plot_design_3d_returns_a_figure() -> None:

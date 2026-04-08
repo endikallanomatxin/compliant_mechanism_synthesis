@@ -38,6 +38,12 @@ def test_offline_dataset_roundtrip_preserves_shapes(tmp_path: Path) -> None:
         loaded_cases.last_analyses.generalized_stiffness.shape
         == generated.last_analyses.generalized_stiffness.shape
     )
+    assert loaded_cases.last_analyses.nodal_mechanics is not None
+    assert generated.last_analyses.nodal_mechanics is not None
+    assert (
+        loaded_cases.last_analyses.nodal_mechanics.shape
+        == generated.last_analyses.nodal_mechanics.shape
+    )
     assert loaded_cases.scaffolds is not None
     assert generated.scaffolds is not None
     assert (

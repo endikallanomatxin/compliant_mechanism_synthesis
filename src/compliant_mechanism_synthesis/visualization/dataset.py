@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import torch
-
-from compliant_mechanism_synthesis.dataset.primitives import CHAIN_PRIMITIVE_LIBRARY
-from compliant_mechanism_synthesis.dataset.types import OptimizedCases
 from compliant_mechanism_synthesis.visualization.plots import (
     plot_design_3d,
     plot_scaffold_primitives_3d,
 )
+
+if TYPE_CHECKING:
+    from compliant_mechanism_synthesis.dataset.types import OptimizedCases
 
 
 def _loss_improvement(
@@ -26,6 +27,8 @@ def write_dataset_visualizations(
     max_cases: int = 6,
     case_indices: list[int] | None = None,
 ) -> Path:
+    from compliant_mechanism_synthesis.dataset.primitives import CHAIN_PRIMITIVE_LIBRARY
+
     optimized_cases.validate()
 
     output_path = Path(output_dir)

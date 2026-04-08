@@ -77,6 +77,19 @@ def _concatenate_scaffolds(batches: list[Scaffolds]) -> Scaffolds:
 
 
 def _concatenate_analyses(batches: list[Analyses]) -> Analyses:
+    nodal_mechanics = None
+    has_nodal_mechanics = [batch.nodal_mechanics is not None for batch in batches]
+    if any(has_nodal_mechanics) and not all(has_nodal_mechanics):
+        raise ValueError("all analyses must consistently include nodal_mechanics")
+    if batches and all(has_nodal_mechanics):
+        nodal_mechanics = torch.cat(
+            [
+                batch.nodal_mechanics
+                for batch in batches
+                if batch.nodal_mechanics is not None
+            ],
+            dim=0,
+        )
     return Analyses(
         generalized_stiffness=torch.cat(
             [batch.generalized_stiffness for batch in batches], dim=0
@@ -97,6 +110,7 @@ def _concatenate_analyses(batches: list[Analyses]) -> Analyses:
         free_node_spacing_penalty=torch.cat(
             [batch.free_node_spacing_penalty for batch in batches], dim=0
         ),
+        nodal_mechanics=nodal_mechanics,
     )
 
 
@@ -292,6 +306,7 @@ def load_offline_dataset(
             free_node_spacing_penalty=payload["last_analyses"][
                 "free_node_spacing_penalty"
             ],
+            nodal_mechanics=payload["last_analyses"].get("nodal_mechanics"),
         ),
         scaffolds=Scaffolds(
             positions=payload["scaffolds"]["positions"],
@@ -336,6 +351,7 @@ def _serialize_optimized_cases(
             "thin_beam_penalty": serialized.last_analyses.thin_beam_penalty,
             "thick_beam_penalty": serialized.last_analyses.thick_beam_penalty,
             "free_node_spacing_penalty": serialized.last_analyses.free_node_spacing_penalty,
+            "nodal_mechanics": serialized.last_analyses.nodal_mechanics,
         },
         "scaffolds": {
             "positions": serialized.scaffolds.positions,

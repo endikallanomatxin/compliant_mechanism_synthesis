@@ -332,14 +332,40 @@ def _reduction_transform(
     return transform, free_count
 
 
-def effective_output_stiffness(
+def _solve_free_output_coupling(
+    free_block: torch.Tensor,
+    coupling: torch.Tensor,
+    config: Frame3DConfig,
+) -> torch.Tensor:
+    regularized_free = free_block + torch.diag_embed(
+        config.free_dof_regularization
+        * torch.ones(
+            free_block.shape[:2],
+            device=free_block.device,
+            dtype=free_block.dtype,
+        )
+    )
+    try:
+        return torch.linalg.solve(regularized_free, coupling)
+    except RuntimeError:
+        # Some backends or ill-conditioned batches still need a safer per-case
+        # fallback even though the batched path is much faster when it succeeds.
+        return torch.stack(
+            [
+                torch.linalg.solve(regularized_free[index], coupling[index])
+                for index in range(free_block.shape[0])
+            ],
+            dim=0,
+        )
+
+
+def _output_response_summary(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
-    config: Frame3DConfig | None = None,
+    config: Frame3DConfig,
     profile: dict[str, float] | None = None,
-) -> torch.Tensor:
-    config = config or Frame3DConfig()
+) -> tuple[torch.Tensor, torch.Tensor]:
     if positions.device.type == "cuda":
         torch.cuda.synchronize(positions.device)
     assemble_start_time = time.perf_counter()
@@ -360,49 +386,74 @@ def effective_output_stiffness(
     solve_start_time = time.perf_counter()
     rigid_base = 6 * free_count
     output_block = reduced[:, rigid_base:, rigid_base:]
+    coordinate_scale = torch.tensor(
+        [
+            config.workspace_size,
+            config.workspace_size,
+            config.workspace_size,
+            1.0,
+            1.0,
+            1.0,
+        ],
+        device=positions.device,
+        dtype=positions.dtype,
+    )
+    rigid_modes = torch.diag(coordinate_scale).expand(positions.shape[0], -1, -1)
     if free_count == 0:
+        full_response = transform[:, :, rigid_base:] @ rigid_modes
+        if positions.device.type == "cuda":
+            torch.cuda.synchronize(positions.device)
+        end_time = time.perf_counter()
         if profile is not None:
             profile["assemble"] = transform_start_time - assemble_start_time
             profile["transform"] = reduce_start_time - transform_start_time
             profile["reduce"] = solve_start_time - reduce_start_time
             profile["solve"] = 0.0
-            profile["total"] = solve_start_time - assemble_start_time
-        return symmetrize_matrix(output_block)
+            profile["total"] = end_time - assemble_start_time
+        effective = symmetrize_matrix(output_block)
+    else:
+        free_block = reduced[:, :rigid_base, :rigid_base]
+        coupling = reduced[:, :rigid_base, rigid_base:]
+        relaxed_coupling = _solve_free_output_coupling(
+            free_block, coupling, config=config
+        )
+        free_modes = -(relaxed_coupling @ rigid_modes)
+        reduced_response = torch.cat([free_modes, rigid_modes], dim=1)
+        full_response = transform @ reduced_response
+        if positions.device.type == "cuda":
+            torch.cuda.synchronize(positions.device)
+        end_time = time.perf_counter()
+        if profile is not None:
+            profile["assemble"] = transform_start_time - assemble_start_time
+            profile["transform"] = reduce_start_time - transform_start_time
+            profile["reduce"] = solve_start_time - reduce_start_time
+            profile["solve"] = end_time - solve_start_time
+            profile["total"] = end_time - assemble_start_time
+        effective = output_block - coupling.transpose(-1, -2) @ relaxed_coupling
+        effective = symmetrize_matrix(effective)
 
-    free_block = reduced[:, :rigid_base, :rigid_base]
-    coupling = reduced[:, :rigid_base, rigid_base:]
-    regularized_free = free_block + torch.diag_embed(
-        config.free_dof_regularization
-        * torch.ones(
-            (positions.shape[0], rigid_base),
-            device=positions.device,
-            dtype=positions.dtype,
-        )
+    batch_size, num_nodes, _ = positions.shape
+    nodal_response = full_response.view(batch_size, num_nodes, 6, 6)[:, :, :3, :]
+    nodal_mechanics = (nodal_response / config.workspace_size).permute(0, 1, 3, 2)
+    return effective, nodal_mechanics.reshape(batch_size, num_nodes, 18)
+
+
+def effective_output_stiffness(
+    positions: torch.Tensor,
+    roles: torch.Tensor,
+    adjacency: torch.Tensor,
+    config: Frame3DConfig | None = None,
+    profile: dict[str, float] | None = None,
+) -> torch.Tensor:
+    config = config or Frame3DConfig()
+    effective, _ = _output_response_summary(
+        positions,
+        roles,
+        adjacency,
+        config=config,
+        profile=profile,
     )
-    try:
-        relaxed_coupling = torch.linalg.solve(regularized_free, coupling)
-    except RuntimeError:
-        # Some backends or ill-conditioned batches may still need the safer
-        # per-case fallback even though the batched path is much faster when it
-        # succeeds.
-        relaxed_coupling = torch.stack(
-            [
-                torch.linalg.solve(regularized_free[index], coupling[index])
-                for index in range(positions.shape[0])
-            ],
-            dim=0,
-        )
-    if positions.device.type == "cuda":
-        torch.cuda.synchronize(positions.device)
-    end_time = time.perf_counter()
-    if profile is not None:
-        profile["assemble"] = transform_start_time - assemble_start_time
-        profile["transform"] = reduce_start_time - transform_start_time
-        profile["reduce"] = solve_start_time - reduce_start_time
-        profile["solve"] = end_time - solve_start_time
-        profile["total"] = end_time - assemble_start_time
-    effective = output_block - coupling.transpose(-1, -2) @ relaxed_coupling
-    return symmetrize_matrix(effective)
+    return effective
 
 
 def material_usage(
@@ -512,7 +563,7 @@ def mechanical_terms(
     if positions.device.type == "cuda":
         torch.cuda.synchronize(positions.device)
     stiffness_start_time = time.perf_counter()
-    stiffness = effective_output_stiffness(
+    stiffness, nodal_mechanics = _output_response_summary(
         positions=positions,
         roles=roles,
         adjacency=adjacency,
@@ -544,5 +595,6 @@ def mechanical_terms(
     return {
         "generalized_stiffness": stiffness,
         "material_usage": usage,
+        "nodal_mechanics": nodal_mechanics,
         **penalties,
     }

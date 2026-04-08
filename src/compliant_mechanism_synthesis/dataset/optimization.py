@@ -253,6 +253,7 @@ def _loss_breakdown(
     breakdown["thin_beam_penalty"] = terms["thin_beam_penalty"]
     breakdown["thick_beam_penalty"] = terms["thick_beam_penalty"]
     breakdown["free_node_spacing_penalty"] = terms["free_node_spacing_penalty"]
+    breakdown["nodal_mechanics"] = terms["nodal_mechanics"]
     return breakdown
 
 
@@ -379,6 +380,7 @@ def optimize_cases(
             free_node_spacing_penalty=best_breakdown["free_node_spacing_penalty"]
             .detach()
             .cpu(),
+            nodal_mechanics=best_breakdown["nodal_mechanics"].detach().cpu(),
         ),
     )
     result = result.to("cpu")
