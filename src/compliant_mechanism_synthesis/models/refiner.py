@@ -29,53 +29,6 @@ def sinusoidal_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
     return embedding
 
 
-def _masked_centroid(positions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    weighted = positions * mask.unsqueeze(-1).to(dtype=positions.dtype)
-    count = mask.sum(dim=1, keepdim=True).clamp_min(1).to(dtype=positions.dtype)
-    return weighted.sum(dim=1) / count
-
-
-def _node_context_features(
-    positions: torch.Tensor,
-    roles: torch.Tensor,
-    adjacency: torch.Tensor,
-) -> torch.Tensor:
-    degree = adjacency.sum(dim=-1, keepdim=True)
-    pairwise = torch.linalg.vector_norm(
-        positions[:, :, None, :] - positions[:, None, :, :],
-        dim=-1,
-    )
-    mean_edge_length = (adjacency * pairwise).sum(
-        dim=-1, keepdim=True
-    ) / degree.clamp_min(1e-6)
-    structure_centroid = positions.mean(dim=1, keepdim=True)
-    fixed_mask, mobile_mask, _ = role_masks(roles)
-    fixed_centroid = _masked_centroid(positions, fixed_mask)[:, None, :]
-    mobile_centroid = _masked_centroid(positions, mobile_mask)[:, None, :]
-    distance_to_structure = torch.linalg.vector_norm(
-        positions - structure_centroid, dim=-1, keepdim=True
-    )
-    distance_to_fixed = torch.linalg.vector_norm(
-        positions - fixed_centroid, dim=-1, keepdim=True
-    )
-    distance_to_mobile = torch.linalg.vector_norm(
-        positions - mobile_centroid, dim=-1, keepdim=True
-    )
-    anchor_mask = (fixed_mask | mobile_mask).to(dtype=adjacency.dtype)
-    anchor_attachment = (adjacency * anchor_mask.unsqueeze(1)).sum(dim=-1, keepdim=True)
-    return torch.cat(
-        [
-            degree,
-            mean_edge_length,
-            distance_to_structure,
-            distance_to_fixed,
-            distance_to_mobile,
-            anchor_attachment,
-        ],
-        dim=-1,
-    )
-
-
 @dataclass(frozen=True)
 class FlowPrediction:
     position_velocity: torch.Tensor
@@ -222,7 +175,7 @@ class StyleTokenEncoder(nn.Module):
             )
         self.hidden_dim = style_hidden_dim
         self.position_mlp = nn.Sequential(
-            nn.Linear(9, style_hidden_dim),
+            nn.Linear(3, style_hidden_dim),
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
         )
@@ -249,19 +202,7 @@ class StyleTokenEncoder(nn.Module):
         self.noise_std = config.style_token_noise_std
 
     def forward(self, structures: Structures) -> torch.Tensor:
-        hidden = self.position_mlp(
-            torch.cat(
-                [
-                    structures.positions,
-                    _node_context_features(
-                        structures.positions,
-                        structures.roles,
-                        structures.adjacency,
-                    ),
-                ],
-                dim=-1,
-            )
-        )
+        hidden = self.position_mlp(structures.positions)
         hidden = hidden + self.role_embedding(structures.roles)
         hidden = self.input_norm(hidden)
         for layer in self.layers:
