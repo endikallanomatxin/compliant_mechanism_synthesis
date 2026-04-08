@@ -214,7 +214,7 @@ def _analysis_from_terms(terms: dict[str, torch.Tensor]) -> Analyses:
         thin_beam_penalty=terms["thin_beam_penalty"],
         thick_beam_penalty=terms["thick_beam_penalty"],
         free_node_spacing_penalty=terms["free_node_spacing_penalty"],
-        nodal_mechanics=terms["nodal_mechanics"],
+        nodal_displacements=terms["nodal_displacements"],
     )
 
 
@@ -567,7 +567,7 @@ def train_supervised_refiner(
                     structures=batch.flow_structures,
                     target_stiffness=batch.target_stiffness,
                     current_stiffness=batch.current_analyses.generalized_stiffness,
-                    nodal_mechanics=batch.current_analyses.nodal_mechanics,
+                    nodal_displacements=batch.current_analyses.nodal_displacements,
                     flow_times=batch.flow_times,
                     position_noise_levels=batch.position_noise_levels,
                     adjacency_noise_levels=batch.adjacency_noise_levels,

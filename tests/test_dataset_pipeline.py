@@ -178,8 +178,8 @@ def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:
         == optimized_cases.optimized_structures.num_nodes
     )
     assert loaded_cases.last_analyses.generalized_stiffness.shape == (3, 6, 6)
-    assert loaded_cases.last_analyses.nodal_mechanics is not None
-    assert loaded_cases.last_analyses.nodal_mechanics.shape == (
+    assert loaded_cases.last_analyses.nodal_displacements is not None
+    assert loaded_cases.last_analyses.nodal_displacements.shape == (
         3,
         loaded_cases.optimized_structures.num_nodes,
         18,

@@ -98,7 +98,7 @@ def test_mechanical_terms_backward_is_finite() -> None:
     assert torch.isfinite(adjacency.grad).all()
 
 
-def test_mechanical_terms_include_nodal_mechanics() -> None:
+def test_mechanical_terms_include_nodal_displacements() -> None:
     positions, roles, adjacency = _sample_design()
     terms = mechanical_terms(
         positions=positions,
@@ -107,9 +107,9 @@ def test_mechanical_terms_include_nodal_mechanics() -> None:
         frame_config=Frame3DConfig(),
     )
 
-    nodal_mechanics = terms["nodal_mechanics"]
-    assert nodal_mechanics.shape == (1, positions.shape[1], 18)
-    assert torch.isfinite(nodal_mechanics).all()
+    nodal_displacements = terms["nodal_displacements"]
+    assert nodal_displacements.shape == (1, positions.shape[1], 18)
+    assert torch.isfinite(nodal_displacements).all()
 
 
 def test_plot_design_3d_returns_a_figure() -> None:

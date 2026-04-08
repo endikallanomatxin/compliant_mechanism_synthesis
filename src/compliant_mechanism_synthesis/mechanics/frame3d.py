@@ -359,6 +359,42 @@ def _solve_free_output_coupling(
         )
 
 
+def _solve_linear_system(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    try:
+        return torch.linalg.solve(matrix, rhs)
+    except RuntimeError:
+        return torch.stack(
+            [
+                torch.linalg.solve(matrix[index], rhs[index])
+                for index in range(matrix.shape[0])
+            ],
+            dim=0,
+        )
+
+
+def _canonical_generalized_loads(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    config: Frame3DConfig,
+) -> torch.Tensor:
+    force_scale = config.young_modulus * math.pi * config.radius_max**2
+    moment_scale = force_scale * config.workspace_size
+    load_scale = torch.tensor(
+        [
+            force_scale,
+            force_scale,
+            force_scale,
+            moment_scale,
+            moment_scale,
+            moment_scale,
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    return torch.diag(load_scale).expand(batch_size, -1, -1)
+
+
 def _output_response_summary(
     positions: torch.Tensor,
     roles: torch.Tensor,
@@ -386,56 +422,53 @@ def _output_response_summary(
     solve_start_time = time.perf_counter()
     rigid_base = 6 * free_count
     output_block = reduced[:, rigid_base:, rigid_base:]
-    coordinate_scale = torch.tensor(
-        [
-            config.workspace_size,
-            config.workspace_size,
-            config.workspace_size,
-            1.0,
-            1.0,
-            1.0,
-        ],
-        device=positions.device,
-        dtype=positions.dtype,
-    )
-    rigid_modes = torch.diag(coordinate_scale).expand(positions.shape[0], -1, -1)
     if free_count == 0:
-        full_response = transform[:, :, rigid_base:] @ rigid_modes
-        if positions.device.type == "cuda":
-            torch.cuda.synchronize(positions.device)
-        end_time = time.perf_counter()
-        if profile is not None:
-            profile["assemble"] = transform_start_time - assemble_start_time
-            profile["transform"] = reduce_start_time - transform_start_time
-            profile["reduce"] = solve_start_time - reduce_start_time
-            profile["solve"] = 0.0
-            profile["total"] = end_time - assemble_start_time
         effective = symmetrize_matrix(output_block)
+        relaxed_coupling = None
     else:
         free_block = reduced[:, :rigid_base, :rigid_base]
         coupling = reduced[:, :rigid_base, rigid_base:]
         relaxed_coupling = _solve_free_output_coupling(
             free_block, coupling, config=config
         )
-        free_modes = -(relaxed_coupling @ rigid_modes)
-        reduced_response = torch.cat([free_modes, rigid_modes], dim=1)
-        full_response = transform @ reduced_response
-        if positions.device.type == "cuda":
-            torch.cuda.synchronize(positions.device)
-        end_time = time.perf_counter()
-        if profile is not None:
-            profile["assemble"] = transform_start_time - assemble_start_time
-            profile["transform"] = reduce_start_time - transform_start_time
-            profile["reduce"] = solve_start_time - reduce_start_time
-            profile["solve"] = end_time - solve_start_time
-            profile["total"] = end_time - assemble_start_time
         effective = output_block - coupling.transpose(-1, -2) @ relaxed_coupling
         effective = symmetrize_matrix(effective)
 
+    output_regularized = effective + torch.diag_embed(
+        config.free_dof_regularization
+        * torch.ones(
+            (positions.shape[0], 6),
+            device=positions.device,
+            dtype=positions.dtype,
+        )
+    )
+    load_cases = _canonical_generalized_loads(
+        batch_size=positions.shape[0],
+        device=positions.device,
+        dtype=positions.dtype,
+        config=config,
+    )
+    output_displacements = _solve_linear_system(output_regularized, load_cases)
+    if free_count == 0:
+        full_response = transform[:, :, rigid_base:] @ output_displacements
+    else:
+        free_displacements = -(relaxed_coupling @ output_displacements)
+        reduced_response = torch.cat([free_displacements, output_displacements], dim=1)
+        full_response = transform @ reduced_response
+    if positions.device.type == "cuda":
+        torch.cuda.synchronize(positions.device)
+    end_time = time.perf_counter()
+    if profile is not None:
+        profile["assemble"] = transform_start_time - assemble_start_time
+        profile["transform"] = reduce_start_time - transform_start_time
+        profile["reduce"] = solve_start_time - reduce_start_time
+        profile["solve"] = end_time - solve_start_time
+        profile["total"] = end_time - assemble_start_time
+
     batch_size, num_nodes, _ = positions.shape
     nodal_response = full_response.view(batch_size, num_nodes, 6, 6)[:, :, :3, :]
-    nodal_mechanics = (nodal_response / config.workspace_size).permute(0, 1, 3, 2)
-    return effective, nodal_mechanics.reshape(batch_size, num_nodes, 18)
+    nodal_displacements = (nodal_response / config.workspace_size).permute(0, 1, 3, 2)
+    return effective, nodal_displacements.reshape(batch_size, num_nodes, 18)
 
 
 def effective_output_stiffness(
@@ -563,7 +596,7 @@ def mechanical_terms(
     if positions.device.type == "cuda":
         torch.cuda.synchronize(positions.device)
     stiffness_start_time = time.perf_counter()
-    stiffness, nodal_mechanics = _output_response_summary(
+    stiffness, nodal_displacements = _output_response_summary(
         positions=positions,
         roles=roles,
         adjacency=adjacency,
@@ -595,6 +628,6 @@ def mechanical_terms(
     return {
         "generalized_stiffness": stiffness,
         "material_usage": usage,
-        "nodal_mechanics": nodal_mechanics,
+        "nodal_displacements": nodal_displacements,
         **penalties,
     }
