@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from compliant_mechanism_synthesis.dataset.types import Analyses, Structures
+from compliant_mechanism_synthesis.mechanics import normalize_generalized_stiffness
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.tensor_ops import (
     distance_affinity,
@@ -259,12 +260,18 @@ class StyleTokenEncoder(nn.Module):
             _signed_log1p_features(analyses.nodal_displacements)
         )
         shared_hidden = shared_hidden + self.role_embedding(structures.roles)
-        residual_stiffness = target_stiffness - analyses.generalized_stiffness
+        normalized_target_stiffness = normalize_generalized_stiffness(target_stiffness)
+        normalized_current_stiffness = normalize_generalized_stiffness(
+            analyses.generalized_stiffness
+        )
+        normalized_residual_stiffness = (
+            normalized_target_stiffness - normalized_current_stiffness
+        )
         mechanics_features = torch.cat(
             [
-                symmetric_matrix_unique_values(target_stiffness),
-                symmetric_matrix_unique_values(analyses.generalized_stiffness),
-                symmetric_matrix_unique_values(residual_stiffness),
+                symmetric_matrix_unique_values(normalized_target_stiffness),
+                symmetric_matrix_unique_values(normalized_current_stiffness),
+                symmetric_matrix_unique_values(normalized_residual_stiffness),
             ],
             dim=1,
         )
@@ -463,7 +470,13 @@ class SupervisedRefiner(nn.Module):
         current_adjacency = enforce_role_adjacency_constraints(
             structures.adjacency, roles
         )
-        residual_stiffness = target_stiffness - current_stiffness
+        normalized_target_stiffness = normalize_generalized_stiffness(target_stiffness)
+        normalized_current_stiffness = normalize_generalized_stiffness(
+            current_stiffness
+        )
+        normalized_residual_stiffness = (
+            normalized_target_stiffness - normalized_current_stiffness
+        )
         hidden = self.position_mlp(positions) + self.nodal_displacement_mlp(
             _signed_log1p_features(nodal_displacements)
         )
@@ -479,9 +492,9 @@ class SupervisedRefiner(nn.Module):
 
         mechanics_features = torch.cat(
             [
-                symmetric_matrix_unique_values(target_stiffness),
-                symmetric_matrix_unique_values(current_stiffness),
-                symmetric_matrix_unique_values(residual_stiffness),
+                symmetric_matrix_unique_values(normalized_target_stiffness),
+                symmetric_matrix_unique_values(normalized_current_stiffness),
+                symmetric_matrix_unique_values(normalized_residual_stiffness),
             ],
             dim=1,
         )
