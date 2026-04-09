@@ -16,7 +16,6 @@ from compliant_mechanism_synthesis.models import (
     SupervisedRefinerConfig,
 )
 from compliant_mechanism_synthesis.training import (
-    CurriculumConfig,
     SupervisedTrainingConfig,
     analyze_structures,
     make_supervised_batch,
@@ -89,28 +88,12 @@ def test_scheduled_learning_rate_warms_up_then_cosine_decays() -> None:
     assert learning_rates[2] > learning_rates[5] > learning_rates[8]
 
 
-def test_difficulty_limits_sampled_flow_times(tmp_path: Path) -> None:
+def test_flow_times_cover_unit_interval_without_curriculum(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
-    curriculum = CurriculumConfig(initial_mix=0.2, final_mix=1.0)
+    batch = make_supervised_batch(optimized_cases=cases, seed=3)
 
-    easy_batch = make_supervised_batch(
-        optimized_cases=cases,
-        curriculum=curriculum,
-        difficulty=0.0,
-        seed=3,
-    )
-    hard_batch = make_supervised_batch(
-        optimized_cases=cases,
-        curriculum=curriculum,
-        difficulty=1.0,
-        seed=3,
-    )
-
-    assert float(easy_batch.flow_times.min().item()) >= 0.8
-    assert float(hard_batch.flow_times.min().item()) >= 0.0
-    assert float(easy_batch.flow_times.mean().item()) > float(
-        hard_batch.flow_times.mean().item()
-    )
+    assert float(batch.flow_times.min().item()) >= 0.0
+    assert float(batch.flow_times.max().item()) <= 1.0
 
 
 def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
@@ -148,8 +131,6 @@ def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) 
     baseline = SupervisedRefiner(config)
     batch = make_supervised_batch(
         optimized_cases=cases,
-        curriculum=CurriculumConfig(),
-        difficulty=0.7,
         seed=5,
     )
     baseline_prediction = baseline.predict_flow(
@@ -228,8 +209,6 @@ def test_predict_flow_rejects_mismatched_style_roles(tmp_path: Path) -> None:
     )
     batch = make_supervised_batch(
         optimized_cases=cases,
-        curriculum=CurriculumConfig(),
-        difficulty=0.5,
         seed=11,
     )
     mismatched_roles = batch.oracle_structures.roles.clone()
@@ -269,8 +248,6 @@ def test_predict_flow_ignores_style_inputs_when_style_token_disabled(
     )
     batch = make_supervised_batch(
         optimized_cases=cases,
-        curriculum=CurriculumConfig(),
-        difficulty=0.5,
         seed=13,
     )
     mismatched_roles = batch.oracle_structures.roles.clone()
@@ -308,8 +285,6 @@ def test_predict_flow_stabilizes_large_mechanics_inputs(tmp_path: Path) -> None:
     )
     batch = make_supervised_batch(
         optimized_cases=cases,
-        curriculum=CurriculumConfig(),
-        difficulty=0.5,
         seed=17,
     )
     huge_displacements = torch.full_like(
@@ -348,8 +323,6 @@ def test_predict_flow_requires_style_analyses_with_style_structures(
     )
     batch = make_supervised_batch(
         optimized_cases=cases,
-        curriculum=CurriculumConfig(),
-        difficulty=0.5,
         seed=19,
     )
 

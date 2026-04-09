@@ -14,7 +14,6 @@ from compliant_mechanism_synthesis.dataset import (
 from compliant_mechanism_synthesis.dataset.types import Structures
 from compliant_mechanism_synthesis.evaluation import evaluate_refinement_step
 from compliant_mechanism_synthesis.training import (
-    CurriculumConfig,
     analyze_structures,
     iter_supervised_batches,
     load_supervised_cases,
@@ -43,8 +42,6 @@ def test_make_supervised_batch_returns_noisy_structures(tmp_path: Path) -> None:
     _, optimized_cases = _build_cases(tmp_path)
     batch = make_supervised_batch(
         optimized_cases=optimized_cases,
-        curriculum=CurriculumConfig(),
-        difficulty=0.6,
         seed=7,
     )
 
@@ -81,23 +78,16 @@ def test_sample_noisy_structures_is_seeded_gaussian_from_dataset_stats(
     tmp_path: Path,
 ) -> None:
     _, optimized_cases = _build_cases(tmp_path)
-    curriculum = CurriculumConfig(initial_mix=0.25, final_mix=0.75)
     structures_a = sample_noisy_structures(
         optimized_cases=optimized_cases,
-        curriculum=curriculum,
-        difficulty=1.0,
         seed=7,
     )
     structures_b = sample_noisy_structures(
         optimized_cases=optimized_cases,
-        curriculum=curriculum,
-        difficulty=1.0,
         seed=7,
     )
     structures_c = sample_noisy_structures(
         optimized_cases=optimized_cases,
-        curriculum=curriculum,
-        difficulty=1.0,
         seed=8,
     )
 
@@ -126,8 +116,6 @@ def test_make_supervised_batch_can_use_global_noise_statistics(tmp_path: Path) -
 
     batch = make_supervised_batch(
         optimized_cases=optimized_cases,
-        curriculum=CurriculumConfig(),
-        difficulty=0.5,
         position_mean=position_mean,
         position_std=position_std,
         adjacency_mean=adjacency_mean,
@@ -168,7 +156,6 @@ def test_evaluate_refinement_step_compares_noisy_refined_and_oracle(
     metrics = evaluate_refinement_step(
         refiner=oracle_refiner,
         optimized_cases=optimized_cases,
-        difficulty=0.5,
         seed=3,
     )
 

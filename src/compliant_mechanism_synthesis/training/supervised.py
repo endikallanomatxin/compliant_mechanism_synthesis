@@ -36,17 +36,6 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 
 
 @dataclass(frozen=True)
-class CurriculumConfig:
-    # Maximum noise fraction along the straight path from the optimized oracle
-    # to a Gaussian structure-noise sample drawn from dataset statistics. At a
-    # given difficulty, supervision samples a single interpolation time
-    # `t ~ U(1 - noise_fraction, 1)` and trains one local flow-matching step on
-    # the resulting `x_t`.
-    initial_mix: float = 0.15
-    final_mix: float = 1.0
-
-
-@dataclass(frozen=True)
 class SupervisedTrainingConfig:
     dataset_path: str
     device: str = "auto"
@@ -60,7 +49,6 @@ class SupervisedTrainingConfig:
     use_style_token: bool = True
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.35
-    endpoint_loss_weight: float = 0.03
     stiffness_loss_weight: float = 0.0
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
@@ -90,12 +78,6 @@ class SupervisedBatch:
 class SupervisedTrainingSummary:
     history: dict[str, list[float]]
     checkpoint_path: Path
-
-
-def _difficulty_fraction(step: int, total_steps: int) -> float:
-    if total_steps <= 1:
-        return 1.0
-    return min(max(step / (total_steps - 1), 0.0), 1.0)
 
 
 def _scheduled_learning_rate(
@@ -164,8 +146,6 @@ def _dataset_adjacency_statistics(
 
 def sample_noisy_structures(
     optimized_cases: OptimizedCases,
-    curriculum: CurriculumConfig,
-    difficulty: float,
     position_mean: torch.Tensor | None = None,
     position_std: torch.Tensor | None = None,
     adjacency_mean: torch.Tensor | None = None,
@@ -173,8 +153,6 @@ def sample_noisy_structures(
     seed: int | None = None,
 ) -> Structures:
     optimized_cases.validate()
-    del curriculum
-    del difficulty
 
     oracle_positions = optimized_cases.optimized_structures.positions
     oracle_adjacency = optimized_cases.optimized_structures.adjacency
@@ -277,8 +255,6 @@ def _flow_noise_levels(
 
 def make_supervised_batch(
     optimized_cases: OptimizedCases,
-    curriculum: CurriculumConfig,
-    difficulty: float,
     position_mean: torch.Tensor | None = None,
     position_std: torch.Tensor | None = None,
     adjacency_mean: torch.Tensor | None = None,
@@ -286,15 +262,8 @@ def make_supervised_batch(
     seed: int | None = None,
     profile: dict[str, float] | None = None,
 ) -> SupervisedBatch:
-    difficulty = float(min(max(difficulty, 0.0), 1.0))
-    noise_fraction = curriculum.initial_mix + difficulty * (
-        curriculum.final_mix - curriculum.initial_mix
-    )
-    time_min = max(0.0, 1.0 - noise_fraction)
     source_structures = sample_noisy_structures(
         optimized_cases=optimized_cases,
-        curriculum=curriculum,
-        difficulty=difficulty,
         position_mean=position_mean,
         position_std=position_std,
         adjacency_mean=adjacency_mean,
@@ -312,10 +281,9 @@ def make_supervised_batch(
         device=source_structures.positions.device,
         dtype=source_structures.positions.dtype,
     )
-    flow_times = time_min + (1.0 - time_min) * flow_times
     # Sample supervision on points along the straight path from a full Gaussian
     # structure-noise source to the optimized oracle, and train the model to
-    # predict the residual correction from the sampled state to the oracle.
+    # predict the constant flow velocity of that straight transport path.
     interpolation = flow_times[:, None, None]
     flow_positions = torch.lerp(
         source_structures.positions,
@@ -429,40 +397,6 @@ def _adjacency_velocity_loss(
     )
 
 
-def _endpoint_loss(
-    prediction: FlowPrediction, batch: SupervisedBatch
-) -> tuple[torch.Tensor, Structures]:
-    _, _, free_mask = role_masks(batch.flow_structures.roles)
-    free_mask = free_mask.unsqueeze(-1).to(dtype=prediction.position_velocity.dtype)
-    estimated_positions = (
-        batch.flow_structures.positions + prediction.position_velocity * free_mask
-    ).clamp(0.0, 1.0)
-    estimated_adjacency = enforce_role_adjacency_constraints(
-        (batch.flow_structures.adjacency + prediction.adjacency_velocity).clamp(
-            0.0, 1.0
-        ),
-        batch.flow_structures.roles,
-    )
-    # The supervised target is the residual from the current flow state to the
-    # optimized oracle, so a locally correct prediction should land on the
-    # oracle in one step.
-    estimated = Structures(
-        positions=estimated_positions,
-        roles=batch.flow_structures.roles,
-        adjacency=estimated_adjacency,
-    )
-    position_error = (
-        (estimated.positions - batch.oracle_structures.positions).square() * free_mask
-    ).sum(dim=(1, 2))
-    position_error = position_error / free_mask.sum(dim=(1, 2)).clamp_min(1.0)
-    adjacency_error = (
-        (estimated.adjacency - batch.oracle_structures.adjacency)
-        .square()
-        .mean(dim=(1, 2))
-    )
-    return position_error + adjacency_error, estimated
-
-
 def _training_losses(
     prediction: FlowPrediction,
     batch: SupervisedBatch,
@@ -471,8 +405,23 @@ def _training_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     position_error = _position_velocity_loss(prediction, batch)
     adjacency_error = _adjacency_velocity_loss(prediction, batch)
-    endpoint_error, estimated = _endpoint_loss(prediction, batch)
     if config.stiffness_loss_weight > 0.0:
+        _, _, free_mask = role_masks(batch.flow_structures.roles)
+        free_mask = free_mask.unsqueeze(-1).to(dtype=prediction.position_velocity.dtype)
+        estimated_positions = (
+            batch.flow_structures.positions + prediction.position_velocity * free_mask
+        ).clamp(0.0, 1.0)
+        estimated_adjacency = enforce_role_adjacency_constraints(
+            (batch.flow_structures.adjacency + prediction.adjacency_velocity).clamp(
+                0.0, 1.0
+            ),
+            batch.flow_structures.roles,
+        )
+        estimated = Structures(
+            positions=estimated_positions,
+            roles=batch.flow_structures.roles,
+            adjacency=estimated_adjacency,
+        )
         endpoint_analyses = analyze_structures(estimated, profile=profile)
         stiffness_error = torch.log1p(
             generalized_stiffness_error(
@@ -480,27 +429,23 @@ def _training_losses(
             )
         )
     else:
-        stiffness_error = endpoint_error.new_zeros(endpoint_error.shape)
+        stiffness_error = position_error.new_zeros(position_error.shape)
     loss_contributions = {
         "position_error_loss_contribution": config.position_loss_weight
         * position_error,
         "adjacency_error_loss_contribution": config.adjacency_loss_weight
         * adjacency_error,
-        "endpoint_error_loss_contribution": config.endpoint_loss_weight
-        * endpoint_error,
         "stiffness_error_loss_contribution": config.stiffness_loss_weight
         * stiffness_error,
     }
     total_loss = (
         loss_contributions["position_error_loss_contribution"]
         + loss_contributions["adjacency_error_loss_contribution"]
-        + loss_contributions["endpoint_error_loss_contribution"]
         + loss_contributions["stiffness_error_loss_contribution"]
     )
     metrics = {
         "position_error": position_error.mean(),
         "adjacency_error": adjacency_error.mean(),
-        "endpoint_error": endpoint_error.mean(),
         "stiffness_error": stiffness_error.mean(),
     }
     loss_summary = {name: value.mean() for name, value in loss_contributions.items()}
@@ -512,14 +457,12 @@ def train_supervised_refiner(
     optimized_cases: OptimizedCases,
     model_config: SupervisedRefinerConfig | None = None,
     train_config: SupervisedTrainingConfig | None = None,
-    curriculum: CurriculumConfig | None = None,
 ) -> tuple[SupervisedRefiner, SupervisedTrainingSummary]:
     optimized_cases.validate()
     train_config = train_config or SupervisedTrainingConfig(dataset_path="")
     model_config = model_config or SupervisedRefinerConfig(
         use_style_token=train_config.use_style_token
     )
-    curriculum = curriculum or CurriculumConfig()
     device = resolve_torch_device(train_config.device)
 
     random.seed(train_config.seed)
@@ -550,7 +493,6 @@ def train_supervised_refiner(
         "total_loss": [],
         "position_error_loss_contribution": [],
         "adjacency_error_loss_contribution": [],
-        "endpoint_error_loss_contribution": [],
         "stiffness_error_loss_contribution": [],
     }
     checkpoint_path = (
@@ -583,15 +525,12 @@ def train_supervised_refiner(
                 batch_cases = batch_cases.to(device)
                 _synchronize_device_if_needed(device)
                 batch_transfer_time = time.perf_counter()
-                difficulty = _difficulty_fraction(step, train_config.num_steps)
                 learning_rate = _scheduled_learning_rate(step, train_config)
                 for parameter_group in optimizer.param_groups:
                     parameter_group["lr"] = learning_rate
                 batch_analysis_profile: dict[str, float] = {}
                 batch = make_supervised_batch(
                     optimized_cases=batch_cases,
-                    curriculum=curriculum,
-                    difficulty=difficulty,
                     position_mean=global_position_mean.to(device),
                     position_std=global_position_std.to(device),
                     adjacency_mean=global_adjacency_mean.to(device),
@@ -650,9 +589,8 @@ def train_supervised_refiner(
                         float(value_tensor.detach().item()),
                         step,
                     )
-                writer.add_scalar("train/curriculum/difficulty", difficulty, step)
                 writer.add_scalar(
-                    "train/curriculum/flow_time_mean",
+                    "train/parameters/flow_time_mean",
                     float(batch.flow_times.mean().item()),
                     step,
                 )
@@ -668,16 +606,14 @@ def train_supervised_refiner(
                     print(
                         f"train step={step + 1}/{train_config.num_steps} "
                         f"batch_cases={batch_cases.optimized_structures.batch_size} "
-                        f"examples_seen={examples_seen} difficulty={difficulty:.3f} "
+                        f"examples_seen={examples_seen} "
                         f"learning_rate={learning_rate:.8f} "
                         f"loss_total={history['total_loss'][-1]:.6f} "
                         f"loss_position={history['position_error_loss_contribution'][-1]:.6f} "
                         f"loss_adjacency={history['adjacency_error_loss_contribution'][-1]:.6f} "
-                        f"loss_endpoint={history['endpoint_error_loss_contribution'][-1]:.6f} "
                         f"loss_stiffness={history['stiffness_error_loss_contribution'][-1]:.6f} "
                         f"metric_position={float(metrics['position_error'].detach().item()):.6f} "
                         f"metric_adjacency={float(metrics['adjacency_error'].detach().item()):.6f} "
-                        f"metric_endpoint={float(metrics['endpoint_error'].detach().item()):.6f} "
                         f"metric_stiffness={float(metrics['stiffness_error'].detach().item()):.6f} "
                         f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
                         f"clip_ratio={clip_ratio:.3f} "
@@ -715,7 +651,6 @@ def train_supervised_refiner(
                 },
                 "model_config": asdict(model_config),
                 "train_config": asdict(train_config),
-                "curriculum_config": asdict(curriculum),
                 "history": history,
             },
             checkpoint_path,

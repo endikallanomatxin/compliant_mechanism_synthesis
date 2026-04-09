@@ -1,7 +1,6 @@
 """Supervised and online training stages built on top of the offline dataset."""
 
 from compliant_mechanism_synthesis.training.supervised import (
-    CurriculumConfig,
     SupervisedBatch,
     SupervisedTrainingSummary,
     SupervisedTrainingConfig,
@@ -17,7 +16,6 @@ from compliant_mechanism_synthesis.training.supervised import (
 )
 
 __all__ = [
-    "CurriculumConfig",
     "SupervisedBatch",
     "SupervisedTrainingSummary",
     "SupervisedTrainingConfig",

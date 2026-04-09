@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from compliant_mechanism_synthesis.dataset.types import OptimizedCases, Structures
 from compliant_mechanism_synthesis.models import SupervisedRefiner
 from compliant_mechanism_synthesis.training.supervised import (
-    CurriculumConfig,
     analyze_structures,
     generalized_stiffness_error,
     make_supervised_batch,
@@ -23,15 +22,10 @@ class RefinementMetrics:
 def evaluate_refinement_step(
     refiner: SupervisedRefiner | Callable[[Structures, object], Structures],
     optimized_cases: OptimizedCases,
-    curriculum: CurriculumConfig | None = None,
-    difficulty: float = 1.0,
     seed: int | None = None,
 ) -> RefinementMetrics:
-    curriculum = curriculum or CurriculumConfig()
     batch = make_supervised_batch(
         optimized_cases=optimized_cases,
-        curriculum=curriculum,
-        difficulty=difficulty,
         seed=seed,
     )
     if isinstance(refiner, SupervisedRefiner):
