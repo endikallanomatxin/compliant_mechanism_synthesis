@@ -166,6 +166,10 @@ def sample_noisy_structures(
     optimized_cases: OptimizedCases,
     curriculum: CurriculumConfig,
     difficulty: float,
+    position_mean: torch.Tensor | None = None,
+    position_std: torch.Tensor | None = None,
+    adjacency_mean: torch.Tensor | None = None,
+    adjacency_std: torch.Tensor | None = None,
     seed: int | None = None,
 ) -> Structures:
     optimized_cases.validate()
@@ -177,8 +181,10 @@ def sample_noisy_structures(
     generator = None
     if seed is not None:
         generator = torch.Generator(device=oracle_positions.device).manual_seed(seed)
-    position_mean, position_std = _dataset_position_statistics(optimized_cases)
-    adjacency_mean, adjacency_std = _dataset_adjacency_statistics(optimized_cases)
+    if position_mean is None or position_std is None:
+        position_mean, position_std = _dataset_position_statistics(optimized_cases)
+    if adjacency_mean is None or adjacency_std is None:
+        adjacency_mean, adjacency_std = _dataset_adjacency_statistics(optimized_cases)
     sampled_positions = position_mean + position_std * torch.randn(
         oracle_positions.shape,
         generator=generator,
@@ -273,6 +279,10 @@ def make_supervised_batch(
     optimized_cases: OptimizedCases,
     curriculum: CurriculumConfig,
     difficulty: float,
+    position_mean: torch.Tensor | None = None,
+    position_std: torch.Tensor | None = None,
+    adjacency_mean: torch.Tensor | None = None,
+    adjacency_std: torch.Tensor | None = None,
     seed: int | None = None,
     profile: dict[str, float] | None = None,
 ) -> SupervisedBatch:
@@ -285,6 +295,10 @@ def make_supervised_batch(
         optimized_cases=optimized_cases,
         curriculum=curriculum,
         difficulty=difficulty,
+        position_mean=position_mean,
+        position_std=position_std,
+        adjacency_mean=adjacency_mean,
+        adjacency_std=adjacency_std,
         seed=seed,
     )
     generator = None
@@ -340,9 +354,9 @@ def make_supervised_batch(
         position_noise_levels=position_noise_levels,
         adjacency_noise_levels=adjacency_noise_levels,
         target_position_velocity=optimized_cases.optimized_structures.positions
-        - flow_structures.positions,
+        - source_structures.positions,
         target_adjacency_velocity=optimized_cases.optimized_structures.adjacency
-        - flow_structures.adjacency,
+        - source_structures.adjacency,
     )
 
 
@@ -524,6 +538,12 @@ def train_supervised_refiner(
 
     dataset_cases = optimized_cases.optimized_structures.batch_size
     steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
+    global_position_mean, global_position_std = _dataset_position_statistics(
+        optimized_cases
+    )
+    global_adjacency_mean, global_adjacency_std = _dataset_adjacency_statistics(
+        optimized_cases
+    )
     model = SupervisedRefiner(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
     history = {
@@ -572,6 +592,10 @@ def train_supervised_refiner(
                     optimized_cases=batch_cases,
                     curriculum=curriculum,
                     difficulty=difficulty,
+                    position_mean=global_position_mean.to(device),
+                    position_std=global_position_std.to(device),
+                    adjacency_mean=global_adjacency_mean.to(device),
+                    adjacency_std=global_adjacency_std.to(device),
                     seed=train_config.seed + step,
                     profile=batch_analysis_profile,
                 )

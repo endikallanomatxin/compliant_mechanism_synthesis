@@ -69,11 +69,11 @@ def test_make_supervised_batch_returns_noisy_structures(tmp_path: Path) -> None:
     )
     assert torch.allclose(
         batch.target_position_velocity,
-        batch.oracle_structures.positions - batch.flow_structures.positions,
+        batch.oracle_structures.positions - batch.source_structures.positions,
     )
     assert torch.allclose(
         batch.target_adjacency_velocity,
-        batch.oracle_structures.adjacency - batch.flow_structures.adjacency,
+        batch.oracle_structures.adjacency - batch.source_structures.adjacency,
     )
 
 
@@ -106,6 +106,39 @@ def test_sample_noisy_structures_is_seeded_gaussian_from_dataset_stats(
     assert not torch.allclose(structures_a.positions, structures_c.positions)
     assert not torch.allclose(
         structures_a.positions, optimized_cases.optimized_structures.positions
+    )
+
+
+def test_make_supervised_batch_can_use_global_noise_statistics(tmp_path: Path) -> None:
+    _, optimized_cases = _build_cases(tmp_path)
+    position_mean = optimized_cases.optimized_structures.positions.mean(
+        dim=0, keepdim=True
+    )
+    position_std = optimized_cases.optimized_structures.positions.std(
+        dim=0, unbiased=False, keepdim=True
+    ).clamp_min(1e-3)
+    adjacency_mean = optimized_cases.optimized_structures.adjacency.mean(
+        dim=0, keepdim=True
+    )
+    adjacency_std = optimized_cases.optimized_structures.adjacency.std(
+        dim=0, unbiased=False, keepdim=True
+    ).clamp_min(1e-3)
+
+    batch = make_supervised_batch(
+        optimized_cases=optimized_cases,
+        curriculum=CurriculumConfig(),
+        difficulty=0.5,
+        position_mean=position_mean,
+        position_std=position_std,
+        adjacency_mean=adjacency_mean,
+        adjacency_std=adjacency_std,
+        seed=9,
+    )
+
+    assert batch.noisy_structures.positions.shape == (
+        optimized_cases.optimized_structures.batch_size,
+        optimized_cases.optimized_structures.num_nodes,
+        3,
     )
 
 
