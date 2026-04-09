@@ -7,6 +7,7 @@ from pathlib import Path
 import random
 
 import torch
+from scipy.optimize import linear_sum_assignment
 from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.dataset import load_offline_dataset
@@ -144,6 +145,103 @@ def _dataset_adjacency_statistics(
     return mean, std
 
 
+def _minimum_cost_assignment(cost: torch.Tensor) -> torch.Tensor:
+    num_items = cost.shape[0]
+    if num_items == 0:
+        return torch.empty(0, dtype=torch.long)
+    _, column_indices = linear_sum_assignment(cost.detach().cpu().numpy())
+    return torch.as_tensor(column_indices, dtype=torch.long)
+
+
+def _match_oracle_to_source(
+    source_structures: Structures,
+    oracle_structures: Structures,
+    oracle_analyses: Analyses,
+) -> tuple[Structures, Analyses]:
+    batch_size, num_nodes, _ = source_structures.positions.shape
+    _, _, free_mask = role_masks(source_structures.roles)
+    permutations: list[torch.Tensor] = []
+    for batch_index in range(batch_size):
+        free_indices = torch.nonzero(free_mask[batch_index], as_tuple=False).squeeze(-1)
+        permutation = torch.arange(num_nodes, device=source_structures.positions.device)
+        if free_indices.numel() > 0:
+            source_free = source_structures.positions[batch_index].index_select(
+                0, free_indices
+            )
+            oracle_free = oracle_structures.positions[batch_index].index_select(
+                0, free_indices
+            )
+            cost = torch.cdist(source_free, oracle_free).square()
+            assignment = _minimum_cost_assignment(cost).to(
+                device=source_structures.positions.device
+            )
+            permutation[free_indices] = free_indices.index_select(0, assignment)
+        permutations.append(permutation)
+
+    stacked_permutations = torch.stack(permutations, dim=0)
+    matched_positions = torch.stack(
+        [
+            oracle_structures.positions[index].index_select(
+                0, stacked_permutations[index]
+            )
+            for index in range(batch_size)
+        ],
+        dim=0,
+    )
+    matched_adjacency = torch.stack(
+        [
+            oracle_structures.adjacency[index]
+            .index_select(0, stacked_permutations[index])
+            .index_select(1, stacked_permutations[index])
+            for index in range(batch_size)
+        ],
+        dim=0,
+    )
+    matched_structures = Structures(
+        positions=matched_positions,
+        roles=oracle_structures.roles,
+        adjacency=matched_adjacency,
+    )
+    matched_analyses = Analyses(
+        generalized_stiffness=oracle_analyses.generalized_stiffness,
+        material_usage=oracle_analyses.material_usage,
+        short_beam_penalty=oracle_analyses.short_beam_penalty,
+        long_beam_penalty=oracle_analyses.long_beam_penalty,
+        thin_beam_penalty=oracle_analyses.thin_beam_penalty,
+        thick_beam_penalty=oracle_analyses.thick_beam_penalty,
+        free_node_spacing_penalty=oracle_analyses.free_node_spacing_penalty,
+        nodal_displacements=(
+            None
+            if oracle_analyses.nodal_displacements is None
+            else torch.stack(
+                [
+                    oracle_analyses.nodal_displacements[index].index_select(
+                        0, stacked_permutations[index]
+                    )
+                    for index in range(batch_size)
+                ],
+                dim=0,
+            )
+        ),
+        edge_von_mises=(
+            None
+            if oracle_analyses.edge_von_mises is None
+            else torch.stack(
+                [
+                    oracle_analyses.edge_von_mises[index]
+                    .index_select(0, stacked_permutations[index])
+                    .index_select(1, stacked_permutations[index])
+                    for index in range(batch_size)
+                ],
+                dim=0,
+            )
+        ),
+    )
+    matched_structures.validate()
+    matched_analyses.validate(batch_size)
+    return matched_structures, matched_analyses
+
+
 def sample_noisy_structures(
     optimized_cases: OptimizedCases,
     position_mean: torch.Tensor | None = None,
@@ -270,6 +368,11 @@ def make_supervised_batch(
         adjacency_std=adjacency_std,
         seed=seed,
     )
+    oracle_structures, oracle_analyses = _match_oracle_to_source(
+        source_structures=source_structures,
+        oracle_structures=optimized_cases.optimized_structures,
+        oracle_analyses=optimized_cases.last_analyses,
+    )
     generator = None
     if seed is not None:
         generator = torch.Generator(
@@ -287,12 +390,12 @@ def make_supervised_batch(
     interpolation = flow_times[:, None, None]
     flow_positions = torch.lerp(
         source_structures.positions,
-        optimized_cases.optimized_structures.positions,
+        oracle_structures.positions,
         interpolation,
     )
     flow_adjacency = torch.lerp(
         source_structures.adjacency,
-        optimized_cases.optimized_structures.adjacency,
+        oracle_structures.adjacency,
         interpolation,
     )
     flow_structures = Structures(
@@ -309,21 +412,21 @@ def make_supervised_batch(
         current_analyses = analyze_structures(flow_structures, profile=profile)
     position_noise_levels, adjacency_noise_levels = _flow_noise_levels(
         source_structures=flow_structures,
-        oracle_structures=optimized_cases.optimized_structures,
+        oracle_structures=oracle_structures,
     )
     return SupervisedBatch(
         source_structures=source_structures,
         flow_structures=flow_structures,
         target_stiffness=optimized_cases.target_stiffness,
-        oracle_structures=optimized_cases.optimized_structures,
-        oracle_analyses=optimized_cases.last_analyses,
+        oracle_structures=oracle_structures,
+        oracle_analyses=oracle_analyses,
         current_analyses=current_analyses,
         flow_times=flow_times,
         position_noise_levels=position_noise_levels,
         adjacency_noise_levels=adjacency_noise_levels,
-        target_position_velocity=optimized_cases.optimized_structures.positions
+        target_position_velocity=oracle_structures.positions
         - source_structures.positions,
-        target_adjacency_velocity=optimized_cases.optimized_structures.adjacency
+        target_adjacency_velocity=oracle_structures.adjacency
         - source_structures.adjacency,
     )
 

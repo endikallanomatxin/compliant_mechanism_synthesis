@@ -11,8 +11,13 @@ from compliant_mechanism_synthesis.dataset import (
     PrimitiveConfig,
     generate_offline_dataset,
 )
-from compliant_mechanism_synthesis.dataset.types import Structures
+from compliant_mechanism_synthesis.dataset.types import (
+    Analyses,
+    OptimizedCases,
+    Structures,
+)
 from compliant_mechanism_synthesis.evaluation import evaluate_refinement_step
+from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.training import (
     analyze_structures,
     iter_supervised_batches,
@@ -127,6 +132,96 @@ def test_make_supervised_batch_can_use_global_noise_statistics(tmp_path: Path) -
         optimized_cases.optimized_structures.batch_size,
         optimized_cases.optimized_structures.num_nodes,
         3,
+    )
+
+
+def test_make_supervised_batch_matches_permuted_free_oracle_nodes(
+    tmp_path: Path,
+) -> None:
+    _, optimized_cases = _build_cases(tmp_path)
+    _, _, free_mask = role_masks(optimized_cases.optimized_structures.roles)
+    free_indices = torch.nonzero(free_mask[0], as_tuple=False).squeeze(-1)
+    reversed_free = torch.flip(free_indices, dims=[0])
+    permutation = torch.arange(
+        optimized_cases.optimized_structures.num_nodes, dtype=torch.long
+    )
+    permutation[free_indices] = reversed_free
+
+    permuted_cases = OptimizedCases(
+        target_stiffness=optimized_cases.target_stiffness,
+        optimized_structures=Structures(
+            positions=optimized_cases.optimized_structures.positions.index_select(
+                1, permutation
+            ),
+            roles=optimized_cases.optimized_structures.roles,
+            adjacency=optimized_cases.optimized_structures.adjacency.index_select(
+                1, permutation
+            ).index_select(2, permutation),
+        ),
+        initial_loss=optimized_cases.initial_loss,
+        best_loss=optimized_cases.best_loss,
+        last_analyses=Analyses(
+            generalized_stiffness=optimized_cases.last_analyses.generalized_stiffness,
+            material_usage=optimized_cases.last_analyses.material_usage,
+            short_beam_penalty=optimized_cases.last_analyses.short_beam_penalty,
+            long_beam_penalty=optimized_cases.last_analyses.long_beam_penalty,
+            thin_beam_penalty=optimized_cases.last_analyses.thin_beam_penalty,
+            thick_beam_penalty=optimized_cases.last_analyses.thick_beam_penalty,
+            free_node_spacing_penalty=optimized_cases.last_analyses.free_node_spacing_penalty,
+            nodal_displacements=optimized_cases.last_analyses.nodal_displacements.index_select(
+                1, permutation
+            ),
+            edge_von_mises=optimized_cases.last_analyses.edge_von_mises.index_select(
+                1, permutation
+            ).index_select(2, permutation),
+        ),
+        scaffolds=optimized_cases.scaffolds,
+    )
+    position_mean = optimized_cases.optimized_structures.positions.mean(
+        dim=0, keepdim=True
+    )
+    position_std = optimized_cases.optimized_structures.positions.std(
+        dim=0, unbiased=False, keepdim=True
+    ).clamp_min(1e-3)
+    adjacency_mean = optimized_cases.optimized_structures.adjacency.mean(
+        dim=0, keepdim=True
+    )
+    adjacency_std = optimized_cases.optimized_structures.adjacency.std(
+        dim=0, unbiased=False, keepdim=True
+    ).clamp_min(1e-3)
+
+    reference_batch = make_supervised_batch(
+        optimized_cases=optimized_cases,
+        position_mean=position_mean,
+        position_std=position_std,
+        adjacency_mean=adjacency_mean,
+        adjacency_std=adjacency_std,
+        seed=12,
+    )
+    permuted_batch = make_supervised_batch(
+        optimized_cases=permuted_cases,
+        position_mean=position_mean,
+        position_std=position_std,
+        adjacency_mean=adjacency_mean,
+        adjacency_std=adjacency_std,
+        seed=12,
+    )
+
+    assert torch.allclose(
+        reference_batch.source_structures.positions,
+        permuted_batch.source_structures.positions,
+    )
+    assert torch.allclose(
+        reference_batch.oracle_structures.positions,
+        permuted_batch.oracle_structures.positions,
+    )
+    assert torch.allclose(
+        reference_batch.target_position_velocity,
+        permuted_batch.target_position_velocity,
+    )
+    assert torch.allclose(
+        reference_batch.target_adjacency_velocity,
+        permuted_batch.target_adjacency_velocity,
     )
 
 
