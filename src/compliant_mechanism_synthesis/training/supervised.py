@@ -40,13 +40,13 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class SupervisedTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 32
+    batch_size: int = 48
     log_every_steps: int = 10
     max_grad_norm: float = 1.0
-    num_steps: int = 4_096
-    learning_rate: float = 1e-4
+    num_steps: int = 65_536
+    learning_rate: float = 2e-4
     warmup_steps: int = 500
-    min_learning_rate: float = 1e-6
+    min_learning_rate: float = 1e-5
     use_style_token: bool = True
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 1.0
