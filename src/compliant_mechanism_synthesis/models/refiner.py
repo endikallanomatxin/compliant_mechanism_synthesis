@@ -44,10 +44,10 @@ class FlowPrediction:
 
 @dataclass(frozen=True)
 class SupervisedRefinerConfig:
-    hidden_dim: int = 256
-    latent_dim: int = 128
+    hidden_dim: int = 128
+    latent_dim: int = 64
     num_attention_layers: int = 8
-    num_heads: int = 8
+    num_heads: int = 4
     num_integration_steps: int = 8
     max_distance: float = 0.24
     transition_width: float = 0.08
@@ -193,7 +193,15 @@ class GraphAttentionBlock(nn.Module):
 
 
 class StyleTokenEncoder(nn.Module):
-    def __init__(self, config: SupervisedRefinerConfig) -> None:
+    def __init__(
+        self,
+        config: SupervisedRefinerConfig,
+        position_mlp: nn.Module,
+        nodal_displacement_mlp: nn.Module,
+        edge_von_mises_mlp: nn.Module,
+        role_embedding: nn.Embedding,
+        mechanics_condition_mlp: nn.Module,
+    ) -> None:
         super().__init__()
         style_hidden_dim = max(config.num_heads, config.hidden_dim // 2)
         if style_hidden_dim % config.num_heads != 0:
@@ -201,46 +209,14 @@ class StyleTokenEncoder(nn.Module):
                 1, style_hidden_dim // config.num_heads
             )
         self.hidden_dim = style_hidden_dim
-        self.position_mlp = nn.Sequential(
-            nn.Linear(3, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-        )
-        self.nodal_displacement_mlp = nn.Sequential(
-            nn.Linear(18, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-        )
-        self.edge_von_mises_mlp = nn.Sequential(
-            nn.Linear(6, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, config.num_heads),
-        )
-        self.role_embedding = nn.Embedding(3, style_hidden_dim)
-        self.mechanics_condition_mlp = nn.Sequential(
-            nn.Linear(63, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-        )
-        self.time_mlp = nn.Sequential(
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
-        )
-        self.noise_condition_mlp = nn.Sequential(
-            nn.Linear(3, style_hidden_dim),
-            nn.GELU(),
-            nn.Linear(style_hidden_dim, style_hidden_dim),
+        self.shared_hidden_dim = config.hidden_dim
+        self.position_mlp = position_mlp
+        self.nodal_displacement_mlp = nodal_displacement_mlp
+        self.edge_von_mises_mlp = edge_von_mises_mlp
+        self.role_embedding = role_embedding
+        self.mechanics_condition_mlp = mechanics_condition_mlp
+        self.stem_down_proj = nn.Sequential(
+            nn.Linear(config.hidden_dim, style_hidden_dim),
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
         )
@@ -272,19 +248,17 @@ class StyleTokenEncoder(nn.Module):
         structures: Structures,
         analyses: Analyses,
         target_stiffness: torch.Tensor,
-        flow_times: torch.Tensor,
-        position_noise_levels: torch.Tensor,
-        adjacency_noise_levels: torch.Tensor,
     ) -> torch.Tensor:
         if analyses.nodal_displacements is None:
             raise ValueError("style analyses must provide nodal_displacements")
         if analyses.edge_von_mises is None:
             raise ValueError("style analyses must provide edge_von_mises")
-        hidden = self.position_mlp(structures.positions) + self.nodal_displacement_mlp(
+        shared_hidden = self.position_mlp(
+            structures.positions
+        ) + self.nodal_displacement_mlp(
             _signed_log1p_features(analyses.nodal_displacements)
         )
-        hidden = hidden + self.role_embedding(structures.roles)
-        hidden = self.input_norm(hidden)
+        shared_hidden = shared_hidden + self.role_embedding(structures.roles)
         residual_stiffness = target_stiffness - analyses.generalized_stiffness
         mechanics_features = torch.cat(
             [
@@ -294,18 +268,10 @@ class StyleTokenEncoder(nn.Module):
             ],
             dim=1,
         )
-        hidden = hidden + self.mechanics_condition_mlp(mechanics_features)[:, None, :]
-        hidden = (
-            hidden
-            + self.time_mlp(sinusoidal_embedding(flow_times, self.hidden_dim))[
-                :, None, :
-            ]
+        shared_hidden = (
+            shared_hidden + self.mechanics_condition_mlp(mechanics_features)[:, None, :]
         )
-        noise_features = torch.stack(
-            [flow_times, position_noise_levels, adjacency_noise_levels],
-            dim=1,
-        )
-        hidden = hidden + self.noise_condition_mlp(noise_features)[:, None, :]
+        hidden = self.input_norm(self.stem_down_proj(shared_hidden))
         edge_stress_conditioning = self.edge_von_mises_mlp(
             torch.log1p(
                 torch.nan_to_num(
@@ -381,7 +347,16 @@ class SupervisedRefiner(nn.Module):
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
         self.style_token_encoder = (
-            StyleTokenEncoder(self.config) if self.config.use_style_token else None
+            StyleTokenEncoder(
+                self.config,
+                position_mlp=self.position_mlp,
+                nodal_displacement_mlp=self.nodal_displacement_mlp,
+                edge_von_mises_mlp=self.edge_von_mises_mlp,
+                role_embedding=self.role_embedding,
+                mechanics_condition_mlp=self.mechanics_condition_mlp,
+            )
+            if self.config.use_style_token
+            else None
         )
         self.input_norm = nn.LayerNorm(self.config.hidden_dim)
         layer_modes = ("distance", "connectivity", "stress", "free")
@@ -528,15 +503,10 @@ class SupervisedRefiner(nn.Module):
                 raise RuntimeError("style token encoder is not initialized")
             if style_analyses is None:
                 raise RuntimeError("style analyses are required for style conditioning")
-            style_flow_times = torch.ones_like(flow_times)
-            style_noise = torch.zeros_like(flow_times)
             style_context = self.style_token_encoder(
                 structures=style_structures,
                 analyses=style_analyses,
                 target_stiffness=target_stiffness,
-                flow_times=style_flow_times,
-                position_noise_levels=style_noise,
-                adjacency_noise_levels=style_noise,
             )
 
         for layer in self.layers:
