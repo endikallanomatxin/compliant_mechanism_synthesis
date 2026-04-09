@@ -44,10 +44,10 @@ class FlowPrediction:
 
 @dataclass(frozen=True)
 class SupervisedRefinerConfig:
-    hidden_dim: int = 128
-    latent_dim: int = 64
-    num_attention_layers: int = 6
-    num_heads: int = 4
+    hidden_dim: int = 256
+    latent_dim: int = 128
+    num_attention_layers: int = 8
+    num_heads: int = 8
     num_integration_steps: int = 8
     max_distance: float = 0.24
     transition_width: float = 0.08
@@ -205,14 +205,20 @@ class StyleTokenEncoder(nn.Module):
             nn.Linear(3, style_hidden_dim),
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
         )
         self.nodal_displacement_mlp = nn.Sequential(
             nn.Linear(18, style_hidden_dim),
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
         )
         self.edge_von_mises_mlp = nn.Sequential(
             nn.Linear(6, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
             nn.GELU(),
             nn.Linear(style_hidden_dim, config.num_heads),
         )
@@ -221,14 +227,20 @@ class StyleTokenEncoder(nn.Module):
             nn.Linear(63, style_hidden_dim),
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
         )
         self.time_mlp = nn.Sequential(
+            nn.Linear(style_hidden_dim, style_hidden_dim),
+            nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
         )
         self.noise_condition_mlp = nn.Sequential(
             nn.Linear(3, style_hidden_dim),
+            nn.GELU(),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
         )
@@ -247,6 +259,8 @@ class StyleTokenEncoder(nn.Module):
         self.final_norm = nn.LayerNorm(style_hidden_dim)
         self.token_proj = nn.Sequential(
             nn.Linear(style_hidden_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.GELU(),
             nn.Linear(config.hidden_dim, config.hidden_dim),
         )
@@ -327,14 +341,20 @@ class SupervisedRefiner(nn.Module):
             nn.Linear(3, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
         self.nodal_displacement_mlp = nn.Sequential(
             nn.Linear(18, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
         self.edge_von_mises_mlp = nn.Sequential(
             nn.Linear(6, self.config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.num_heads),
         )
@@ -343,14 +363,20 @@ class SupervisedRefiner(nn.Module):
             nn.Linear(63, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
         self.time_mlp = nn.Sequential(
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
         self.noise_condition_mlp = nn.Sequential(
             nn.Linear(3, self.config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
@@ -375,9 +401,13 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
             nn.Linear(self.config.hidden_dim, 3),
         )
         self.node_latent_head = nn.Sequential(
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
