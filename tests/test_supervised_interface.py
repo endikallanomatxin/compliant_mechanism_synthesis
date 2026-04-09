@@ -106,18 +106,40 @@ def test_sample_noisy_structures_is_seeded_gaussian_from_dataset_stats(
 
 def test_make_supervised_batch_can_use_global_noise_statistics(tmp_path: Path) -> None:
     _, optimized_cases = _build_cases(tmp_path)
-    position_mean = optimized_cases.optimized_structures.positions.mean(
-        dim=0, keepdim=True
+    _, _, free_mask = role_masks(optimized_cases.optimized_structures.roles)
+    free_positions = optimized_cases.optimized_structures.positions[free_mask]
+    position_mean = free_positions.mean(dim=0, keepdim=True).view(1, 1, 3)
+    position_std = (
+        free_positions.std(dim=0, unbiased=False).clamp_min(1e-3).view(1, 1, 3)
     )
-    position_std = optimized_cases.optimized_structures.positions.std(
-        dim=0, unbiased=False, keepdim=True
-    ).clamp_min(1e-3)
-    adjacency_mean = optimized_cases.optimized_structures.adjacency.mean(
-        dim=0, keepdim=True
+    fixed_mask, mobile_mask, free_mask = role_masks(
+        optimized_cases.optimized_structures.roles
     )
-    adjacency_std = optimized_cases.optimized_structures.adjacency.std(
-        dim=0, unbiased=False, keepdim=True
-    ).clamp_min(1e-3)
+    diagonal = torch.eye(
+        optimized_cases.optimized_structures.num_nodes, dtype=torch.bool
+    ).unsqueeze(0)
+    free_free = (free_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)) & ~diagonal
+    free_fixed = (free_mask.unsqueeze(-1) & fixed_mask.unsqueeze(-2)) | (
+        fixed_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    free_mobile = (free_mask.unsqueeze(-1) & mobile_mask.unsqueeze(-2)) | (
+        mobile_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    adjacency_values = optimized_cases.optimized_structures.adjacency
+    adjacency_mean = torch.stack(
+        [
+            adjacency_values[free_free].mean(),
+            adjacency_values[free_fixed].mean(),
+            adjacency_values[free_mobile].mean(),
+        ]
+    )
+    adjacency_std = torch.stack(
+        [
+            adjacency_values[free_free].std(unbiased=False).clamp_min(1e-3),
+            adjacency_values[free_fixed].std(unbiased=False).clamp_min(1e-3),
+            adjacency_values[free_mobile].std(unbiased=False).clamp_min(1e-3),
+        ]
+    )
 
     batch = make_supervised_batch(
         optimized_cases=optimized_cases,
@@ -177,18 +199,39 @@ def test_make_supervised_batch_matches_permuted_free_oracle_nodes(
         ),
         scaffolds=optimized_cases.scaffolds,
     )
-    position_mean = optimized_cases.optimized_structures.positions.mean(
-        dim=0, keepdim=True
+    all_free_positions = optimized_cases.optimized_structures.positions[free_mask]
+    position_mean = all_free_positions.mean(dim=0, keepdim=True).view(1, 1, 3)
+    position_std = (
+        all_free_positions.std(dim=0, unbiased=False).clamp_min(1e-3).view(1, 1, 3)
     )
-    position_std = optimized_cases.optimized_structures.positions.std(
-        dim=0, unbiased=False, keepdim=True
-    ).clamp_min(1e-3)
-    adjacency_mean = optimized_cases.optimized_structures.adjacency.mean(
-        dim=0, keepdim=True
+    fixed_mask, mobile_mask, free_mask = role_masks(
+        optimized_cases.optimized_structures.roles
     )
-    adjacency_std = optimized_cases.optimized_structures.adjacency.std(
-        dim=0, unbiased=False, keepdim=True
-    ).clamp_min(1e-3)
+    diagonal = torch.eye(
+        optimized_cases.optimized_structures.num_nodes, dtype=torch.bool
+    ).unsqueeze(0)
+    free_free = (free_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)) & ~diagonal
+    free_fixed = (free_mask.unsqueeze(-1) & fixed_mask.unsqueeze(-2)) | (
+        fixed_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    free_mobile = (free_mask.unsqueeze(-1) & mobile_mask.unsqueeze(-2)) | (
+        mobile_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    adjacency_values = optimized_cases.optimized_structures.adjacency
+    adjacency_mean = torch.stack(
+        [
+            adjacency_values[free_free].mean(),
+            adjacency_values[free_fixed].mean(),
+            adjacency_values[free_mobile].mean(),
+        ]
+    )
+    adjacency_std = torch.stack(
+        [
+            adjacency_values[free_free].std(unbiased=False).clamp_min(1e-3),
+            adjacency_values[free_fixed].std(unbiased=False).clamp_min(1e-3),
+            adjacency_values[free_mobile].std(unbiased=False).clamp_min(1e-3),
+        ]
+    )
 
     reference_batch = make_supervised_batch(
         optimized_cases=optimized_cases,

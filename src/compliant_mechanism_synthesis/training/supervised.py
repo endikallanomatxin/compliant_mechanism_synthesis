@@ -128,8 +128,11 @@ def _dataset_position_statistics(
     optimized_cases: OptimizedCases,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     positions = optimized_cases.optimized_structures.positions
-    mean = positions.mean(dim=0, keepdim=True)
-    std = positions.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-3)
+    _, _, free_mask = role_masks(optimized_cases.optimized_structures.roles)
+    free_positions = positions[free_mask]
+    mean = free_positions.mean(dim=0, keepdim=True).view(1, 1, 3)
+    std = free_positions.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-3)
+    std = std.view(1, 1, 3)
     return mean, std
 
 
@@ -137,12 +140,64 @@ def _dataset_adjacency_statistics(
     optimized_cases: OptimizedCases,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     adjacency = optimized_cases.optimized_structures.adjacency
-    mean = adjacency.mean(dim=0, keepdim=True)
-    std = adjacency.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-3)
-    diagonal = torch.arange(adjacency.shape[1], device=adjacency.device)
-    mean[:, diagonal, diagonal] = 0.0
-    std[:, diagonal, diagonal] = 1e-3
+    fixed_mask, mobile_mask, free_mask = role_masks(
+        optimized_cases.optimized_structures.roles
+    )
+    diagonal = torch.eye(adjacency.shape[1], device=adjacency.device, dtype=torch.bool)
+    diagonal = diagonal.unsqueeze(0)
+    free_free = (free_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)) & ~diagonal
+    free_fixed = (free_mask.unsqueeze(-1) & fixed_mask.unsqueeze(-2)) | (
+        fixed_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    free_mobile = (free_mask.unsqueeze(-1) & mobile_mask.unsqueeze(-2)) | (
+        mobile_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    masks = [free_free, free_fixed, free_mobile]
+    means: list[torch.Tensor] = []
+    stds: list[torch.Tensor] = []
+    for mask in masks:
+        values = adjacency[mask]
+        means.append(values.mean())
+        stds.append(values.std(unbiased=False).clamp_min(1e-3))
+    mean = torch.stack(means)
+    std = torch.stack(stds)
     return mean, std
+
+
+def _role_pair_adjacency_matrices(
+    roles: torch.Tensor,
+    adjacency_mean: torch.Tensor,
+    adjacency_std: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fixed_mask, mobile_mask, free_mask = role_masks(roles)
+    batch_size, num_nodes = roles.shape
+    mean_matrix = torch.zeros(
+        batch_size,
+        num_nodes,
+        num_nodes,
+        device=roles.device,
+        dtype=adjacency_mean.dtype,
+    )
+    std_matrix = torch.zeros(
+        batch_size, num_nodes, num_nodes, device=roles.device, dtype=adjacency_std.dtype
+    )
+    free_free = free_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    free_fixed = (free_mask.unsqueeze(-1) & fixed_mask.unsqueeze(-2)) | (
+        fixed_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    free_mobile = (free_mask.unsqueeze(-1) & mobile_mask.unsqueeze(-2)) | (
+        mobile_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    mean_matrix = mean_matrix.masked_fill(free_free, float(adjacency_mean[0].item()))
+    mean_matrix = mean_matrix.masked_fill(free_fixed, float(adjacency_mean[1].item()))
+    mean_matrix = mean_matrix.masked_fill(free_mobile, float(adjacency_mean[2].item()))
+    std_matrix = std_matrix.masked_fill(free_free, float(adjacency_std[0].item()))
+    std_matrix = std_matrix.masked_fill(free_fixed, float(adjacency_std[1].item()))
+    std_matrix = std_matrix.masked_fill(free_mobile, float(adjacency_std[2].item()))
+    diagonal = torch.arange(num_nodes, device=roles.device)
+    mean_matrix[:, diagonal, diagonal] = 0.0
+    std_matrix[:, diagonal, diagonal] = 0.0
+    return mean_matrix, std_matrix
 
 
 def _minimum_cost_assignment(cost: torch.Tensor) -> torch.Tensor:
@@ -261,13 +316,18 @@ def sample_noisy_structures(
         position_mean, position_std = _dataset_position_statistics(optimized_cases)
     if adjacency_mean is None or adjacency_std is None:
         adjacency_mean, adjacency_std = _dataset_adjacency_statistics(optimized_cases)
+    adjacency_mean_matrix, adjacency_std_matrix = _role_pair_adjacency_matrices(
+        optimized_cases.optimized_structures.roles,
+        adjacency_mean.to(device=oracle_adjacency.device, dtype=oracle_adjacency.dtype),
+        adjacency_std.to(device=oracle_adjacency.device, dtype=oracle_adjacency.dtype),
+    )
     sampled_positions = position_mean + position_std * torch.randn(
         oracle_positions.shape,
         generator=generator,
         device=oracle_positions.device,
         dtype=oracle_positions.dtype,
     )
-    sampled_adjacency = adjacency_mean + adjacency_std * torch.randn(
+    sampled_adjacency = adjacency_mean_matrix + adjacency_std_matrix * torch.randn(
         oracle_adjacency.shape,
         generator=generator,
         device=oracle_adjacency.device,
