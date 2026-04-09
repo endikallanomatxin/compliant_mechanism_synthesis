@@ -50,7 +50,7 @@ class SupervisedTrainingConfig:
     use_style_token: bool = True
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 1.0
-    stiffness_loss_weight: float = 0.001
+    stiffness_loss_weight: float = 0.0
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
     seed: int = 7
@@ -65,8 +65,6 @@ class SupervisedBatch:
     oracle_analyses: Analyses
     current_analyses: Analyses
     flow_times: torch.Tensor
-    position_noise_levels: torch.Tensor
-    adjacency_noise_levels: torch.Tensor
     target_position_velocity: torch.Tensor
     target_adjacency_velocity: torch.Tensor
 
@@ -389,28 +387,6 @@ def analyze_structures(
     )
 
 
-def _flow_noise_levels(
-    source_structures: Structures,
-    oracle_structures: Structures,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    _, _, free_mask = role_masks(source_structures.roles)
-    free_mask = free_mask.unsqueeze(-1).to(dtype=source_structures.positions.dtype)
-    free_count = free_mask.sum(dim=(1, 2)).clamp_min(1.0)
-    position_gap = (
-        (
-            (oracle_structures.positions - source_structures.positions).square()
-            * free_mask
-        ).sum(dim=(1, 2))
-        / free_count
-    ).sqrt()
-    adjacency_gap = (
-        (oracle_structures.adjacency - source_structures.adjacency)
-        .square()
-        .mean(dim=(1, 2))
-    ).sqrt()
-    return position_gap, adjacency_gap
-
-
 def make_supervised_batch(
     optimized_cases: OptimizedCases,
     position_mean: torch.Tensor | None = None,
@@ -470,10 +446,6 @@ def make_supervised_batch(
     # model's own predictions.
     with torch.no_grad():
         current_analyses = analyze_structures(flow_structures, profile=profile)
-    position_noise_levels, adjacency_noise_levels = _flow_noise_levels(
-        source_structures=flow_structures,
-        oracle_structures=oracle_structures,
-    )
     return SupervisedBatch(
         source_structures=source_structures,
         flow_structures=flow_structures,
@@ -482,8 +454,6 @@ def make_supervised_batch(
         oracle_analyses=oracle_analyses,
         current_analyses=current_analyses,
         flow_times=flow_times,
-        position_noise_levels=position_noise_levels,
-        adjacency_noise_levels=adjacency_noise_levels,
         target_position_velocity=oracle_structures.positions
         - source_structures.positions,
         target_adjacency_velocity=oracle_structures.adjacency
@@ -571,13 +541,16 @@ def _training_losses(
     if config.stiffness_loss_weight > 0.0:
         _, _, free_mask = role_masks(batch.flow_structures.roles)
         free_mask = free_mask.unsqueeze(-1).to(dtype=prediction.position_velocity.dtype)
+        remaining = (1.0 - batch.flow_times)[:, None, None]
         estimated_positions = (
-            batch.flow_structures.positions + prediction.position_velocity * free_mask
+            batch.flow_structures.positions
+            + remaining * prediction.position_velocity * free_mask
         ).clamp(0.0, 1.0)
         estimated_adjacency = enforce_role_adjacency_constraints(
-            (batch.flow_structures.adjacency + prediction.adjacency_velocity).clamp(
-                0.0, 1.0
-            ),
+            (
+                batch.flow_structures.adjacency
+                + remaining * prediction.adjacency_velocity
+            ).clamp(0.0, 1.0),
             batch.flow_structures.roles,
         )
         estimated = Structures(
@@ -710,8 +683,6 @@ def train_supervised_refiner(
                     nodal_displacements=batch.current_analyses.nodal_displacements,
                     edge_von_mises=batch.current_analyses.edge_von_mises,
                     flow_times=batch.flow_times,
-                    position_noise_levels=batch.position_noise_levels,
-                    adjacency_noise_levels=batch.adjacency_noise_levels,
                     style_structures=(
                         batch.oracle_structures
                         if model.config.use_style_token

@@ -171,8 +171,6 @@ def test_predict_flow_rejects_mismatched_style_roles(tmp_path: Path) -> None:
             nodal_displacements=batch.current_analyses.nodal_displacements,
             edge_von_mises=batch.current_analyses.edge_von_mises,
             flow_times=batch.flow_times,
-            position_noise_levels=batch.position_noise_levels,
-            adjacency_noise_levels=batch.adjacency_noise_levels,
             style_structures=type(batch.oracle_structures)(
                 positions=batch.oracle_structures.positions,
                 roles=mismatched_roles,
@@ -209,8 +207,6 @@ def test_predict_flow_ignores_style_inputs_when_style_token_disabled(
         nodal_displacements=batch.current_analyses.nodal_displacements,
         edge_von_mises=batch.current_analyses.edge_von_mises,
         flow_times=batch.flow_times,
-        position_noise_levels=batch.position_noise_levels,
-        adjacency_noise_levels=batch.adjacency_noise_levels,
         style_structures=type(batch.oracle_structures)(
             positions=batch.oracle_structures.positions,
             roles=mismatched_roles,
@@ -248,8 +244,6 @@ def test_predict_flow_stabilizes_large_mechanics_inputs(tmp_path: Path) -> None:
         nodal_displacements=huge_displacements,
         edge_von_mises=huge_stresses,
         flow_times=batch.flow_times,
-        position_noise_levels=batch.position_noise_levels,
-        adjacency_noise_levels=batch.adjacency_noise_levels,
         style_structures=batch.oracle_structures,
         style_analyses=batch.oracle_analyses,
     )
@@ -283,7 +277,5 @@ def test_predict_flow_requires_style_analyses_with_style_structures(
             nodal_displacements=batch.current_analyses.nodal_displacements,
             edge_von_mises=batch.current_analyses.edge_von_mises,
             flow_times=batch.flow_times,
-            position_noise_levels=batch.position_noise_levels,
-            adjacency_noise_levels=batch.adjacency_noise_levels,
             style_structures=batch.oracle_structures,
         )

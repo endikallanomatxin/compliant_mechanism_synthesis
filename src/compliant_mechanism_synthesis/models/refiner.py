@@ -346,13 +346,6 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
-        self.noise_condition_mlp = nn.Sequential(
-            nn.Linear(3, self.config.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
-        )
         self.style_token_encoder = (
             StyleTokenEncoder(
                 self.config,
@@ -407,8 +400,6 @@ class SupervisedRefiner(nn.Module):
         nodal_displacements: torch.Tensor,
         edge_von_mises: torch.Tensor,
         flow_times: torch.Tensor,
-        position_noise_levels: torch.Tensor,
-        adjacency_noise_levels: torch.Tensor,
         style_structures: Structures | None = None,
         style_analyses: Analyses | None = None,
     ) -> FlowPrediction:
@@ -457,13 +448,8 @@ class SupervisedRefiner(nn.Module):
             and not torch.equal(style_structures.roles, structures.roles)
         ):
             raise ValueError("style_structures must use the same node roles")
-        for name, value in (
-            ("flow_times", flow_times),
-            ("position_noise_levels", position_noise_levels),
-            ("adjacency_noise_levels", adjacency_noise_levels),
-        ):
-            if value.shape != (structures.batch_size,):
-                raise ValueError(f"{name} must have shape [batch]")
+        if flow_times.shape != (structures.batch_size,):
+            raise ValueError("flow_times must have shape [batch]")
 
         positions = structures.positions
         roles = structures.roles
@@ -505,11 +491,6 @@ class SupervisedRefiner(nn.Module):
                 :, None, :
             ]
         )
-        noise_features = torch.stack(
-            [flow_times, position_noise_levels, adjacency_noise_levels],
-            dim=1,
-        )
-        hidden = hidden + self.noise_condition_mlp(noise_features)[:, None, :]
         style_context = None
         if self.config.use_style_token and style_structures is not None:
             if self.style_token_encoder is None:
@@ -618,7 +599,6 @@ class SupervisedRefiner(nn.Module):
                 (current.batch_size,),
                 (step + 0.5) / num_steps,
             )
-            remaining = 1.0 - flow_time
             prediction = self.predict_flow(
                 structures=current,
                 target_stiffness=target_stiffness,
@@ -626,8 +606,6 @@ class SupervisedRefiner(nn.Module):
                 nodal_displacements=analyses.nodal_displacements,
                 edge_von_mises=analyses.edge_von_mises,
                 flow_times=flow_time,
-                position_noise_levels=remaining * initial_position_gap,
-                adjacency_noise_levels=remaining * initial_adjacency_gap,
                 style_structures=style_structures,
                 style_analyses=style_analyses,
             )
