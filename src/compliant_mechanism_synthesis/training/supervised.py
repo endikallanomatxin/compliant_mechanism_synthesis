@@ -37,8 +37,11 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 
 @dataclass(frozen=True)
 class CurriculumConfig:
-    # Blend factor between the optimized oracle and a Gaussian structure-noise
-    # sample drawn from dataset statistics in normalized design space.
+    # Maximum noise fraction along the straight path from the optimized oracle
+    # to a Gaussian structure-noise sample drawn from dataset statistics. At a
+    # given difficulty, supervision samples a single interpolation time
+    # `t ~ U(1 - noise_fraction, 1)` and trains one local flow-matching step on
+    # the resulting `x_t`.
     initial_mix: float = 0.15
     final_mix: float = 1.0
 
@@ -47,13 +50,11 @@ class CurriculumConfig:
 class SupervisedTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 16
+    batch_size: int = 64
     log_every_steps: int = 10
     max_grad_norm: float = 1.0
     num_steps: int = 4_096
-    initial_diffusion_steps: int = 1
-    final_diffusion_steps: int = 4
-    learning_rate: float = 1e-5
+    learning_rate: float = 1e-4
     warmup_steps: int = 500
     min_learning_rate: float = 1e-6
     use_style_token: bool = True
@@ -130,118 +131,9 @@ def _scheduled_learning_rate(
     )
 
 
-def _scheduled_diffusion_steps(
-    step: int,
-    config: SupervisedTrainingConfig,
-) -> int:
-    if config.initial_diffusion_steps <= 0:
-        raise ValueError("initial_diffusion_steps must be positive")
-    if config.final_diffusion_steps <= 0:
-        raise ValueError("final_diffusion_steps must be positive")
-    if config.final_diffusion_steps < config.initial_diffusion_steps:
-        raise ValueError("final_diffusion_steps must be >= initial_diffusion_steps")
-    progress = _difficulty_fraction(step, config.num_steps)
-    span = config.final_diffusion_steps - config.initial_diffusion_steps
-    return config.initial_diffusion_steps + int(progress * span)
-
-
 def _synchronize_device_if_needed(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-
-
-def _step_batch(
-    batch: SupervisedBatch,
-    structures: Structures,
-    current_analyses: Analyses,
-    flow_times: torch.Tensor,
-    position_noise_levels: torch.Tensor,
-    adjacency_noise_levels: torch.Tensor,
-) -> SupervisedBatch:
-    return SupervisedBatch(
-        source_structures=batch.source_structures,
-        flow_structures=structures,
-        target_stiffness=batch.target_stiffness,
-        oracle_structures=batch.oracle_structures,
-        oracle_analyses=batch.oracle_analyses,
-        current_analyses=current_analyses,
-        flow_times=flow_times,
-        position_noise_levels=position_noise_levels,
-        adjacency_noise_levels=adjacency_noise_levels,
-        target_position_velocity=batch.oracle_structures.positions
-        - structures.positions,
-        target_adjacency_velocity=batch.oracle_structures.adjacency
-        - structures.adjacency,
-    )
-
-
-def _apply_diffusion_step(
-    structures: Structures,
-    prediction: FlowPrediction,
-    num_steps: int,
-) -> Structures:
-    _, _, free_mask = role_masks(structures.roles)
-    free_mask = free_mask.unsqueeze(-1).to(dtype=structures.positions.dtype)
-    step_size = 1.0 / num_steps
-    position_candidate = (
-        structures.positions + step_size * prediction.position_velocity * free_mask
-    )
-    position_candidate = torch.where(
-        torch.isfinite(position_candidate),
-        position_candidate,
-        structures.positions,
-    )
-    positions = position_candidate.clamp(0.0, 1.0)
-    adjacency = enforce_role_adjacency_constraints(
-        symmetrize_matrix(
-            torch.where(
-                torch.isfinite(
-                    structures.adjacency + step_size * prediction.adjacency_velocity
-                ),
-                structures.adjacency + step_size * prediction.adjacency_velocity,
-                structures.adjacency,
-            ).clamp(0.0, 1.0)
-        ),
-        structures.roles,
-    )
-    return Structures(positions=positions, roles=structures.roles, adjacency=adjacency)
-
-
-def _sanitize_prediction(prediction: FlowPrediction) -> FlowPrediction:
-    return FlowPrediction(
-        position_velocity=torch.nan_to_num(
-            prediction.position_velocity,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ),
-        adjacency_velocity=torch.nan_to_num(
-            prediction.adjacency_velocity,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ),
-        predicted_adjacency=torch.nan_to_num(
-            prediction.predicted_adjacency,
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        ),
-        node_latents=torch.nan_to_num(
-            prediction.node_latents,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ),
-    )
-
-
-def _accumulate_profile(
-    total: dict[str, float],
-    update: dict[str, float],
-) -> None:
-    for key, value in update.items():
-        total[key] = total.get(key, 0.0) + value
 
 
 def load_supervised_cases(dataset_path: str) -> OptimizedCases:
@@ -277,10 +169,8 @@ def sample_noisy_structures(
     seed: int | None = None,
 ) -> Structures:
     optimized_cases.validate()
-    difficulty = float(min(max(difficulty, 0.0), 1.0))
-    mix = curriculum.initial_mix + difficulty * (
-        curriculum.final_mix - curriculum.initial_mix
-    )
+    del curriculum
+    del difficulty
 
     oracle_positions = optimized_cases.optimized_structures.positions
     oracle_adjacency = optimized_cases.optimized_structures.adjacency
@@ -301,13 +191,9 @@ def sample_noisy_structures(
         device=oracle_adjacency.device,
         dtype=oracle_adjacency.dtype,
     )
-    noisy_positions = torch.lerp(oracle_positions, sampled_positions, mix).clamp(
-        0.0, 1.0
-    )
+    noisy_positions = sampled_positions.clamp(0.0, 1.0)
     noisy_adjacency = enforce_role_adjacency_constraints(
-        symmetrize_matrix(
-            torch.lerp(oracle_adjacency, sampled_adjacency, mix).clamp(0.0, 1.0)
-        ),
+        symmetrize_matrix(sampled_adjacency.clamp(0.0, 1.0)),
         optimized_cases.optimized_structures.roles,
     )
 
@@ -390,6 +276,11 @@ def make_supervised_batch(
     seed: int | None = None,
     profile: dict[str, float] | None = None,
 ) -> SupervisedBatch:
+    difficulty = float(min(max(difficulty, 0.0), 1.0))
+    noise_fraction = curriculum.initial_mix + difficulty * (
+        curriculum.final_mix - curriculum.initial_mix
+    )
+    time_min = max(0.0, 1.0 - noise_fraction)
     source_structures = sample_noisy_structures(
         optimized_cases=optimized_cases,
         curriculum=curriculum,
@@ -407,9 +298,10 @@ def make_supervised_batch(
         device=source_structures.positions.device,
         dtype=source_structures.positions.dtype,
     )
-    # Sample supervision on points along the straight path from the noisy
-    # source structure to the optimized oracle, but train the model to predict
-    # the residual correction from the current flow state to the oracle.
+    flow_times = time_min + (1.0 - time_min) * flow_times
+    # Sample supervision on points along the straight path from a full Gaussian
+    # structure-noise source to the optimized oracle, and train the model to
+    # predict the residual correction from the sampled state to the oracle.
     interpolation = flow_times[:, None, None]
     flow_positions = torch.lerp(
         source_structures.positions,
@@ -434,7 +326,7 @@ def make_supervised_batch(
     with torch.no_grad():
         current_analyses = analyze_structures(flow_structures, profile=profile)
     position_noise_levels, adjacency_noise_levels = _flow_noise_levels(
-        source_structures=source_structures,
+        source_structures=flow_structures,
         oracle_structures=optimized_cases.optimized_structures,
     )
     return SupervisedBatch(
@@ -629,12 +521,6 @@ def train_supervised_refiner(
         raise ValueError("min_learning_rate must be non-negative")
     if train_config.min_learning_rate > train_config.learning_rate:
         raise ValueError("min_learning_rate must be <= learning_rate")
-    if train_config.initial_diffusion_steps <= 0:
-        raise ValueError("initial_diffusion_steps must be positive")
-    if train_config.final_diffusion_steps <= 0:
-        raise ValueError("final_diffusion_steps must be positive")
-    if train_config.final_diffusion_steps < train_config.initial_diffusion_steps:
-        raise ValueError("final_diffusion_steps must be >= initial_diffusion_steps")
 
     dataset_cases = optimized_cases.optimized_structures.batch_size
     steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
@@ -658,7 +544,6 @@ def train_supervised_refiner(
         f"training started dataset_cases={dataset_cases} batch_size={train_config.batch_size} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"use_style_token={'yes' if model.config.use_style_token else 'no'} "
-        f"diffusion_steps={train_config.initial_diffusion_steps}->{train_config.final_diffusion_steps} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
         f"min_learning_rate={train_config.min_learning_rate}",
         flush=True,
@@ -679,7 +564,6 @@ def train_supervised_refiner(
                 _synchronize_device_if_needed(device)
                 batch_transfer_time = time.perf_counter()
                 difficulty = _difficulty_fraction(step, train_config.num_steps)
-                diffusion_steps = _scheduled_diffusion_steps(step, train_config)
                 learning_rate = _scheduled_learning_rate(step, train_config)
                 for parameter_group in optimizer.param_groups:
                     parameter_group["lr"] = learning_rate
@@ -693,106 +577,30 @@ def train_supervised_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 batch_build_time = time.perf_counter()
-                current_structures = batch.flow_structures
-                initial_position_noise = batch.position_noise_levels
-                initial_adjacency_noise = batch.adjacency_noise_levels
-                total_loss_terms: dict[str, torch.Tensor] | None = None
-                total_metrics: dict[str, torch.Tensor] | None = None
-                total_loss_tensor = batch.target_stiffness.new_zeros(())
-                for diffusion_step in range(diffusion_steps):
-                    step_analysis_profile: dict[str, float] = {}
-                    current_analyses = analyze_structures(
-                        current_structures,
-                        profile=step_analysis_profile,
-                    )
-                    _accumulate_profile(batch_analysis_profile, step_analysis_profile)
-                    remaining_progress = current_structures.positions.new_full(
-                        (current_structures.batch_size,),
-                        diffusion_step / max(diffusion_steps, 1),
-                    )
-                    flow_time = (
-                        batch.flow_times + (1.0 - batch.flow_times) * remaining_progress
-                    )
-                    remaining = 1.0 - remaining_progress
-                    step_batch = _step_batch(
-                        batch=batch,
-                        structures=current_structures,
-                        current_analyses=current_analyses,
-                        flow_times=flow_time,
-                        position_noise_levels=remaining * initial_position_noise,
-                        adjacency_noise_levels=remaining * initial_adjacency_noise,
-                    )
-                    prediction = model.predict_flow(
-                        structures=step_batch.flow_structures,
-                        target_stiffness=step_batch.target_stiffness,
-                        current_stiffness=step_batch.current_analyses.generalized_stiffness,
-                        nodal_displacements=step_batch.current_analyses.nodal_displacements,
-                        edge_von_mises=step_batch.current_analyses.edge_von_mises,
-                        flow_times=step_batch.flow_times,
-                        position_noise_levels=step_batch.position_noise_levels,
-                        adjacency_noise_levels=step_batch.adjacency_noise_levels,
-                        style_structures=(
-                            step_batch.oracle_structures
-                            if model.config.use_style_token
-                            else None
-                        ),
-                        style_analyses=(
-                            step_batch.oracle_analyses
-                            if model.config.use_style_token
-                            else None
-                        ),
-                    )
-                    prediction = _sanitize_prediction(prediction)
-                    step_loss_analysis_profile: dict[str, float] = {}
-                    step_total_loss, step_metrics, step_loss_terms = _training_losses(
-                        prediction,
-                        step_batch,
-                        train_config,
-                        profile=step_loss_analysis_profile,
-                    )
-                    _accumulate_profile(
-                        batch_analysis_profile,
-                        {
-                            f"loss_{key}": value
-                            for key, value in step_loss_analysis_profile.items()
-                        },
-                    )
-                    total_loss_tensor = total_loss_tensor + step_total_loss
-                    if total_metrics is None:
-                        total_metrics = {
-                            name: value.detach().clone()
-                            for name, value in step_metrics.items()
-                        }
-                        total_loss_terms = {
-                            name: value.detach().clone()
-                            for name, value in step_loss_terms.items()
-                        }
-                    else:
-                        for name, value in step_metrics.items():
-                            total_metrics[name] = total_metrics[name] + value.detach()
-                        for name, value in step_loss_terms.items():
-                            total_loss_terms[name] = (
-                                total_loss_terms[name] + value.detach()
-                            )
-                    if diffusion_step < diffusion_steps - 1:
-                        current_structures = _apply_diffusion_step(
-                            current_structures,
-                            prediction,
-                            diffusion_steps,
-                        )
-                total_loss = total_loss_tensor / diffusion_steps
-                if total_metrics is None or total_loss_terms is None:
-                    raise RuntimeError("diffusion training produced no substep losses")
-                metrics = {
-                    name: value / diffusion_steps
-                    for name, value in total_metrics.items()
-                }
-                loss_terms = {
-                    name: value / diffusion_steps
-                    for name, value in total_loss_terms.items()
-                }
+                prediction = model.predict_flow(
+                    structures=batch.flow_structures,
+                    target_stiffness=batch.target_stiffness,
+                    current_stiffness=batch.current_analyses.generalized_stiffness,
+                    nodal_displacements=batch.current_analyses.nodal_displacements,
+                    edge_von_mises=batch.current_analyses.edge_von_mises,
+                    flow_times=batch.flow_times,
+                    position_noise_levels=batch.position_noise_levels,
+                    adjacency_noise_levels=batch.adjacency_noise_levels,
+                    style_structures=(
+                        batch.oracle_structures
+                        if model.config.use_style_token
+                        else None
+                    ),
+                    style_analyses=(
+                        batch.oracle_analyses if model.config.use_style_token else None
+                    ),
+                )
                 _synchronize_device_if_needed(device)
                 forward_time = time.perf_counter()
+                loss_analysis_profile: dict[str, float] = {}
+                total_loss, metrics, loss_terms = _training_losses(
+                    prediction, batch, train_config, profile=loss_analysis_profile
+                )
                 _synchronize_device_if_needed(device)
                 loss_time = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
@@ -802,18 +610,9 @@ def train_supervised_refiner(
                         model.parameters(), max_norm=train_config.max_grad_norm
                     ).item()
                 )
-                grad_finite = math.isfinite(grad_norm)
-                clipped = grad_finite and grad_norm > train_config.max_grad_norm
-                clip_ratio = (
-                    grad_norm / train_config.max_grad_norm
-                    if grad_finite
-                    else float("nan")
-                )
-                skipped_update = not grad_finite
-                if skipped_update:
-                    optimizer.zero_grad(set_to_none=True)
-                else:
-                    optimizer.step()
+                clipped = grad_norm > train_config.max_grad_norm
+                clip_ratio = grad_norm / train_config.max_grad_norm
+                optimizer.step()
                 _synchronize_device_if_needed(device)
                 optimizer_time = time.perf_counter()
 
@@ -829,9 +628,6 @@ def train_supervised_refiner(
                     )
                 writer.add_scalar("train/curriculum/difficulty", difficulty, step)
                 writer.add_scalar(
-                    "train/curriculum/diffusion_steps", diffusion_steps, step
-                )
-                writer.add_scalar(
                     "train/curriculum/flow_time_mean",
                     float(batch.flow_times.mean().item()),
                     step,
@@ -840,9 +636,6 @@ def train_supervised_refiner(
                 writer.add_scalar("train/gradients/grad_norm", grad_norm, step)
                 writer.add_scalar("train/gradients/clip_ratio", clip_ratio, step)
                 writer.add_scalar("train/gradients/clipped", float(clipped), step)
-                writer.add_scalar(
-                    "train/gradients/skipped_update", float(skipped_update), step
-                )
                 examples_seen += batch_cases.optimized_structures.batch_size
                 if (
                     step % train_config.log_every_steps == 0
@@ -852,7 +645,6 @@ def train_supervised_refiner(
                         f"train step={step + 1}/{train_config.num_steps} "
                         f"batch_cases={batch_cases.optimized_structures.batch_size} "
                         f"examples_seen={examples_seen} difficulty={difficulty:.3f} "
-                        f"diffusion_steps={diffusion_steps} "
                         f"learning_rate={learning_rate:.8f} "
                         f"loss_total={history['total_loss'][-1]:.6f} "
                         f"loss_position={history['position_error_loss_contribution'][-1]:.6f} "
@@ -864,7 +656,6 @@ def train_supervised_refiner(
                         f"metric_endpoint={float(metrics['endpoint_error'].detach().item()):.6f} "
                         f"metric_stiffness={float(metrics['stiffness_error'].detach().item()):.6f} "
                         f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
-                        f"skipped_update={'yes' if skipped_update else 'no'} "
                         f"clip_ratio={clip_ratio:.3f} "
                         f"t_transfer={batch_transfer_time - step_start_time:.3f}s "
                         f"t_batch={batch_build_time - batch_transfer_time:.3f}s "
@@ -879,13 +670,13 @@ def train_supervised_refiner(
                         f"t_batch_transform={batch_analysis_profile.get('transform', 0.0):.3f}s "
                         f"t_batch_reduce={batch_analysis_profile.get('reduce', 0.0):.3f}s "
                         f"t_batch_solve={batch_analysis_profile.get('solve', 0.0):.3f}s "
-                        f"t_loss_stiffness={batch_analysis_profile.get('loss_stiffness', 0.0):.3f}s "
-                        f"t_loss_penalties={batch_analysis_profile.get('loss_penalties', 0.0):.3f}s "
-                        f"t_loss_material={batch_analysis_profile.get('loss_material_usage', 0.0):.3f}s "
-                        f"t_loss_assemble={batch_analysis_profile.get('loss_assemble', 0.0):.3f}s "
-                        f"t_loss_transform={batch_analysis_profile.get('loss_transform', 0.0):.3f}s "
-                        f"t_loss_reduce={batch_analysis_profile.get('loss_reduce', 0.0):.3f}s "
-                        f"t_loss_solve={batch_analysis_profile.get('loss_solve', 0.0):.3f}s",
+                        f"t_loss_stiffness={loss_analysis_profile.get('stiffness', 0.0):.3f}s "
+                        f"t_loss_penalties={loss_analysis_profile.get('penalties', 0.0):.3f}s "
+                        f"t_loss_material={loss_analysis_profile.get('material_usage', 0.0):.3f}s "
+                        f"t_loss_assemble={loss_analysis_profile.get('assemble', 0.0):.3f}s "
+                        f"t_loss_transform={loss_analysis_profile.get('transform', 0.0):.3f}s "
+                        f"t_loss_reduce={loss_analysis_profile.get('reduce', 0.0):.3f}s "
+                        f"t_loss_solve={loss_analysis_profile.get('solve', 0.0):.3f}s",
                         flush=True,
                     )
                 step += 1
