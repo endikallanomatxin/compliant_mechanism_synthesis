@@ -23,7 +23,10 @@ from compliant_mechanism_synthesis.training import (
     load_supervised_cases,
     train_supervised_refiner,
 )
-from compliant_mechanism_synthesis.training.supervised import _scheduled_learning_rate
+from compliant_mechanism_synthesis.training.supervised import (
+    _scheduled_diffusion_steps,
+    _scheduled_learning_rate,
+)
 
 
 def _build_cases(tmp_path: Path):
@@ -89,6 +92,21 @@ def test_scheduled_learning_rate_warms_up_then_cosine_decays() -> None:
     assert learning_rates[2] > learning_rates[5] > learning_rates[8]
 
 
+def test_scheduled_diffusion_steps_ramps_from_one_to_four() -> None:
+    config = SupervisedTrainingConfig(
+        dataset_path="dataset.pt",
+        num_steps=8,
+        initial_diffusion_steps=1,
+        final_diffusion_steps=4,
+    )
+
+    diffusion_steps = [_scheduled_diffusion_steps(step, config) for step in range(8)]
+
+    assert diffusion_steps[0] == 1
+    assert diffusion_steps[-1] == 4
+    assert diffusion_steps == sorted(diffusion_steps)
+
+
 def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
     tmp_path: Path,
 ) -> None:
@@ -148,6 +166,8 @@ def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) 
             device="cpu",
             batch_size=2,
             num_steps=20,
+            initial_diffusion_steps=1,
+            final_diffusion_steps=1,
             learning_rate=5e-4,
             checkpoint_path=str(tmp_path / "refiner.pt"),
             logdir=str(tmp_path / "runs"),
