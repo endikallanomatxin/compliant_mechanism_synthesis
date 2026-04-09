@@ -49,8 +49,8 @@ class SupervisedTrainingConfig:
     min_learning_rate: float = 1e-6
     use_style_token: bool = True
     position_loss_weight: float = 1.0
-    adjacency_loss_weight: float = 0.35
-    stiffness_loss_weight: float = 0.0
+    adjacency_loss_weight: float = 1.0
+    stiffness_loss_weight: float = 0.001
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
     seed: int = 7
