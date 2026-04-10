@@ -9,7 +9,6 @@ import torch
 from compliant_mechanism_synthesis.dataset.optimization import (
     CaseOptimizationConfig,
     optimize_cases,
-    sample_target_stiffness,
 )
 from compliant_mechanism_synthesis.dataset.primitives import (
     CHAIN_PRIMITIVE_LIBRARY,
@@ -206,7 +205,6 @@ def generate_offline_dataset(
         )
     current_structures: list[Structures] = []
     current_scaffolds: list[Scaffolds] = []
-    current_targets: list[torch.Tensor] = []
     optimized_batches: list[OptimizedCases] = []
     scaffold_batches: list[Scaffolds] = []
 
@@ -215,10 +213,8 @@ def generate_offline_dataset(
         if not current_structures:
             return
         batch_structures = _concatenate_structures(current_structures)
-        batch_targets = torch.cat(current_targets, dim=0)
         optimized_batch = optimize_cases(
             structures=batch_structures,
-            target_stiffness=batch_targets,
             config=config.optimization,
             logdir=Path(config.logdir) / f"batch_{batch_index:04d}",
         )
@@ -233,24 +229,16 @@ def generate_offline_dataset(
         )
         current_structures.clear()
         current_scaffolds.clear()
-        current_targets.clear()
 
     for case_index in range(config.num_cases):
         primitive_seed = rng.randrange(0, 2**31)
-        target_seed = rng.randrange(0, 2**31)
         initial_structures, scaffold = sample_random_primitive(
             config=primitive_config,
             seed=primitive_seed,
         )
         initial_structures = initial_structures.to(device)
-        target = sample_target_stiffness(
-            initial_structures,
-            config=config.optimization,
-            seed=target_seed,
-        )
         current_structures.append(initial_structures)
         current_scaffolds.append(scaffold)
-        current_targets.append(target.unsqueeze(0))
         if len(current_structures) == config.batch_size:
             flush_batch(batch_index=len(optimized_batches))
 

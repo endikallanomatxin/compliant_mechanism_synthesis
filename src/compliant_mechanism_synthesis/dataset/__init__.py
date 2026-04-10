@@ -10,7 +10,6 @@ from compliant_mechanism_synthesis.dataset.optimization import (
     CaseOptimizationConfig,
     OptimizationLossWeights,
     optimize_cases,
-    sample_target_stiffness,
 )
 from compliant_mechanism_synthesis.dataset.primitives import (
     CHAIN_PRIMITIVE_LIBRARY,
@@ -36,5 +35,4 @@ __all__ = [
     "save_offline_dataset",
     "sample_primitive_design",
     "sample_random_primitive",
-    "sample_target_stiffness",
 ]

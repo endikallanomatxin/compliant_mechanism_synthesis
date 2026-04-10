@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import random
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -15,7 +14,6 @@ from compliant_mechanism_synthesis.dataset.types import (
 from compliant_mechanism_synthesis.mechanics import (
     Frame3DConfig,
     GeometryPenaltyConfig,
-    denormalize_generalized_stiffness,
     mechanical_terms,
     normalize_generalized_stiffness,
 )
@@ -47,7 +45,6 @@ class CaseOptimizationConfig:
     num_steps: int = 32
     learning_rate: float = 1e-3
     log_every: int = 10
-    stiffness_perturbation_scale: float = 0.18
     weights: OptimizationLossWeights = OptimizationLossWeights()
     mechanics: Frame3DConfig = Frame3DConfig()
     geometry: GeometryPenaltyConfig = GeometryPenaltyConfig()
@@ -116,46 +113,6 @@ def _build_adjacency(
     adjacency[:, edge_i[upper_mask], edge_j[upper_mask]] = torch.sigmoid(edge_logits)
     return symmetrize_matrix(adjacency)
 
-
-def sample_target_stiffness(
-    structures: Structures,
-    config: CaseOptimizationConfig | None = None,
-    seed: int | None = None,
-) -> torch.Tensor:
-    config = config or CaseOptimizationConfig()
-    rng = random.Random(seed)
-    structures.validate()
-    if structures.batch_size != 1:
-        raise ValueError("sample_target_stiffness expects a single-structure batch")
-    base = mechanical_terms(
-        positions=structures.positions,
-        roles=structures.roles,
-        adjacency=structures.adjacency,
-        frame_config=config.mechanics,
-        penalty_config=config.geometry,
-    )["generalized_stiffness"][0]
-    normalized_base = normalize_generalized_stiffness(base, config=config.mechanics)
-    jitter = torch.tensor(
-        [[rng.gauss(0.0, 1.0) for _ in range(6)] for _ in range(6)],
-        dtype=normalized_base.dtype,
-        device=normalized_base.device,
-    )
-    symmetric_jitter = symmetrize_matrix(jitter)
-    scale = normalized_base.abs().mean().clamp_min(1e-3)
-    proposal = (
-        normalized_base + config.stiffness_perturbation_scale * scale * symmetric_jitter
-    )
-    eigenvalues, eigenvectors = torch.linalg.eigh(proposal)
-    minimum_eigenvalue = max(
-        float(normalized_base.diagonal().mean().item()) * 0.05, 1e-4
-    )
-    clamped = eigenvalues.clamp_min(minimum_eigenvalue)
-    normalized_target = (
-        eigenvectors @ torch.diag(clamped) @ eigenvectors.transpose(0, 1)
-    )
-    return denormalize_generalized_stiffness(normalized_target, config=config.mechanics)
-
-
 def _domain_penalty(positions: torch.Tensor, roles: torch.Tensor) -> torch.Tensor:
     squeeze = False
     if positions.ndim == 2:
@@ -195,15 +152,15 @@ def _anchor_attachment_penalty(
     return penalty[0] if squeeze else penalty
 
 
-def _stiffness_loss(current: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _stiffness_step_loss(current: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
     normalized_current = normalize_generalized_stiffness(current)
-    normalized_target = normalize_generalized_stiffness(target)
-    if normalized_target.ndim == 2:
-        scale = normalized_target.abs().amax().clamp_min(1e-3)
-        return ((normalized_current - normalized_target) / scale).square().mean()
-    scale = normalized_target.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1e-3)
+    normalized_previous = normalize_generalized_stiffness(previous)
+    if normalized_previous.ndim == 2:
+        scale = normalized_previous.abs().amax().clamp_min(1e-3)
+        return ((normalized_current - normalized_previous) / scale).square().mean()
+    scale = normalized_previous.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1e-3)
     return (
-        ((normalized_current - normalized_target) / scale).square().mean(dim=(-2, -1))
+        ((normalized_current - normalized_previous) / scale).square().mean(dim=(-2, -1))
     )
 
 
@@ -227,7 +184,7 @@ def _stiffness_interest_loss(matrix: torch.Tensor) -> torch.Tensor:
 
 def _loss_breakdown(
     structures: Structures,
-    target_stiffness: torch.Tensor,
+    previous_stiffness: torch.Tensor,
     config: CaseOptimizationConfig,
 ) -> dict[str, torch.Tensor]:
     structures.validate()
@@ -243,7 +200,7 @@ def _loss_breakdown(
     sparsity = structures.adjacency.mean(dim=(-2, -1))
     breakdown = {
         "stiffness_loss": weights.stiffness
-        * _stiffness_loss(generalized_stiffness, target_stiffness),
+        * _stiffness_step_loss(generalized_stiffness, previous_stiffness),
         "stiffness_interest_loss": weights.stiffness_interest
         * _stiffness_interest_loss(generalized_stiffness),
         "material_loss": weights.material * terms["material_usage"],
@@ -275,14 +232,11 @@ def _loss_breakdown(
 
 def optimize_cases(
     structures: Structures,
-    target_stiffness: torch.Tensor,
     config: CaseOptimizationConfig | None = None,
     logdir: str | Path | None = None,
 ) -> OptimizedCases:
     config = config or CaseOptimizationConfig()
     structures.validate()
-    if target_stiffness.shape != (structures.batch_size, 6, 6):
-        raise ValueError("target_stiffness must have shape [batch, 6, 6]")
 
     writer = SummaryWriter(log_dir=str(logdir)) if logdir is not None else None
     initial_structures = structures
@@ -297,6 +251,14 @@ def optimize_cases(
     ]
     edge_logits = torch.nn.Parameter(_logits_from_adjacency(initial_edge_values))
     optimizer = torch.optim.Adam([free_positions, edge_logits], lr=config.learning_rate)
+    previous_terms = mechanical_terms(
+        positions=initial_structures.positions,
+        roles=initial_structures.roles,
+        adjacency=initial_structures.adjacency,
+        frame_config=config.mechanics,
+        penalty_config=config.geometry,
+    )
+    previous_stiffness = previous_terms["generalized_stiffness"].detach()
 
     best_loss = torch.full(
         (structures.batch_size,),
@@ -323,9 +285,14 @@ def optimize_cases(
                 roles=initial_structures.roles,
                 adjacency=adjacency,
             )
-            breakdown = _loss_breakdown(current_structures, target_stiffness, config)
+            breakdown = _loss_breakdown(
+                current_structures,
+                previous_stiffness,
+                config,
+            )
             breakdown["total_loss"].backward()
             optimizer.step()
+            previous_stiffness = breakdown["generalized_stiffness"].detach()
 
             current_loss = breakdown["total_loss_per_case"].detach()
             if initial_loss is None:
@@ -373,9 +340,13 @@ def optimize_cases(
         roles=initial_structures.roles.detach().clone(),
         adjacency=best_adjacency,
     )
-    best_breakdown = _loss_breakdown(best_structures, target_stiffness, config)
+    best_breakdown = _loss_breakdown(
+        best_structures,
+        previous_stiffness,
+        config,
+    )
     result = OptimizedCases(
-        target_stiffness=target_stiffness.detach().cpu().clone(),
+        target_stiffness=best_breakdown["generalized_stiffness"].detach().cpu().clone(),
         optimized_structures=best_structures,
         initial_loss=initial_loss.detach().cpu(),
         best_loss=best_loss.detach().cpu(),

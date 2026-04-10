@@ -14,7 +14,6 @@ from compliant_mechanism_synthesis.dataset import (
     generate_offline_dataset,
     optimize_cases,
     sample_primitive_design,
-    sample_target_stiffness,
 )
 from compliant_mechanism_synthesis.visualization import plot_design_3d
 
@@ -103,12 +102,8 @@ def _run_sample_check(args: argparse.Namespace) -> None:
         seed=args.sample_seed,
     )
     initial_structures = initial_structures.to(device)
-    target = sample_target_stiffness(
-        initial_structures, config=optimization, seed=args.sample_seed + 1
-    )
     result = optimize_cases(
         structures=initial_structures,
-        target_stiffness=target.unsqueeze(0),
         config=optimization,
         logdir=output_dir / "tensorboard_cases",
     )

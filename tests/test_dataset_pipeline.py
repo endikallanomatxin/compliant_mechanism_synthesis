@@ -14,7 +14,6 @@ from compliant_mechanism_synthesis.dataset import (
     optimize_cases,
     sample_primitive_design,
     sample_random_primitive,
-    sample_target_stiffness,
 )
 from compliant_mechanism_synthesis.mechanics import normalize_generalized_stiffness
 from compliant_mechanism_synthesis.roles import NodeRole
@@ -156,10 +155,8 @@ def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) 
         seed=3,
     )
     optimization = CaseOptimizationConfig(num_steps=6)
-    target = sample_target_stiffness(initial_structures, config=optimization, seed=11)
     result = optimize_cases(
         structures=initial_structures,
-        target_stiffness=target.unsqueeze(0),
         config=optimization,
         logdir=tmp_path / "tb",
     )
@@ -183,13 +180,8 @@ def test_case_optimizer_can_increase_batch_stiffness_diversity(
         roles=torch.cat([structure_a.roles, structure_b.roles], dim=0),
         adjacency=torch.cat([structure_a.adjacency, structure_b.adjacency], dim=0),
     )
-    base_config = CaseOptimizationConfig(num_steps=8)
-    target_a = sample_target_stiffness(structure_a, config=base_config, seed=31)
-    target_b = sample_target_stiffness(structure_b, config=base_config, seed=37)
-    targets = torch.stack([target_a, target_b], dim=0)
     neutral = optimize_cases(
         structures=initial_structures,
-        target_stiffness=targets,
         config=CaseOptimizationConfig(
             num_steps=8,
             weights=OptimizationLossWeights(stiffness_interest=0.0),
@@ -198,7 +190,6 @@ def test_case_optimizer_can_increase_batch_stiffness_diversity(
     )
     interested = optimize_cases(
         structures=initial_structures,
-        target_stiffness=targets,
         config=CaseOptimizationConfig(
             num_steps=8,
             weights=OptimizationLossWeights(stiffness_interest=0.2),
