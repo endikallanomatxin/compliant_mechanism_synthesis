@@ -30,7 +30,7 @@ class PrimitiveConfig:
     # This controls the sparse scaffolding graph, not the final number of free
     # FEM nodes. We keep the default sparse on purpose during primitive
     # debugging so the scaffold-to-mesh conversion remains visually readable.
-    num_free_nodes: int = 18
+    num_free_nodes: int = 12
     width: float = 0.18
     thickness: float = 0.10
     anchor_radius: float = 0.04
@@ -38,8 +38,8 @@ class PrimitiveConfig:
     # than a few oversized blobs. Using a 0.04 workspace-wide diameter keeps
     # the primitive family legible once many of them are composed together.
     primitive_radius: float = 0.015
-    neighbor_count: int = 3
-    extra_connection_probability: float = 0.18
+    neighbor_count: int = 2
+    extra_connection_probability: float = 0.10
     connection_length_scale: float = 0.22
     chain_connection_probability: float = 0.72
     free_z_min: float = 0.28
@@ -225,10 +225,8 @@ def _intertwined_scaffold_edges(num_nodes: int) -> list[tuple[int, int]]:
     edges: list[tuple[int, int]] = []
     for source in range(num_nodes - 1):
         edges.append((source, source + 1))
-    for source in range(0, num_nodes - 2, 2):
+    for source in range(0, num_nodes - 2, 3):
         edges.append((source, source + 2))
-    for source in range(1, num_nodes - 3, 2):
-        edges.append((source, source + 3))
     return edges
 
 

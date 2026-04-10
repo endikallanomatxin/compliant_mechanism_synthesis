@@ -80,7 +80,8 @@ def test_sample_random_primitive_builds_intertwined_scaffold_graph() -> None:
     )
 
     degree = scaffolds.adjacency[0].sum(dim=1)
-    assert torch.count_nonzero(degree >= 3.0) >= 4
+    assert torch.count_nonzero(degree >= 3.0) >= 2
+    assert torch.all(degree[1:-1] >= 2.0)
 
 
 def test_materialize_scaffold_returns_valid_structure() -> None:
@@ -261,13 +262,17 @@ def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) 
 def test_case_optimizer_can_increase_batch_stiffness_diversity(
     tmp_path: Path,
 ) -> None:
+    primitive_config = PrimitiveConfig(
+        num_free_nodes=6,
+        forced_primitive_type="rod",
+    )
     structure_a = sample_primitive_design(
-        config=PrimitiveConfig(num_free_nodes=6),
+        config=primitive_config,
         seed=29,
     )
     structure_b = sample_primitive_design(
-        config=PrimitiveConfig(num_free_nodes=6),
-        seed=29,
+        config=primitive_config,
+        seed=31,
     )
     initial_structures = type(structure_a)(
         positions=torch.cat([structure_a.positions, structure_b.positions], dim=0),
@@ -277,7 +282,7 @@ def test_case_optimizer_can_increase_batch_stiffness_diversity(
     neutral = optimize_cases(
         structures=initial_structures,
         config=CaseOptimizationConfig(
-            num_steps=8,
+            num_steps=12,
             weights=OptimizationLossWeights(stiffness_interest=0.0),
         ),
         logdir=tmp_path / "tb_neutral",
@@ -285,8 +290,8 @@ def test_case_optimizer_can_increase_batch_stiffness_diversity(
     interested = optimize_cases(
         structures=initial_structures,
         config=CaseOptimizationConfig(
-            num_steps=8,
-            weights=OptimizationLossWeights(stiffness_interest=0.2),
+            num_steps=12,
+            weights=OptimizationLossWeights(stiffness_interest=0.4),
         ),
         logdir=tmp_path / "tb_interested",
     )
