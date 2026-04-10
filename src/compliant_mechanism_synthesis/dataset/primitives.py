@@ -56,8 +56,6 @@ class PrimitiveConfig:
     sheet_helix_offset_distance_max: float = 0.10
     sheet_helix_pitch_distance: float = 0.24
     sheet_helix_max_longitudinal_points: int = 128
-    forced_primitive_type: str | None = None
-    forced_segment_primitive_types: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -290,17 +288,6 @@ def _sample_chain_primitives(
     rng: random.Random,
 ) -> list[ChainPrimitiveAssignment]:
     assignments = []
-    if (
-        config.forced_primitive_type is not None
-        and config.forced_primitive_type not in CHAIN_PRIMITIVE_LIBRARY
-    ):
-        raise ValueError("forced_primitive_type must be a known primitive family")
-    if config.forced_segment_primitive_types is not None:
-        for primitive_type in config.forced_segment_primitive_types:
-            if primitive_type not in CHAIN_PRIMITIVE_LIBRARY:
-                raise ValueError(
-                    "forced_segment_primitive_types must contain known primitive families"
-                )
 
     def allowed_primitive_types(chain: list[int]) -> tuple[str, ...]:
         if len(chain) > 4:
@@ -309,39 +296,7 @@ def _sample_chain_primitives(
             return ("rod", "sheet", "truss")
         return CHAIN_PRIMITIVE_LIBRARY
 
-    def coerce_primitive_type(chain: list[int], primitive_type: str) -> str:
-        allowed = allowed_primitive_types(chain)
-        if primitive_type in allowed:
-            return primitive_type
-        if len(chain) > 4:
-            return "truss"
-        if primitive_type == "rod_helix":
-            return "rod"
-        if primitive_type == "sheet_helix":
-            return "sheet"
-        return allowed[0]
-
-    primitive_types = []
-    if config.forced_segment_primitive_types is not None:
-        if len(config.forced_segment_primitive_types) != len(chains):
-            raise ValueError(
-                "forced_segment_primitive_types must match the number of scaffold segments"
-            )
-        primitive_types = [
-            coerce_primitive_type(chain, primitive_type)
-            for chain, primitive_type in zip(
-                chains, config.forced_segment_primitive_types
-            )
-        ]
-    elif config.forced_primitive_type is not None:
-        primitive_types = [
-            coerce_primitive_type(chain, config.forced_primitive_type)
-            for chain in chains
-        ]
-    else:
-        primitive_types = [
-            rng.choice(allowed_primitive_types(chain)) for chain in chains
-        ]
+    primitive_types = [rng.choice(allowed_primitive_types(chain)) for chain in chains]
 
     for chain, primitive_type in zip(chains, primitive_types):
         width_scale = rng.uniform(0.8, 1.15)
@@ -703,10 +658,10 @@ def _materialize_scaffold_node_triplets(
             end_index=end_index,
         )
 
-    edge_index = torch.tensor(sorted(edges), dtype=torch.long)
+    edge_index = torch.tensor(sorted(edges), dtype=torch.long, device=centers.device)
     return (
         torch.stack(positions, dim=0),
-        torch.tensor(roles, dtype=torch.long),
+        torch.tensor(roles, dtype=torch.long, device=centers.device),
         edge_index,
     )
 
@@ -1294,7 +1249,9 @@ def _materialize_sheet_lattice(
 
 
 def _edge_index_to_adjacency(num_nodes: int, edge_index: torch.Tensor) -> torch.Tensor:
-    adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    adjacency = torch.zeros(
+        (num_nodes, num_nodes), dtype=torch.float32, device=edge_index.device
+    )
     if edge_index.numel() == 0:
         return adjacency
     adjacency[edge_index[:, 0], edge_index[:, 1]] = 1.0

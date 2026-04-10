@@ -19,7 +19,13 @@ from compliant_mechanism_synthesis.dataset import (
     sample_random_primitive,
 )
 from compliant_mechanism_synthesis.dataset.primitives import (
+    ChainPrimitiveAssignment,
+    _build_sheet_helix_centerline,
+    _build_sheet_lateral_axes,
+    _build_truss_helix_positions,
+    _discretize_sheet_chain,
     _extract_primitive_segments,
+    _materialize_truss_helix,
     _sample_chain_primitives,
 )
 from compliant_mechanism_synthesis.mechanics import normalize_generalized_stiffness
@@ -31,6 +37,41 @@ def _stiffness_interest_score(matrix: torch.Tensor) -> torch.Tensor:
     eigenvalues = torch.linalg.eigvalsh(normalized)
     batch_mean = eigenvalues.mean(dim=0, keepdim=True)
     return (eigenvalues - batch_mean).square().mean(dim=-1)
+
+
+def _sample_matching_random_primitives(
+    config: PrimitiveConfig,
+    *,
+    seed_start: int,
+    count: int,
+) -> list[tuple[torch.Tensor, object]]:
+    candidates_by_size: dict[int, list[tuple[torch.Tensor, object]]] = {}
+    for seed in range(seed_start, seed_start + 256):
+        structures, scaffold = sample_random_primitive(config=config, seed=seed)
+        candidates = candidates_by_size.setdefault(structures.num_nodes, [])
+        candidates.append((structures, scaffold))
+        if len(candidates) == count:
+            return candidates
+    raise AssertionError("unable to sample matching primitive structures")
+
+
+def _sheet_helix_assignment(sheet_width_nodes: int = 2) -> ChainPrimitiveAssignment:
+    return ChainPrimitiveAssignment(
+        chain=[0, 1, 2],
+        primitive_type="sheet_helix",
+        sheet_width_nodes=sheet_width_nodes,
+        sheet_orientations=(0.0, 0.0, 0.0),
+        offset_distances=(0.06, 0.06, 0.06),
+        helix_phase=0.0,
+        helix_pitch=0.30,
+        width_start=0.015,
+        width_end=0.015,
+        thickness_start=0.010,
+        thickness_end=0.010,
+        twist_start=0.0,
+        twist_end=0.0,
+        sweep_phase=0.0,
+    )
 
 
 def test_sample_primitive_design_is_valid_in_3d() -> None:
@@ -88,23 +129,31 @@ def test_extract_primitive_segments_merges_degree_two_runs() -> None:
 
 
 def test_sample_chain_primitives_disables_helices_on_longer_runs() -> None:
-    assignments = _sample_chain_primitives(
-        chains=[[0, 1, 2, 3]],
-        config=PrimitiveConfig(forced_primitive_type="rod_helix"),
-        rng=random.Random(7),
-    )
+    observed_types = {
+        _sample_chain_primitives(
+            chains=[[0, 1, 2, 3]],
+            config=PrimitiveConfig(),
+            rng=random.Random(seed),
+        )[0].primitive_type
+        for seed in range(32)
+    }
 
-    assert assignments[0].primitive_type == "rod"
+    assert observed_types <= {"rod", "sheet", "truss"}
+    assert "rod_helix" not in observed_types
+    assert "sheet_helix" not in observed_types
 
 
 def test_sample_chain_primitives_restricts_very_long_runs_to_truss() -> None:
-    assignments = _sample_chain_primitives(
-        chains=[[0, 1, 2, 3, 4]],
-        config=PrimitiveConfig(forced_primitive_type="sheet"),
-        rng=random.Random(7),
-    )
+    observed_types = {
+        _sample_chain_primitives(
+            chains=[[0, 1, 2, 3, 4]],
+            config=PrimitiveConfig(),
+            rng=random.Random(seed),
+        )[0].primitive_type
+        for seed in range(16)
+    }
 
-    assert assignments[0].primitive_type == "truss"
+    assert observed_types == {"truss"}
 
 
 def test_sample_random_primitive_builds_degree_capped_scaffold_graph() -> None:
@@ -146,14 +195,11 @@ def test_materialize_scaffold_returns_valid_structure() -> None:
 
 
 def test_optimize_scaffolds_returns_valid_batch() -> None:
-    primitive_config = PrimitiveConfig(num_free_nodes=6, forced_primitive_type="rod")
-    _, scaffold_a = sample_random_primitive(
-        config=primitive_config,
-        seed=27,
-    )
-    _, scaffold_b = sample_random_primitive(
-        config=primitive_config,
-        seed=33,
+    primitive_config = PrimitiveConfig(num_free_nodes=6)
+    (_, scaffold_a), (_, scaffold_b) = _sample_matching_random_primitives(
+        primitive_config,
+        seed_start=27,
+        count=2,
     )
     scaffolds = type(scaffold_a)(
         positions=torch.cat([scaffold_a.positions, scaffold_b.positions], dim=0),
@@ -225,70 +271,138 @@ def test_optimize_scaffolds_returns_valid_batch() -> None:
 
 
 def test_sheet_width_nodes_increases_materialized_node_count() -> None:
-    narrow = sample_primitive_design(
-        config=PrimitiveConfig(
-            num_free_nodes=6,
-            sheet_width_nodes=2,
-            forced_primitive_type="sheet_helix",
-            sample_sheet_helix_width_nodes=False,
-            sheet_helix_width_nodes_min=2,
-            sheet_helix_width_nodes_max=2,
-        ),
-        seed=17,
+    chain_positions = torch.tensor(
+        [[0.12, 0.50, 0.20], [0.50, 0.55, 0.50], [0.88, 0.50, 0.80]],
+        dtype=torch.float32,
     )
-    wide = sample_primitive_design(
-        config=PrimitiveConfig(
-            num_free_nodes=6,
-            sheet_width_nodes=4,
-            forced_primitive_type="sheet_helix",
-            sample_sheet_helix_width_nodes=False,
-            sheet_helix_width_nodes_min=4,
-            sheet_helix_width_nodes_max=4,
+    narrow_assignment = _sheet_helix_assignment(sheet_width_nodes=2)
+    wide_assignment = _sheet_helix_assignment(sheet_width_nodes=4)
+    narrow_centerline, narrow_radial_axes = _build_sheet_helix_centerline(
+        chain_positions,
+        narrow_assignment,
+        target_edge_length=0.05,
+        max_longitudinal_points=32,
+    )
+    wide_centerline, wide_radial_axes = _build_sheet_helix_centerline(
+        chain_positions,
+        wide_assignment,
+        target_edge_length=0.05,
+        max_longitudinal_points=32,
+    )
+    narrow_rows = _discretize_sheet_chain(
+        narrow_centerline,
+        _build_sheet_lateral_axes(
+            narrow_centerline, narrow_assignment, narrow_radial_axes
         ),
-        seed=17,
+        sheet_width_distance=0.02,
+        sheet_width_nodes=2,
+        helix_turns=0.0,
+        helix_phase=0.0,
+    )
+    wide_rows = _discretize_sheet_chain(
+        wide_centerline,
+        _build_sheet_lateral_axes(wide_centerline, wide_assignment, wide_radial_axes),
+        sheet_width_distance=0.02,
+        sheet_width_nodes=4,
+        helix_turns=0.0,
+        helix_phase=0.0,
     )
 
-    assert wide.positions.shape[1] > narrow.positions.shape[1]
+    assert sum(row.shape[0] for row in wide_rows) > sum(
+        row.shape[0] for row in narrow_rows
+    )
 
 
 def test_sheet_helix_responds_to_pitch_and_offset_controls() -> None:
-    relaxed = sample_primitive_design(
-        config=PrimitiveConfig(
-            num_free_nodes=6,
-            forced_primitive_type="sheet_helix",
-            sample_sheet_helix_width_nodes=False,
-            sheet_helix_width_nodes_min=2,
-            sheet_helix_width_nodes_max=2,
-            sheet_helix_offset_distance_min=0.04,
-            sheet_helix_offset_distance_max=0.04,
-            sheet_helix_pitch_distance=0.40,
-        ),
-        seed=19,
+    chain_positions = torch.tensor(
+        [[0.12, 0.50, 0.20], [0.50, 0.55, 0.50], [0.88, 0.50, 0.80]],
+        dtype=torch.float32,
     )
-    tighter = sample_primitive_design(
-        config=PrimitiveConfig(
-            num_free_nodes=6,
-            forced_primitive_type="sheet_helix",
-            sample_sheet_helix_width_nodes=False,
-            sheet_helix_width_nodes_min=2,
-            sheet_helix_width_nodes_max=2,
-            sheet_helix_offset_distance_min=0.20,
-            sheet_helix_offset_distance_max=0.20,
-            sheet_helix_pitch_distance=0.10,
-        ),
-        seed=19,
+    relaxed_assignment = ChainPrimitiveAssignment(
+        **{
+            **_sheet_helix_assignment(sheet_width_nodes=2).__dict__,
+            "offset_distances": (0.04, 0.04, 0.04),
+            "helix_pitch": 0.40,
+        }
+    )
+    tighter_assignment = ChainPrimitiveAssignment(
+        **{
+            **_sheet_helix_assignment(sheet_width_nodes=2).__dict__,
+            "offset_distances": (0.20, 0.20, 0.20),
+            "helix_pitch": 0.10,
+        }
+    )
+    relaxed_centerline, _ = _build_sheet_helix_centerline(
+        chain_positions,
+        relaxed_assignment,
+        target_edge_length=0.05,
+        max_longitudinal_points=128,
+    )
+    tighter_centerline, _ = _build_sheet_helix_centerline(
+        chain_positions,
+        tighter_assignment,
+        target_edge_length=0.05,
+        max_longitudinal_points=128,
     )
 
-    assert tighter.positions.shape[1] > relaxed.positions.shape[1]
+    assert tighter_centerline.shape[0] > relaxed_centerline.shape[0]
 
 
 def test_truss_materialization_creates_dense_skip_link_bracing() -> None:
-    structures = sample_primitive_design(
-        config=PrimitiveConfig(num_free_nodes=6),
-        seed=23,
+    assignment = ChainPrimitiveAssignment(
+        chain=[0, 1, 2, 3, 4],
+        primitive_type="truss",
+        sheet_width_nodes=2,
+        sheet_orientations=(0.0, 0.0, 0.0, 0.0, 0.0),
+        offset_distances=(0.0, 0.0, 0.0, 0.0, 0.0),
+        helix_phase=0.0,
+        helix_pitch=0.30,
+        width_start=0.015,
+        width_end=0.015,
+        thickness_start=0.010,
+        thickness_end=0.010,
+        twist_start=0.0,
+        twist_end=0.0,
+        sweep_phase=0.0,
     )
+    chain_positions = torch.tensor(
+        [
+            [0.12, 0.50, 0.20],
+            [0.31, 0.52, 0.35],
+            [0.50, 0.55, 0.50],
+            [0.69, 0.52, 0.65],
+            [0.88, 0.50, 0.80],
+        ],
+        dtype=torch.float32,
+    )
+    truss_positions = _build_truss_helix_positions(chain_positions, assignment)
+    next_node_index = 2
+    edge_pairs: set[tuple[int, int]] = set()
 
-    degree = structures.adjacency[0].sum(dim=1)
+    def add_node(position: torch.Tensor, role: NodeRole) -> int:
+        nonlocal next_node_index
+        assert role == NodeRole.FREE
+        node_index = next_node_index
+        next_node_index += 1
+        return node_index
+
+    def add_edge(source: int, target: int) -> None:
+        edge_pairs.add(tuple(sorted((source, target))))
+
+    _materialize_truss_helix(
+        truss_positions,
+        add_node=add_node,
+        add_edge=add_edge,
+        start_index=0,
+        end_index=1,
+    )
+    node_count = next_node_index
+    adjacency = torch.zeros((node_count, node_count), dtype=torch.float32)
+    for source, target in edge_pairs:
+        adjacency[source, target] = 1.0
+        adjacency[target, source] = 1.0
+
+    degree = adjacency.sum(dim=1)
     assert torch.count_nonzero(degree >= 4.0) > 0
 
 
@@ -312,15 +426,11 @@ def test_case_optimizer_can_increase_batch_stiffness_diversity(
 ) -> None:
     primitive_config = PrimitiveConfig(
         num_free_nodes=6,
-        forced_primitive_type="rod",
     )
-    structure_a = sample_primitive_design(
-        config=primitive_config,
-        seed=20,
-    )
-    structure_b = sample_primitive_design(
-        config=primitive_config,
-        seed=21,
+    (structure_a, _), (structure_b, _) = _sample_matching_random_primitives(
+        primitive_config,
+        seed_start=20,
+        count=2,
     )
     initial_structures = type(structure_a)(
         positions=torch.cat([structure_a.positions, structure_b.positions], dim=0),

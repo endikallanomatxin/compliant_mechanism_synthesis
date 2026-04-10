@@ -12,10 +12,7 @@ from compliant_mechanism_synthesis.dataset.optimization import (
     optimize_scaffolds,
 )
 from compliant_mechanism_synthesis.dataset.primitives import (
-    CHAIN_PRIMITIVE_LIBRARY,
     PrimitiveConfig,
-    _default_extra_scaffold_edge_count,
-    _default_scaffold_primitive_count,
     sample_random_primitive,
 )
 from compliant_mechanism_synthesis.dataset.types import (
@@ -233,20 +230,6 @@ def generate_offline_dataset(
 
     rng = random.Random(config.seed)
     primitive_config = config.primitive
-    if (
-        primitive_config.forced_segment_primitive_types is None
-        and primitive_config.forced_primitive_type is None
-    ):
-        num_scaffold_nodes = primitive_config.num_free_nodes + 2
-        num_segments = _default_scaffold_primitive_count(num_scaffold_nodes)
-        # Offline batches need a stable materialized node count across cases.
-        # Since long control-point runs are coerced to structurally safer
-        # families, we use the always-valid truss family for the batch-fixed
-        # scaffold primitive template.
-        primitive_config = replace(
-            primitive_config,
-            forced_segment_primitive_types=("truss",) * num_segments,
-        )
     if primitive_config.sample_sheet_helix_width_nodes:
         if (
             primitive_config.sheet_helix_width_nodes_min
@@ -267,6 +250,8 @@ def generate_offline_dataset(
     current_scaffolds: list[Scaffolds] = []
     optimized_batches: list[OptimizedCases] = []
     scaffold_batches: list[Scaffolds] = []
+    target_node_count: int | None = None
+    target_roles: torch.Tensor | None = None
 
     def flush_batch(batch_index: int) -> None:
         nonlocal processed_cases
@@ -291,7 +276,8 @@ def generate_offline_dataset(
         scaffold_batches.append(batch_scaffolds)
         processed_cases += batch_structures.batch_size
         print(
-            f"dataset batch {batch_index + 1}/{total_batches} "
+            f"dataset batch {batch_index + 1} "
+            f"node_count={target_node_count} "
             f"cases={processed_cases}/{config.num_cases} "
             f"mean_best_loss={float(optimized_batch.best_loss.mean().item()):.6f}",
             flush=True,
@@ -299,13 +285,25 @@ def generate_offline_dataset(
         current_structures.clear()
         current_scaffolds.clear()
 
-    for case_index in range(config.num_cases):
+    while processed_cases + len(current_structures) < config.num_cases:
         primitive_seed = rng.randrange(0, 2**31)
         initial_structures, scaffold = sample_random_primitive(
             config=primitive_config,
             seed=primitive_seed,
         )
         initial_structures = initial_structures.to(device)
+        scaffold = scaffold.to(device)
+        node_count = initial_structures.num_nodes
+        if target_node_count is None:
+            target_node_count = node_count
+            target_roles = initial_structures.roles.detach().cpu().clone()
+        if node_count != target_node_count:
+            continue
+        if target_roles is None or not torch.equal(
+            initial_structures.roles.detach().cpu(),
+            target_roles,
+        ):
+            continue
         current_structures.append(initial_structures)
         current_scaffolds.append(scaffold)
         if len(current_structures) == config.batch_size:

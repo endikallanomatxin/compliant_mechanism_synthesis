@@ -38,7 +38,6 @@ def _build_cases(tmp_path: Path):
             logdir=str(tmp_path / "runs"),
             primitive=PrimitiveConfig(
                 num_free_nodes=6,
-                forced_primitive_type="sheet_helix",
                 sheet_width_nodes=2,
                 sample_sheet_helix_width_nodes=False,
                 sheet_helix_width_nodes_min=2,
