@@ -29,7 +29,7 @@ from compliant_mechanism_synthesis.visualization import write_dataset_visualizat
 
 @dataclass(frozen=True)
 class OfflineDatasetConfig:
-    num_cases: int = 4096
+    num_cases: int = 16_384
     batch_size: int = 64
     seed: int = 7
     device: str = "auto"
