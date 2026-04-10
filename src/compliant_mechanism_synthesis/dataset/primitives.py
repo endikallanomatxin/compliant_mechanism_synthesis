@@ -289,14 +289,19 @@ def _sample_chain_primitives(
 ) -> list[ChainPrimitiveAssignment]:
     assignments = []
 
-    def allowed_primitive_types(chain: list[int]) -> tuple[str, ...]:
-        if len(chain) > 4:
-            return ("truss",)
-        if len(chain) > 3:
-            return ("rod", "sheet", "truss")
-        return CHAIN_PRIMITIVE_LIBRARY
+    def coerce_primitive_type(chain: list[int], primitive_type: str) -> str:
+        if len(chain) <= 3:
+            return primitive_type
+        if primitive_type == "rod_helix":
+            return "rod"
+        if primitive_type == "sheet_helix":
+            return "sheet"
+        return primitive_type
 
-    primitive_types = [rng.choice(allowed_primitive_types(chain)) for chain in chains]
+    primitive_types = [
+        coerce_primitive_type(chain, rng.choice(CHAIN_PRIMITIVE_LIBRARY))
+        for chain in chains
+    ]
 
     for chain, primitive_type in zip(chains, primitive_types):
         width_scale = rng.uniform(0.8, 1.15)
