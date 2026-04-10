@@ -379,6 +379,9 @@ def test_sample_supervised_main_writes_comparison_outputs(tmp_path: Path) -> Non
         ]
     )
 
+    summary = (samples_dir / "summary.txt").read_text(encoding="utf-8")
     assert (samples_dir / "summary.txt").exists()
     assert (samples_dir / "case_0000_comparison.png").exists()
     assert (samples_dir / "case_0000_rollout.gif").exists()
+    assert "noisy_position_error=" in summary
+    assert "generated_no_style_position_error=" in summary

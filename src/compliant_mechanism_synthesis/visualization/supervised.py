@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass
 
 import matplotlib
 
@@ -15,11 +16,11 @@ from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
 )
-from compliant_mechanism_synthesis.roles import NodeRole
+from compliant_mechanism_synthesis.roles import NodeRole, role_masks
+from compliant_mechanism_synthesis.tensor_ops import upper_triangle_edge_index
 from compliant_mechanism_synthesis.training import (
     analyze_structures,
     dataset_noise_statistics,
-    generalized_stiffness_error,
     match_oracle_to_source,
     sample_noisy_structures,
 )
@@ -40,6 +41,13 @@ def load_supervised_refiner_checkpoint(
     return model
 
 
+@dataclass(frozen=True)
+class OracleErrorMetrics:
+    position_error: float
+    adjacency_error: float
+    stiffness_error: float
+
+
 def _case_indices_to_render(
     optimized_cases: OptimizedCases,
     max_cases: int,
@@ -56,16 +64,69 @@ def _case_indices_to_render(
     return selected
 
 
-def _case_error(structures: Structures, target_stiffness: torch.Tensor) -> float:
+def _oracle_error_metrics(
+    structures: Structures,
+    oracle_structures: Structures,
+    oracle_stiffness: torch.Tensor,
+) -> OracleErrorMetrics:
     analyses = analyze_structures(structures)
-    return float(
-        generalized_stiffness_error(
-            analyses.generalized_stiffness,
-            target_stiffness,
+    _, _, free_mask = role_masks(oracle_structures.roles)
+    free_mask = free_mask.unsqueeze(-1)
+    free_positions = structures.positions.masked_select(free_mask).view(-1, 3)
+    oracle_free_positions = oracle_structures.positions.masked_select(free_mask).view(
+        -1, 3
+    )
+    if free_positions.shape[0] == 0:
+        position_error = 0.0
+    else:
+        position_error = float(
+            torch.linalg.vector_norm(free_positions - oracle_free_positions, dim=-1)
+            .mean()
+            .detach()
+            .item()
         )
+
+    edge_i, edge_j = upper_triangle_edge_index(
+        oracle_structures.num_nodes, oracle_structures.positions.device
+    )
+    fixed_mask, mobile_mask, _ = role_masks(oracle_structures.roles)
+    allowed_edges = ~(
+        (fixed_mask[:, edge_i] & fixed_mask[:, edge_j])
+        | (mobile_mask[:, edge_i] & mobile_mask[:, edge_j])
+        | (fixed_mask[:, edge_i] & mobile_mask[:, edge_j])
+        | (mobile_mask[:, edge_i] & fixed_mask[:, edge_j])
+    )
+    adjacency_difference = (structures.adjacency - oracle_structures.adjacency).abs()[
+        :, edge_i, edge_j
+    ]
+    allowed_values = adjacency_difference[allowed_edges]
+    adjacency_error = (
+        0.0
+        if allowed_values.numel() == 0
+        else float(allowed_values.mean().detach().item())
+    )
+
+    stiffness_error = float(
+        (analyses.generalized_stiffness - oracle_stiffness)
+        .square()
+        .mean(dim=(-2, -1))
+        .sqrt()
         .mean()
         .detach()
         .item()
+    )
+    return OracleErrorMetrics(
+        position_error=position_error,
+        adjacency_error=adjacency_error,
+        stiffness_error=stiffness_error,
+    )
+
+
+def _metrics_text(metrics: OracleErrorMetrics) -> str:
+    return (
+        f"pos={metrics.position_error:.4f} domain\n"
+        f"adj={metrics.adjacency_error:.4f}\n"
+        f"K={metrics.stiffness_error:.4f} raw"
     )
 
 
@@ -217,25 +278,30 @@ def _write_case_summary_figure(
     output_path: Path,
     case_index: int,
     source_structures: Structures,
+    source_metrics: OracleErrorMetrics,
     oracle_structures: Structures,
     no_style_structures: Structures,
-    no_style_error: float,
+    no_style_metrics: OracleErrorMetrics,
     with_style_structures: Structures | None,
-    with_style_error: float | None,
+    with_style_metrics: OracleErrorMetrics | None,
     threshold: float,
 ) -> None:
     panels: list[tuple[str, Structures, str]] = [
-        ("noise vs oracle", source_structures, "#7b61ff"),
         (
-            f"generated no style\nerror={no_style_error:.4f}",
+            f"noise vs oracle\n{_metrics_text(source_metrics)}",
+            source_structures,
+            "#7b61ff",
+        ),
+        (
+            f"generated no style\n{_metrics_text(no_style_metrics)}",
             no_style_structures,
             "#d62728",
         ),
     ]
-    if with_style_structures is not None and with_style_error is not None:
+    if with_style_structures is not None and with_style_metrics is not None:
         panels.append(
             (
-                f"generated with style\nerror={with_style_error:.4f}",
+                f"generated with style\n{_metrics_text(with_style_metrics)}",
                 with_style_structures,
                 "#17a398",
             )
@@ -401,13 +467,24 @@ def write_supervised_sampling_visualizations(
         with_style_structures = (
             None if with_style_trajectory is None else with_style_trajectory[-1]
         )
-        noisy_error = _case_error(source_structures, case.target_stiffness)
-        oracle_error = _case_error(oracle_structures, case.target_stiffness)
-        no_style_error = _case_error(no_style_structures, case.target_stiffness)
-        with_style_error = (
+        source_metrics = _oracle_error_metrics(
+            structures=source_structures,
+            oracle_structures=oracle_structures,
+            oracle_stiffness=oracle_analyses.generalized_stiffness,
+        )
+        no_style_metrics = _oracle_error_metrics(
+            structures=no_style_structures,
+            oracle_structures=oracle_structures,
+            oracle_stiffness=oracle_analyses.generalized_stiffness,
+        )
+        with_style_metrics = (
             None
             if with_style_structures is None
-            else _case_error(with_style_structures, case.target_stiffness)
+            else _oracle_error_metrics(
+                structures=with_style_structures,
+                oracle_structures=oracle_structures,
+                oracle_stiffness=oracle_analyses.generalized_stiffness,
+            )
         )
         source_cpu = source_structures.to("cpu")
         oracle_cpu = oracle_structures.to("cpu")
@@ -423,15 +500,16 @@ def write_supervised_sampling_visualizations(
             output_path=output_path / f"case_{case_index:04d}_comparison.png",
             case_index=case_index,
             source_structures=source_cpu,
+            source_metrics=source_metrics,
             oracle_structures=oracle_cpu,
             no_style_structures=no_style_trajectory_cpu[-1],
-            no_style_error=no_style_error,
+            no_style_metrics=no_style_metrics,
             with_style_structures=(
                 None
                 if with_style_trajectory_cpu is None
                 else with_style_trajectory_cpu[-1]
             ),
-            with_style_error=with_style_error,
+            with_style_metrics=with_style_metrics,
             threshold=threshold,
         )
         _write_case_rollout_gif(
@@ -445,13 +523,26 @@ def write_supervised_sampling_visualizations(
         summary_lines.extend(
             [
                 f"[case_{case_index:04d}]",
-                f"noisy_target_error={noisy_error:.6f}",
-                f"oracle_target_error={oracle_error:.6f}",
-                f"generated_no_style_target_error={no_style_error:.6f}",
+                f"noisy_position_error={source_metrics.position_error:.6f}",
+                f"noisy_adjacency_error={source_metrics.adjacency_error:.6f}",
+                f"noisy_stiffness_error={source_metrics.stiffness_error:.6f}",
+                f"generated_no_style_position_error={no_style_metrics.position_error:.6f}",
+                f"generated_no_style_adjacency_error={no_style_metrics.adjacency_error:.6f}",
+                f"generated_no_style_stiffness_error={no_style_metrics.stiffness_error:.6f}",
                 (
-                    f"generated_with_style_target_error={with_style_error:.6f}"
-                    if with_style_error is not None
-                    else "generated_with_style_target_error=not_available"
+                    f"generated_with_style_position_error={with_style_metrics.position_error:.6f}"
+                    if with_style_metrics is not None
+                    else "generated_with_style_position_error=not_available"
+                ),
+                (
+                    f"generated_with_style_adjacency_error={with_style_metrics.adjacency_error:.6f}"
+                    if with_style_metrics is not None
+                    else "generated_with_style_adjacency_error=not_available"
+                ),
+                (
+                    f"generated_with_style_stiffness_error={with_style_metrics.stiffness_error:.6f}"
+                    if with_style_metrics is not None
+                    else "generated_with_style_stiffness_error=not_available"
                 ),
             ]
         )
