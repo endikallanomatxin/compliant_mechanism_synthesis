@@ -7,6 +7,7 @@ import torch
 from compliant_mechanism_synthesis.dataset import (
     CaseOptimizationConfig,
     OfflineDatasetConfig,
+    OptimizationLossWeights,
     PrimitiveConfig,
     generate_offline_dataset,
     load_offline_dataset,
@@ -15,7 +16,15 @@ from compliant_mechanism_synthesis.dataset import (
     sample_random_primitive,
     sample_target_stiffness,
 )
+from compliant_mechanism_synthesis.mechanics import normalize_generalized_stiffness
 from compliant_mechanism_synthesis.roles import NodeRole
+
+
+def _stiffness_interest_score(matrix: torch.Tensor) -> torch.Tensor:
+    normalized = normalize_generalized_stiffness(matrix)
+    eigenvalues = torch.linalg.eigvalsh(normalized)
+    batch_mean = eigenvalues.mean(dim=0, keepdim=True)
+    return (eigenvalues - batch_mean).square().mean(dim=-1)
 
 
 def test_sample_primitive_design_is_valid_in_3d() -> None:
@@ -156,6 +165,53 @@ def test_case_optimizer_improves_best_loss_against_initial_loss(tmp_path: Path) 
     )
 
     assert result.best_loss[0] <= result.initial_loss[0]
+
+
+def test_case_optimizer_can_increase_batch_stiffness_diversity(
+    tmp_path: Path,
+) -> None:
+    structure_a = sample_primitive_design(
+        config=PrimitiveConfig(num_free_nodes=6),
+        seed=29,
+    )
+    structure_b = sample_primitive_design(
+        config=PrimitiveConfig(num_free_nodes=6),
+        seed=29,
+    )
+    initial_structures = type(structure_a)(
+        positions=torch.cat([structure_a.positions, structure_b.positions], dim=0),
+        roles=torch.cat([structure_a.roles, structure_b.roles], dim=0),
+        adjacency=torch.cat([structure_a.adjacency, structure_b.adjacency], dim=0),
+    )
+    base_config = CaseOptimizationConfig(num_steps=8)
+    target_a = sample_target_stiffness(structure_a, config=base_config, seed=31)
+    target_b = sample_target_stiffness(structure_b, config=base_config, seed=37)
+    targets = torch.stack([target_a, target_b], dim=0)
+    neutral = optimize_cases(
+        structures=initial_structures,
+        target_stiffness=targets,
+        config=CaseOptimizationConfig(
+            num_steps=8,
+            weights=OptimizationLossWeights(stiffness_interest=0.0),
+        ),
+        logdir=tmp_path / "tb_neutral",
+    )
+    interested = optimize_cases(
+        structures=initial_structures,
+        target_stiffness=targets,
+        config=CaseOptimizationConfig(
+            num_steps=8,
+            weights=OptimizationLossWeights(stiffness_interest=0.2),
+        ),
+        logdir=tmp_path / "tb_interested",
+    )
+
+    neutral_score = _stiffness_interest_score(neutral.last_analyses.generalized_stiffness)
+    interested_score = _stiffness_interest_score(
+        interested.last_analyses.generalized_stiffness
+    )
+
+    assert interested_score.mean() >= neutral_score.mean()
 
 
 def test_generate_offline_dataset_persists_payload(tmp_path: Path) -> None:

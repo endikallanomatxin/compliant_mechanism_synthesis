@@ -29,6 +29,7 @@ from compliant_mechanism_synthesis.tensor_ops import (
 @dataclass(frozen=True)
 class OptimizationLossWeights:
     stiffness: float = 1.0
+    stiffness_interest: float = 0.02
     material: float = 5e2
     sparsity: float = 0.03
     short_beam: float = 2e4
@@ -54,6 +55,7 @@ class CaseOptimizationConfig:
 
 _LOGGED_BREAKDOWN_NAMES = (
     "stiffness_loss",
+    "stiffness_interest_loss",
     "material_loss",
     "sparsity_loss",
     "short_beam_loss",
@@ -212,6 +214,17 @@ def _psd_penalty(matrix: torch.Tensor) -> torch.Tensor:
     return (-eigenvalues).clamp_min(0.0).square().mean(dim=-1)
 
 
+def _stiffness_interest_loss(matrix: torch.Tensor) -> torch.Tensor:
+    normalized = normalize_generalized_stiffness(matrix)
+    eigenvalues = torch.linalg.eigvalsh(normalized)
+    if eigenvalues.ndim == 1:
+        return normalized.new_zeros((1,))
+    if eigenvalues.shape[0] <= 1:
+        return normalized.new_zeros((eigenvalues.shape[0],))
+    batch_mean = eigenvalues.mean(dim=0, keepdim=True)
+    return -(eigenvalues - batch_mean).square().mean(dim=-1)
+
+
 def _loss_breakdown(
     structures: Structures,
     target_stiffness: torch.Tensor,
@@ -231,6 +244,8 @@ def _loss_breakdown(
     breakdown = {
         "stiffness_loss": weights.stiffness
         * _stiffness_loss(generalized_stiffness, target_stiffness),
+        "stiffness_interest_loss": weights.stiffness_interest
+        * _stiffness_interest_loss(generalized_stiffness),
         "material_loss": weights.material * terms["material_usage"],
         "sparsity_loss": weights.sparsity * sparsity,
         "short_beam_loss": weights.short_beam * terms["short_beam_penalty"],
