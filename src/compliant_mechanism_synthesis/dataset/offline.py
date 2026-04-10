@@ -9,6 +9,7 @@ import torch
 from compliant_mechanism_synthesis.dataset.optimization import (
     CaseOptimizationConfig,
     optimize_cases,
+    optimize_scaffolds,
 )
 from compliant_mechanism_synthesis.dataset.primitives import (
     CHAIN_PRIMITIVE_LIBRARY,
@@ -70,6 +71,62 @@ def _concatenate_scaffolds(batches: list[Scaffolds]) -> Scaffolds:
         adjacency=torch.cat([batch.adjacency for batch in batches], dim=0),
         edge_primitive_types=torch.cat(
             [batch.edge_primitive_types for batch in batches],
+            dim=0,
+        ),
+        edge_sheet_width_nodes=torch.cat(
+            [batch.edge_sheet_width_nodes for batch in batches],
+            dim=0,
+        ),
+        edge_orientation_start=torch.cat(
+            [batch.edge_orientation_start for batch in batches],
+            dim=0,
+        ),
+        edge_orientation_end=torch.cat(
+            [batch.edge_orientation_end for batch in batches],
+            dim=0,
+        ),
+        edge_offset_start=torch.cat(
+            [batch.edge_offset_start for batch in batches],
+            dim=0,
+        ),
+        edge_offset_end=torch.cat(
+            [batch.edge_offset_end for batch in batches],
+            dim=0,
+        ),
+        edge_helix_phase=torch.cat(
+            [batch.edge_helix_phase for batch in batches],
+            dim=0,
+        ),
+        edge_helix_pitch=torch.cat(
+            [batch.edge_helix_pitch for batch in batches],
+            dim=0,
+        ),
+        edge_width_start=torch.cat(
+            [batch.edge_width_start for batch in batches],
+            dim=0,
+        ),
+        edge_width_end=torch.cat(
+            [batch.edge_width_end for batch in batches],
+            dim=0,
+        ),
+        edge_thickness_start=torch.cat(
+            [batch.edge_thickness_start for batch in batches],
+            dim=0,
+        ),
+        edge_thickness_end=torch.cat(
+            [batch.edge_thickness_end for batch in batches],
+            dim=0,
+        ),
+        edge_twist_start=torch.cat(
+            [batch.edge_twist_start for batch in batches],
+            dim=0,
+        ),
+        edge_twist_end=torch.cat(
+            [batch.edge_twist_end for batch in batches],
+            dim=0,
+        ),
+        edge_sweep_phase=torch.cat(
+            [batch.edge_sweep_phase for batch in batches],
             dim=0,
         ),
     )
@@ -212,14 +269,23 @@ def generate_offline_dataset(
         nonlocal processed_cases
         if not current_structures:
             return
-        batch_structures = _concatenate_structures(current_structures)
+        batch_scaffolds = _concatenate_scaffolds(current_scaffolds)
+        if config.optimization.scaffold_num_steps > 0:
+            batch_scaffolds, batch_structures = optimize_scaffolds(
+                scaffolds=batch_scaffolds,
+                primitive_config=primitive_config,
+                config=config.optimization,
+                logdir=Path(config.logdir) / f"batch_{batch_index:04d}_scaffold",
+            )
+        else:
+            batch_structures = _concatenate_structures(current_structures)
         optimized_batch = optimize_cases(
             structures=batch_structures,
             config=config.optimization,
             logdir=Path(config.logdir) / f"batch_{batch_index:04d}",
         )
         optimized_batches.append(optimized_batch)
-        scaffold_batches.append(_concatenate_scaffolds(current_scaffolds))
+        scaffold_batches.append(batch_scaffolds)
         processed_cases += batch_structures.batch_size
         print(
             f"dataset batch {batch_index + 1}/{total_batches} "
@@ -313,6 +379,20 @@ def load_offline_dataset(
             roles=payload["scaffolds"]["roles"],
             adjacency=payload["scaffolds"]["adjacency"],
             edge_primitive_types=payload["scaffolds"]["edge_primitive_types"],
+            edge_sheet_width_nodes=payload["scaffolds"]["edge_sheet_width_nodes"],
+            edge_orientation_start=payload["scaffolds"]["edge_orientation_start"],
+            edge_orientation_end=payload["scaffolds"]["edge_orientation_end"],
+            edge_offset_start=payload["scaffolds"]["edge_offset_start"],
+            edge_offset_end=payload["scaffolds"]["edge_offset_end"],
+            edge_helix_phase=payload["scaffolds"]["edge_helix_phase"],
+            edge_helix_pitch=payload["scaffolds"]["edge_helix_pitch"],
+            edge_width_start=payload["scaffolds"]["edge_width_start"],
+            edge_width_end=payload["scaffolds"]["edge_width_end"],
+            edge_thickness_start=payload["scaffolds"]["edge_thickness_start"],
+            edge_thickness_end=payload["scaffolds"]["edge_thickness_end"],
+            edge_twist_start=payload["scaffolds"]["edge_twist_start"],
+            edge_twist_end=payload["scaffolds"]["edge_twist_end"],
+            edge_sweep_phase=payload["scaffolds"]["edge_sweep_phase"],
         ),
     )
     optimized_cases.validate()
@@ -354,6 +434,20 @@ def _serialize_optimized_cases(
             "roles": serialized.scaffolds.roles,
             "adjacency": serialized.scaffolds.adjacency,
             "edge_primitive_types": serialized.scaffolds.edge_primitive_types,
+            "edge_sheet_width_nodes": serialized.scaffolds.edge_sheet_width_nodes,
+            "edge_orientation_start": serialized.scaffolds.edge_orientation_start,
+            "edge_orientation_end": serialized.scaffolds.edge_orientation_end,
+            "edge_offset_start": serialized.scaffolds.edge_offset_start,
+            "edge_offset_end": serialized.scaffolds.edge_offset_end,
+            "edge_helix_phase": serialized.scaffolds.edge_helix_phase,
+            "edge_helix_pitch": serialized.scaffolds.edge_helix_pitch,
+            "edge_width_start": serialized.scaffolds.edge_width_start,
+            "edge_width_end": serialized.scaffolds.edge_width_end,
+            "edge_thickness_start": serialized.scaffolds.edge_thickness_start,
+            "edge_thickness_end": serialized.scaffolds.edge_thickness_end,
+            "edge_twist_start": serialized.scaffolds.edge_twist_start,
+            "edge_twist_end": serialized.scaffolds.edge_twist_end,
+            "edge_sweep_phase": serialized.scaffolds.edge_sweep_phase,
         },
         "config": asdict(config),
     }

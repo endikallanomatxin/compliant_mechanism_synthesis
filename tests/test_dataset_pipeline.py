@@ -11,7 +11,9 @@ from compliant_mechanism_synthesis.dataset import (
     PrimitiveConfig,
     generate_offline_dataset,
     load_offline_dataset,
+    materialize_scaffold,
     optimize_cases,
+    optimize_scaffolds,
     sample_primitive_design,
     sample_random_primitive,
 )
@@ -79,6 +81,98 @@ def test_sample_random_primitive_builds_intertwined_scaffold_graph() -> None:
 
     degree = scaffolds.adjacency[0].sum(dim=1)
     assert torch.count_nonzero(degree >= 3.0) >= 4
+
+
+def test_materialize_scaffold_returns_valid_structure() -> None:
+    structures, scaffold = sample_random_primitive(
+        config=PrimitiveConfig(num_free_nodes=8),
+        seed=15,
+    )
+
+    rematerialized = materialize_scaffold(scaffold, config=PrimitiveConfig(num_free_nodes=8))
+
+    rematerialized.validate()
+    assert rematerialized.batch_size == structures.batch_size
+    assert rematerialized.positions.shape == structures.positions.shape
+    assert torch.allclose(rematerialized.positions, structures.positions)
+    assert torch.equal(rematerialized.roles, structures.roles)
+    assert torch.allclose(rematerialized.adjacency, structures.adjacency)
+
+
+def test_optimize_scaffolds_returns_valid_batch() -> None:
+    primitive_config = PrimitiveConfig(num_free_nodes=6, forced_primitive_type="rod")
+    _, scaffold_a = sample_random_primitive(
+        config=primitive_config,
+        seed=27,
+    )
+    _, scaffold_b = sample_random_primitive(
+        config=primitive_config,
+        seed=33,
+    )
+    scaffolds = type(scaffold_a)(
+        positions=torch.cat([scaffold_a.positions, scaffold_b.positions], dim=0),
+        roles=torch.cat([scaffold_a.roles, scaffold_b.roles], dim=0),
+        adjacency=torch.cat([scaffold_a.adjacency, scaffold_b.adjacency], dim=0),
+        edge_primitive_types=torch.cat(
+            [scaffold_a.edge_primitive_types, scaffold_b.edge_primitive_types], dim=0
+        ),
+        edge_sheet_width_nodes=torch.cat(
+            [scaffold_a.edge_sheet_width_nodes, scaffold_b.edge_sheet_width_nodes],
+            dim=0,
+        ),
+        edge_orientation_start=torch.cat(
+            [scaffold_a.edge_orientation_start, scaffold_b.edge_orientation_start],
+            dim=0,
+        ),
+        edge_orientation_end=torch.cat(
+            [scaffold_a.edge_orientation_end, scaffold_b.edge_orientation_end],
+            dim=0,
+        ),
+        edge_offset_start=torch.cat(
+            [scaffold_a.edge_offset_start, scaffold_b.edge_offset_start], dim=0
+        ),
+        edge_offset_end=torch.cat(
+            [scaffold_a.edge_offset_end, scaffold_b.edge_offset_end], dim=0
+        ),
+        edge_helix_phase=torch.cat(
+            [scaffold_a.edge_helix_phase, scaffold_b.edge_helix_phase], dim=0
+        ),
+        edge_helix_pitch=torch.cat(
+            [scaffold_a.edge_helix_pitch, scaffold_b.edge_helix_pitch], dim=0
+        ),
+        edge_width_start=torch.cat(
+            [scaffold_a.edge_width_start, scaffold_b.edge_width_start], dim=0
+        ),
+        edge_width_end=torch.cat(
+            [scaffold_a.edge_width_end, scaffold_b.edge_width_end], dim=0
+        ),
+        edge_thickness_start=torch.cat(
+            [scaffold_a.edge_thickness_start, scaffold_b.edge_thickness_start], dim=0
+        ),
+        edge_thickness_end=torch.cat(
+            [scaffold_a.edge_thickness_end, scaffold_b.edge_thickness_end], dim=0
+        ),
+        edge_twist_start=torch.cat(
+            [scaffold_a.edge_twist_start, scaffold_b.edge_twist_start], dim=0
+        ),
+        edge_twist_end=torch.cat(
+            [scaffold_a.edge_twist_end, scaffold_b.edge_twist_end], dim=0
+        ),
+        edge_sweep_phase=torch.cat(
+            [scaffold_a.edge_sweep_phase, scaffold_b.edge_sweep_phase], dim=0
+        ),
+    )
+
+    optimized_scaffolds, structures = optimize_scaffolds(
+        scaffolds=scaffolds,
+        primitive_config=primitive_config,
+        config=CaseOptimizationConfig(scaffold_num_steps=2, num_steps=4),
+    )
+
+    optimized_scaffolds.validate()
+    structures.validate()
+    assert optimized_scaffolds.positions.shape == scaffolds.positions.shape
+    assert structures.batch_size == scaffolds.batch_size
 
 
 def test_sheet_width_nodes_increases_materialized_node_count() -> None:

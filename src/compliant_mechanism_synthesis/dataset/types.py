@@ -91,6 +91,20 @@ class Scaffolds:
     roles: torch.Tensor
     adjacency: torch.Tensor
     edge_primitive_types: torch.Tensor
+    edge_sheet_width_nodes: torch.Tensor
+    edge_orientation_start: torch.Tensor
+    edge_orientation_end: torch.Tensor
+    edge_offset_start: torch.Tensor
+    edge_offset_end: torch.Tensor
+    edge_helix_phase: torch.Tensor
+    edge_helix_pitch: torch.Tensor
+    edge_width_start: torch.Tensor
+    edge_width_end: torch.Tensor
+    edge_thickness_start: torch.Tensor
+    edge_thickness_end: torch.Tensor
+    edge_twist_start: torch.Tensor
+    edge_twist_end: torch.Tensor
+    edge_sweep_phase: torch.Tensor
 
     def to(self, device: torch.device | str) -> Scaffolds:
         return Scaffolds(
@@ -98,6 +112,20 @@ class Scaffolds:
             roles=self.roles.to(device),
             adjacency=self.adjacency.to(device),
             edge_primitive_types=self.edge_primitive_types.to(device),
+            edge_sheet_width_nodes=self.edge_sheet_width_nodes.to(device),
+            edge_orientation_start=self.edge_orientation_start.to(device),
+            edge_orientation_end=self.edge_orientation_end.to(device),
+            edge_offset_start=self.edge_offset_start.to(device),
+            edge_offset_end=self.edge_offset_end.to(device),
+            edge_helix_phase=self.edge_helix_phase.to(device),
+            edge_helix_pitch=self.edge_helix_pitch.to(device),
+            edge_width_start=self.edge_width_start.to(device),
+            edge_width_end=self.edge_width_end.to(device),
+            edge_thickness_start=self.edge_thickness_start.to(device),
+            edge_thickness_end=self.edge_thickness_end.to(device),
+            edge_twist_start=self.edge_twist_start.to(device),
+            edge_twist_end=self.edge_twist_end.to(device),
+            edge_sweep_phase=self.edge_sweep_phase.to(device),
         )
 
     def index_select(self, batch_indices: torch.Tensor) -> Scaffolds:
@@ -108,6 +136,28 @@ class Scaffolds:
             edge_primitive_types=self.edge_primitive_types.index_select(
                 0, batch_indices
             ),
+            edge_sheet_width_nodes=self.edge_sheet_width_nodes.index_select(
+                0, batch_indices
+            ),
+            edge_orientation_start=self.edge_orientation_start.index_select(
+                0, batch_indices
+            ),
+            edge_orientation_end=self.edge_orientation_end.index_select(
+                0, batch_indices
+            ),
+            edge_offset_start=self.edge_offset_start.index_select(0, batch_indices),
+            edge_offset_end=self.edge_offset_end.index_select(0, batch_indices),
+            edge_helix_phase=self.edge_helix_phase.index_select(0, batch_indices),
+            edge_helix_pitch=self.edge_helix_pitch.index_select(0, batch_indices),
+            edge_width_start=self.edge_width_start.index_select(0, batch_indices),
+            edge_width_end=self.edge_width_end.index_select(0, batch_indices),
+            edge_thickness_start=self.edge_thickness_start.index_select(
+                0, batch_indices
+            ),
+            edge_thickness_end=self.edge_thickness_end.index_select(0, batch_indices),
+            edge_twist_start=self.edge_twist_start.index_select(0, batch_indices),
+            edge_twist_end=self.edge_twist_end.index_select(0, batch_indices),
+            edge_sweep_phase=self.edge_sweep_phase.index_select(0, batch_indices),
         )
 
     def validate(self) -> None:
@@ -115,6 +165,26 @@ class Scaffolds:
         _require_rank("roles", self.roles, 2)
         _require_rank("adjacency", self.adjacency, 3)
         _require_rank("edge_primitive_types", self.edge_primitive_types, 3)
+        int_parameter_tensors = {
+            "edge_sheet_width_nodes": self.edge_sheet_width_nodes,
+        }
+        float_parameter_tensors = {
+            "edge_orientation_start": self.edge_orientation_start,
+            "edge_orientation_end": self.edge_orientation_end,
+            "edge_offset_start": self.edge_offset_start,
+            "edge_offset_end": self.edge_offset_end,
+            "edge_helix_phase": self.edge_helix_phase,
+            "edge_helix_pitch": self.edge_helix_pitch,
+            "edge_width_start": self.edge_width_start,
+            "edge_width_end": self.edge_width_end,
+            "edge_thickness_start": self.edge_thickness_start,
+            "edge_thickness_end": self.edge_thickness_end,
+            "edge_twist_start": self.edge_twist_start,
+            "edge_twist_end": self.edge_twist_end,
+            "edge_sweep_phase": self.edge_sweep_phase,
+        }
+        for name, tensor in {**int_parameter_tensors, **float_parameter_tensors}.items():
+            _require_rank(name, tensor, 3)
 
         batch_size, num_nodes, spatial_dim = self.positions.shape
         if spatial_dim != 3:
@@ -127,12 +197,21 @@ class Scaffolds:
             raise ValueError(
                 "edge_primitive_types must have shape [batch, nodes, nodes]"
             )
+        for name, tensor in {**int_parameter_tensors, **float_parameter_tensors}.items():
+            if tensor.shape != (batch_size, num_nodes, num_nodes):
+                raise ValueError(f"{name} must have shape [batch, nodes, nodes]")
         if not torch.allclose(self.adjacency, self.adjacency.transpose(1, 2)):
             raise ValueError("scaffold adjacency must be symmetric")
         if not torch.equal(
             self.edge_primitive_types, self.edge_primitive_types.transpose(1, 2)
         ):
             raise ValueError("edge_primitive_types must be symmetric")
+        for name, tensor in int_parameter_tensors.items():
+            if not torch.equal(tensor, tensor.transpose(1, 2)):
+                raise ValueError(f"{name} must be symmetric")
+        for name, tensor in float_parameter_tensors.items():
+            if not torch.allclose(tensor, tensor.transpose(1, 2)):
+                raise ValueError(f"{name} must be symmetric")
 
         adjacency_diagonal = torch.diagonal(self.adjacency, dim1=1, dim2=2)
         if not torch.allclose(adjacency_diagonal, torch.zeros_like(adjacency_diagonal)):
@@ -140,6 +219,13 @@ class Scaffolds:
         primitive_diagonal = torch.diagonal(self.edge_primitive_types, dim1=1, dim2=2)
         if not torch.equal(primitive_diagonal, -torch.ones_like(primitive_diagonal)):
             raise ValueError("edge_primitive_types diagonal must be -1")
+        width_diagonal = torch.diagonal(
+            self.edge_sheet_width_nodes,
+            dim1=1,
+            dim2=2,
+        )
+        if not torch.equal(width_diagonal, -torch.ones_like(width_diagonal)):
+            raise ValueError("edge_sheet_width_nodes diagonal must be -1")
 
         role_values = {int(role) for role in self.roles.unique().tolist()}
         valid_roles = {int(NodeRole.FIXED), int(NodeRole.MOBILE), int(NodeRole.FREE)}
@@ -158,6 +244,10 @@ class Scaffolds:
             raise ValueError("every scaffold edge must have an assigned primitive type")
         if torch.any(self.edge_primitive_types[~edge_mask] != -1):
             raise ValueError("non-edges must use primitive type -1")
+        if torch.any(self.edge_sheet_width_nodes[edge_mask] < 0):
+            raise ValueError("every scaffold edge must have a valid width-node count")
+        if torch.any(self.edge_sheet_width_nodes[~edge_mask] != -1):
+            raise ValueError("non-edges must use width-node count -1")
 
     @property
     def batch_size(self) -> int:
@@ -169,6 +259,20 @@ class Scaffolds:
             roles=self.roles[index : index + 1],
             adjacency=self.adjacency[index : index + 1],
             edge_primitive_types=self.edge_primitive_types[index : index + 1],
+            edge_sheet_width_nodes=self.edge_sheet_width_nodes[index : index + 1],
+            edge_orientation_start=self.edge_orientation_start[index : index + 1],
+            edge_orientation_end=self.edge_orientation_end[index : index + 1],
+            edge_offset_start=self.edge_offset_start[index : index + 1],
+            edge_offset_end=self.edge_offset_end[index : index + 1],
+            edge_helix_phase=self.edge_helix_phase[index : index + 1],
+            edge_helix_pitch=self.edge_helix_pitch[index : index + 1],
+            edge_width_start=self.edge_width_start[index : index + 1],
+            edge_width_end=self.edge_width_end[index : index + 1],
+            edge_thickness_start=self.edge_thickness_start[index : index + 1],
+            edge_thickness_end=self.edge_thickness_end[index : index + 1],
+            edge_twist_start=self.edge_twist_start[index : index + 1],
+            edge_twist_end=self.edge_twist_end[index : index + 1],
+            edge_sweep_phase=self.edge_sweep_phase[index : index + 1],
         )
 
 

@@ -5,6 +5,7 @@ import math
 import random
 
 import torch
+import torch.nn.functional as F
 
 from compliant_mechanism_synthesis.dataset.types import Scaffolds, Structures
 from compliant_mechanism_synthesis.roles import NodeRole
@@ -369,9 +370,12 @@ def _apply_chain_style_offsets(
     assignments: list[ChainPrimitiveAssignment],
     config: PrimitiveConfig,
 ) -> torch.Tensor:
-    adjusted = centers.clone()
     offset_sum = torch.zeros_like(centers)
-    offset_count = torch.zeros((centers.shape[0], 1), dtype=centers.dtype)
+    offset_count = torch.zeros(
+        (centers.shape[0], 1),
+        dtype=centers.dtype,
+        device=centers.device,
+    )
 
     for assignment in assignments:
         chain = assignment.chain
@@ -406,14 +410,27 @@ def _apply_chain_style_offsets(
                 sweep_phase=assignment.sweep_phase,
             )
 
-            offset_sum[node_index] = offset_sum[node_index] + offset
-            offset_count[node_index] = offset_count[node_index] + 1.0
+            selector = F.one_hot(
+                torch.tensor(node_index, device=centers.device),
+                num_classes=centers.shape[0],
+            ).to(dtype=centers.dtype)
+            offset_sum = offset_sum + selector[:, None] * offset[None, :]
+            offset_count = offset_count + selector[:, None]
 
-    valid = offset_count.squeeze(-1) > 0.0
-    adjusted[valid] = adjusted[valid] + offset_sum[valid] / offset_count[valid]
-    adjusted[:, 2] = adjusted[:, 2].clamp(config.free_z_min, config.free_z_max)
-    adjusted[0, 2] = config.fixed_anchor_z
-    adjusted[-1, 2] = config.mobile_anchor_z
+    safe_count = offset_count.clamp_min(1.0)
+    adjusted = centers + offset_sum / safe_count
+    valid = (offset_count > 0.0).to(dtype=centers.dtype)
+    adjusted = valid * adjusted + (1.0 - valid) * centers
+    adjusted_z = adjusted[:, 2].clamp(config.free_z_min, config.free_z_max)
+    adjusted_z = torch.cat(
+        [
+            adjusted_z[:1] * 0.0 + config.fixed_anchor_z,
+            adjusted_z[1:-1],
+            adjusted_z[-1:] * 0.0 + config.mobile_anchor_z,
+        ],
+        dim=0,
+    )
+    adjusted = torch.cat([adjusted[:, :2], adjusted_z.unsqueeze(-1)], dim=1)
     return adjusted
 
 
@@ -1192,6 +1209,166 @@ def _build_scaffold_roles(num_nodes: int) -> torch.Tensor:
     return roles
 
 
+def _build_scaffold_assignment_tensors(
+    scaffold_adjacency: torch.Tensor,
+    assignments: list[ChainPrimitiveAssignment],
+) -> dict[str, torch.Tensor]:
+    shape = scaffold_adjacency.shape
+    float_params = {
+        "edge_orientation_start": torch.zeros(shape, dtype=torch.float32),
+        "edge_orientation_end": torch.zeros(shape, dtype=torch.float32),
+        "edge_offset_start": torch.zeros(shape, dtype=torch.float32),
+        "edge_offset_end": torch.zeros(shape, dtype=torch.float32),
+        "edge_helix_phase": torch.zeros(shape, dtype=torch.float32),
+        "edge_helix_pitch": torch.zeros(shape, dtype=torch.float32),
+        "edge_width_start": torch.zeros(shape, dtype=torch.float32),
+        "edge_width_end": torch.zeros(shape, dtype=torch.float32),
+        "edge_thickness_start": torch.zeros(shape, dtype=torch.float32),
+        "edge_thickness_end": torch.zeros(shape, dtype=torch.float32),
+        "edge_twist_start": torch.zeros(shape, dtype=torch.float32),
+        "edge_twist_end": torch.zeros(shape, dtype=torch.float32),
+        "edge_sweep_phase": torch.zeros(shape, dtype=torch.float32),
+    }
+    int_params = {
+        "edge_sheet_width_nodes": -torch.ones(shape, dtype=torch.long),
+    }
+    for assignment in assignments:
+        source, target = assignment.chain
+        pair = ((source, target), (target, source))
+        for i, j in pair:
+            int_params["edge_sheet_width_nodes"][i, j] = assignment.sheet_width_nodes
+            float_params["edge_orientation_start"][i, j] = assignment.sheet_orientations[0]
+            float_params["edge_orientation_end"][i, j] = assignment.sheet_orientations[1]
+            float_params["edge_offset_start"][i, j] = assignment.offset_distances[0]
+            float_params["edge_offset_end"][i, j] = assignment.offset_distances[1]
+            float_params["edge_helix_phase"][i, j] = assignment.helix_phase
+            float_params["edge_helix_pitch"][i, j] = assignment.helix_pitch
+            float_params["edge_width_start"][i, j] = assignment.width_start
+            float_params["edge_width_end"][i, j] = assignment.width_end
+            float_params["edge_thickness_start"][i, j] = assignment.thickness_start
+            float_params["edge_thickness_end"][i, j] = assignment.thickness_end
+            float_params["edge_twist_start"][i, j] = assignment.twist_start
+            float_params["edge_twist_end"][i, j] = assignment.twist_end
+            float_params["edge_sweep_phase"][i, j] = assignment.sweep_phase
+    return {**int_params, **float_params}
+
+
+def _assignments_from_scaffold(
+    scaffold: Scaffolds,
+    batch_index: int,
+    config: PrimitiveConfig,
+) -> list[ChainPrimitiveAssignment]:
+    adjacency = scaffold.adjacency[batch_index]
+    primitive_types = scaffold.edge_primitive_types[batch_index]
+    primitive_names = list(CHAIN_PRIMITIVE_LIBRARY)
+    assignments: list[ChainPrimitiveAssignment] = []
+    for source in range(adjacency.shape[0]):
+        for target in range(source + 1, adjacency.shape[1]):
+            if adjacency[source, target] <= 0.0:
+                continue
+            primitive_index = int(primitive_types[source, target].item())
+            primitive_type = primitive_names[primitive_index]
+            assignments.append(
+                ChainPrimitiveAssignment(
+                    chain=[source, target],
+                    primitive_type=primitive_type,
+                    sheet_width_nodes=int(
+                        scaffold.edge_sheet_width_nodes[batch_index, source, target].item()
+                    ),
+                    sheet_orientations=(
+                        float(
+                            scaffold.edge_orientation_start[
+                                batch_index, source, target
+                            ].item()
+                        ),
+                        float(
+                            scaffold.edge_orientation_end[
+                                batch_index, source, target
+                            ].item()
+                        ),
+                    ),
+                    offset_distances=(
+                        float(
+                            scaffold.edge_offset_start[batch_index, source, target].item()
+                        ),
+                        float(
+                            scaffold.edge_offset_end[batch_index, source, target].item()
+                        ),
+                    ),
+                    helix_phase=float(
+                        scaffold.edge_helix_phase[batch_index, source, target].item()
+                    ),
+                    helix_pitch=float(
+                        scaffold.edge_helix_pitch[batch_index, source, target].item()
+                    ),
+                    width_start=float(
+                        scaffold.edge_width_start[batch_index, source, target].item()
+                    ),
+                    width_end=float(
+                        scaffold.edge_width_end[batch_index, source, target].item()
+                    ),
+                    thickness_start=float(
+                        scaffold.edge_thickness_start[
+                            batch_index, source, target
+                        ].item()
+                    ),
+                    thickness_end=float(
+                        scaffold.edge_thickness_end[batch_index, source, target].item()
+                    ),
+                    twist_start=float(
+                        scaffold.edge_twist_start[batch_index, source, target].item()
+                    ),
+                    twist_end=float(
+                        scaffold.edge_twist_end[batch_index, source, target].item()
+                    ),
+                    sweep_phase=float(
+                        scaffold.edge_sweep_phase[batch_index, source, target].item()
+                    ),
+                )
+            )
+    return assignments
+
+
+def materialize_scaffold(
+    scaffold: Scaffolds,
+    config: PrimitiveConfig | None = None,
+) -> Structures:
+    config = config or PrimitiveConfig()
+    scaffold.validate()
+    designs: list[Structures] = []
+    for batch_index in range(scaffold.batch_size):
+        centers = scaffold.positions[batch_index]
+        adjacency = scaffold.adjacency[batch_index]
+        assignments = _assignments_from_scaffold(scaffold, batch_index, config)
+        styled_centers = _apply_chain_style_offsets(
+            centers=centers,
+            adjacency=adjacency,
+            assignments=assignments,
+            config=config,
+        )
+        positions, roles, edge_index = _materialize_scaffold_node_triplets(
+            centers=styled_centers,
+            adjacency=adjacency,
+            assignments=assignments,
+            config=config,
+        )
+        dense_adjacency = _edge_index_to_adjacency(positions.shape[0], edge_index)
+        designs.append(
+            Structures(
+                positions=positions.unsqueeze(0).clamp(0.02, 0.98),
+                roles=roles.unsqueeze(0),
+                adjacency=symmetrize_matrix(dense_adjacency).unsqueeze(0),
+            )
+        )
+    design = Structures(
+        positions=torch.cat([item.positions for item in designs], dim=0),
+        roles=torch.cat([item.roles for item in designs], dim=0),
+        adjacency=torch.cat([item.adjacency for item in designs], dim=0),
+    )
+    design.validate()
+    return design
+
+
 def _sample_primitive_case(
     config: PrimitiveConfig,
     seed: int | None,
@@ -1226,6 +1403,10 @@ def _sample_primitive_case(
         roles=roles.unsqueeze(0),
         adjacency=symmetrize_matrix(adjacency).unsqueeze(0),
     )
+    assignment_tensors = _build_scaffold_assignment_tensors(
+        scaffold_adjacency,
+        primitive_assignments,
+    )
     scaffold = Scaffolds(
         positions=styled_centers.unsqueeze(0).clamp(0.02, 0.98),
         roles=_build_scaffold_roles(styled_centers.shape[0]).unsqueeze(0),
@@ -1234,6 +1415,22 @@ def _sample_primitive_case(
             scaffold_adjacency,
             primitive_assignments,
         ).unsqueeze(0),
+        edge_sheet_width_nodes=assignment_tensors["edge_sheet_width_nodes"].unsqueeze(0),
+        edge_orientation_start=assignment_tensors["edge_orientation_start"].unsqueeze(
+            0
+        ),
+        edge_orientation_end=assignment_tensors["edge_orientation_end"].unsqueeze(0),
+        edge_offset_start=assignment_tensors["edge_offset_start"].unsqueeze(0),
+        edge_offset_end=assignment_tensors["edge_offset_end"].unsqueeze(0),
+        edge_helix_phase=assignment_tensors["edge_helix_phase"].unsqueeze(0),
+        edge_helix_pitch=assignment_tensors["edge_helix_pitch"].unsqueeze(0),
+        edge_width_start=assignment_tensors["edge_width_start"].unsqueeze(0),
+        edge_width_end=assignment_tensors["edge_width_end"].unsqueeze(0),
+        edge_thickness_start=assignment_tensors["edge_thickness_start"].unsqueeze(0),
+        edge_thickness_end=assignment_tensors["edge_thickness_end"].unsqueeze(0),
+        edge_twist_start=assignment_tensors["edge_twist_start"].unsqueeze(0),
+        edge_twist_end=assignment_tensors["edge_twist_end"].unsqueeze(0),
+        edge_sweep_phase=assignment_tensors["edge_sweep_phase"].unsqueeze(0),
     )
     design.validate()
     scaffold.validate()

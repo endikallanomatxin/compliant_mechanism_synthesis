@@ -9,7 +9,12 @@ from torch.utils.tensorboard import SummaryWriter
 from compliant_mechanism_synthesis.dataset.types import (
     Analyses,
     OptimizedCases,
+    Scaffolds,
     Structures,
+)
+from compliant_mechanism_synthesis.dataset.primitives import (
+    PrimitiveConfig,
+    materialize_scaffold,
 )
 from compliant_mechanism_synthesis.mechanics import (
     Frame3DConfig,
@@ -42,6 +47,8 @@ class OptimizationLossWeights:
 
 @dataclass(frozen=True)
 class CaseOptimizationConfig:
+    scaffold_num_steps: int = 8
+    scaffold_learning_rate: float = 5e-4
     num_steps: int = 32
     learning_rate: float = 1e-3
     log_every: int = 10
@@ -369,3 +376,141 @@ def optimize_cases(
     result = result.to("cpu")
     result.validate()
     return result
+
+
+def optimize_scaffolds(
+    scaffolds: Scaffolds,
+    primitive_config: PrimitiveConfig,
+    config: CaseOptimizationConfig | None = None,
+    logdir: str | Path | None = None,
+) -> tuple[Scaffolds, Structures]:
+    config = config or CaseOptimizationConfig()
+    scaffolds.validate()
+    if config.scaffold_num_steps <= 0:
+        structures = materialize_scaffold(scaffolds, config=primitive_config)
+        return scaffolds, structures
+
+    def _scaffold_with_positions(positions: torch.Tensor) -> Scaffolds:
+        return Scaffolds(
+            positions=positions,
+            roles=scaffolds.roles,
+            adjacency=scaffolds.adjacency,
+            edge_primitive_types=scaffolds.edge_primitive_types,
+            edge_sheet_width_nodes=scaffolds.edge_sheet_width_nodes,
+            edge_orientation_start=scaffolds.edge_orientation_start,
+            edge_orientation_end=scaffolds.edge_orientation_end,
+            edge_offset_start=scaffolds.edge_offset_start,
+            edge_offset_end=scaffolds.edge_offset_end,
+            edge_helix_phase=scaffolds.edge_helix_phase,
+            edge_helix_pitch=scaffolds.edge_helix_pitch,
+            edge_width_start=scaffolds.edge_width_start,
+            edge_width_end=scaffolds.edge_width_end,
+            edge_thickness_start=scaffolds.edge_thickness_start,
+            edge_thickness_end=scaffolds.edge_thickness_end,
+            edge_twist_start=scaffolds.edge_twist_start,
+            edge_twist_end=scaffolds.edge_twist_end,
+            edge_sweep_phase=scaffolds.edge_sweep_phase,
+        )
+
+    writer = SummaryWriter(log_dir=str(logdir)) if logdir is not None else None
+    free_mask = role_masks(scaffolds.roles)[2]
+    free_positions = torch.nn.Parameter(scaffolds.positions.clone())
+    optimizer = torch.optim.Adam([free_positions], lr=config.scaffold_learning_rate)
+    initial_structures = materialize_scaffold(scaffolds, config=primitive_config)
+    initial_terms = mechanical_terms(
+        positions=initial_structures.positions,
+        roles=initial_structures.roles,
+        adjacency=initial_structures.adjacency,
+        frame_config=config.mechanics,
+        penalty_config=config.geometry,
+    )
+    previous_stiffness = initial_terms["generalized_stiffness"].detach()
+
+    best_loss = torch.full(
+        (scaffolds.batch_size,),
+        float("inf"),
+        dtype=torch.float32,
+        device=scaffolds.positions.device,
+    )
+    best_positions = scaffolds.positions.detach().clone()
+    best_structures = Structures(
+        positions=initial_structures.positions.detach(),
+        roles=initial_structures.roles.detach(),
+        adjacency=initial_structures.adjacency.detach(),
+    )
+    try:
+        for step in range(config.scaffold_num_steps):
+            optimizer.zero_grad()
+            clamped_positions = torch.where(
+                free_mask.unsqueeze(-1),
+                free_positions.clamp(0.0, 1.0),
+                scaffolds.positions,
+            )
+            current_scaffolds = _scaffold_with_positions(clamped_positions)
+            current_structures = materialize_scaffold(current_scaffolds, config=primitive_config)
+            breakdown = _loss_breakdown(
+                current_structures,
+                previous_stiffness,
+                config,
+            )
+            breakdown["total_loss"].backward()
+            optimizer.step()
+            current_loss = breakdown["total_loss_per_case"].detach()
+            previous_stiffness = breakdown["generalized_stiffness"].detach()
+            improved = current_loss < best_loss
+            best_loss = torch.minimum(best_loss, current_loss)
+            best_positions = torch.where(
+                improved.unsqueeze(-1).unsqueeze(-1),
+                current_scaffolds.positions.detach(),
+                best_positions,
+            )
+            if torch.any(improved):
+                best_structures = Structures(
+                    positions=current_structures.positions.detach(),
+                    roles=current_structures.roles.detach(),
+                    adjacency=current_structures.adjacency.detach(),
+                )
+
+            if writer is not None and (
+                step % config.log_every == 0 or step == config.scaffold_num_steps - 1
+            ):
+                for name in _LOGGED_BREAKDOWN_NAMES:
+                    value = breakdown[name]
+                    mean_value = (
+                        float(value.detach().mean().item())
+                        if value.ndim > 0
+                        else float(value.detach().item())
+                    )
+                    writer.add_scalar(
+                        f"dataset/optimization/scaffold/{name}",
+                        mean_value,
+                        step,
+                    )
+                writer.flush()
+    finally:
+        if writer is not None:
+            writer.close()
+
+    best_scaffolds = Scaffolds(
+        positions=best_positions,
+        roles=scaffolds.roles.detach().clone(),
+        adjacency=scaffolds.adjacency.detach().clone(),
+        edge_primitive_types=scaffolds.edge_primitive_types.detach().clone(),
+        edge_sheet_width_nodes=scaffolds.edge_sheet_width_nodes.detach().clone(),
+        edge_orientation_start=scaffolds.edge_orientation_start.detach().clone(),
+        edge_orientation_end=scaffolds.edge_orientation_end.detach().clone(),
+        edge_offset_start=scaffolds.edge_offset_start.detach().clone(),
+        edge_offset_end=scaffolds.edge_offset_end.detach().clone(),
+        edge_helix_phase=scaffolds.edge_helix_phase.detach().clone(),
+        edge_helix_pitch=scaffolds.edge_helix_pitch.detach().clone(),
+        edge_width_start=scaffolds.edge_width_start.detach().clone(),
+        edge_width_end=scaffolds.edge_width_end.detach().clone(),
+        edge_thickness_start=scaffolds.edge_thickness_start.detach().clone(),
+        edge_thickness_end=scaffolds.edge_thickness_end.detach().clone(),
+        edge_twist_start=scaffolds.edge_twist_start.detach().clone(),
+        edge_twist_end=scaffolds.edge_twist_end.detach().clone(),
+        edge_sweep_phase=scaffolds.edge_sweep_phase.detach().clone(),
+    )
+    best_scaffolds.validate()
+    best_structures.validate()
+    return best_scaffolds, best_structures

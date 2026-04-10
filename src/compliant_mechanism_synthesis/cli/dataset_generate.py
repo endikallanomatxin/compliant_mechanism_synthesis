@@ -13,7 +13,8 @@ from compliant_mechanism_synthesis.dataset import (
     PrimitiveConfig,
     generate_offline_dataset,
     optimize_cases,
-    sample_primitive_design,
+    optimize_scaffolds,
+    sample_random_primitive,
 )
 from compliant_mechanism_synthesis.visualization import plot_design_3d
 
@@ -33,6 +34,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--num-free-nodes", type=int, default=primitive_defaults.num_free_nodes
     )
     parser.add_argument(
+        "--scaffold-optimization-steps",
+        type=int,
+        default=optimization_defaults.scaffold_num_steps,
+    )
+    parser.add_argument(
         "--optimization-steps", type=int, default=optimization_defaults.num_steps
     )
     parser.add_argument("--output-path", default=None)
@@ -46,6 +52,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--just-check-sample", action="store_true")
     parser.add_argument(
         "--sample-num-free-nodes", type=int, default=primitive_defaults.num_free_nodes
+    )
+    parser.add_argument(
+        "--sample-scaffold-optimization-steps",
+        type=int,
+        default=optimization_defaults.scaffold_num_steps,
     )
     parser.add_argument(
         "--sample-optimization-steps", type=int, default=optimization_defaults.num_steps
@@ -83,7 +94,10 @@ def dataset_generate_main(argv: list[str] | None = None) -> None:
         preview_dir=preview_path,
         preview_case_number=args.preview_case_number,
         primitive=PrimitiveConfig(num_free_nodes=args.num_free_nodes),
-        optimization=CaseOptimizationConfig(num_steps=args.optimization_steps),
+        optimization=CaseOptimizationConfig(
+            scaffold_num_steps=args.scaffold_optimization_steps,
+            num_steps=args.optimization_steps,
+        ),
     )
     generate_offline_dataset(config)
     print(f"dataset={resolved_output_path}")
@@ -96,15 +110,30 @@ def _run_sample_check(args: argparse.Namespace) -> None:
     output_dir = Path(args.sample_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     primitive_cfg = PrimitiveConfig(num_free_nodes=args.sample_num_free_nodes)
-    optimization = CaseOptimizationConfig(num_steps=args.sample_optimization_steps)
-    initial_structures = sample_primitive_design(
+    initial_structures, initial_scaffold = sample_random_primitive(
         config=primitive_cfg,
         seed=args.sample_seed,
     )
     initial_structures = initial_structures.to(device)
+    initial_scaffold = initial_scaffold.to(device)
+    if args.sample_scaffold_optimization_steps > 0:
+        _, scaffold_structures = optimize_scaffolds(
+            scaffolds=initial_scaffold,
+            primitive_config=primitive_cfg,
+            config=CaseOptimizationConfig(
+                scaffold_num_steps=args.sample_scaffold_optimization_steps,
+                num_steps=args.sample_optimization_steps,
+            ),
+            logdir=output_dir / "tensorboard_scaffold",
+        )
+    else:
+        scaffold_structures = initial_structures
     result = optimize_cases(
-        structures=initial_structures,
-        config=optimization,
+        structures=scaffold_structures,
+        config=CaseOptimizationConfig(
+            scaffold_num_steps=args.sample_scaffold_optimization_steps,
+            num_steps=args.sample_optimization_steps,
+        ),
         logdir=output_dir / "tensorboard_cases",
     )
     _dump_sample_figures(initial_structures, result, output_dir)
@@ -112,7 +141,11 @@ def _run_sample_check(args: argparse.Namespace) -> None:
     print(f"best_loss={float(result.best_loss[0].item()):.6f}")
 
 
-def _dump_sample_figures(initial_structures, result, output_dir: Path) -> None:
+def _dump_sample_figures(
+    initial_structures,
+    result,
+    output_dir: Path,
+) -> None:
     initial_figure = plot_design_3d(
         initial_structures.positions[0],
         initial_structures.roles[0],
