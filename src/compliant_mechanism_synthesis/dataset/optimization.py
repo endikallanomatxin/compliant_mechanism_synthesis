@@ -120,6 +120,7 @@ def _build_adjacency(
     adjacency[:, edge_i[upper_mask], edge_j[upper_mask]] = torch.sigmoid(edge_logits)
     return symmetrize_matrix(adjacency)
 
+
 def _domain_penalty(positions: torch.Tensor, roles: torch.Tensor) -> torch.Tensor:
     squeeze = False
     if positions.ndim == 2:
@@ -395,6 +396,7 @@ def optimize_scaffolds(
             positions=positions,
             roles=scaffolds.roles,
             adjacency=scaffolds.adjacency,
+            edge_primitive_ids=scaffolds.edge_primitive_ids,
             edge_primitive_types=scaffolds.edge_primitive_types,
             edge_sheet_width_nodes=scaffolds.edge_sheet_width_nodes,
             edge_orientation_start=scaffolds.edge_orientation_start,
@@ -447,7 +449,9 @@ def optimize_scaffolds(
                 scaffolds.positions,
             )
             current_scaffolds = _scaffold_with_positions(clamped_positions)
-            current_structures = materialize_scaffold(current_scaffolds, config=primitive_config)
+            current_structures = materialize_scaffold(
+                current_scaffolds, config=primitive_config
+            )
             breakdown = _loss_breakdown(
                 current_structures,
                 previous_stiffness,
@@ -495,6 +499,7 @@ def optimize_scaffolds(
         positions=best_positions,
         roles=scaffolds.roles.detach().clone(),
         adjacency=scaffolds.adjacency.detach().clone(),
+        edge_primitive_ids=scaffolds.edge_primitive_ids.detach().clone(),
         edge_primitive_types=scaffolds.edge_primitive_types.detach().clone(),
         edge_sheet_width_nodes=scaffolds.edge_sheet_width_nodes.detach().clone(),
         edge_orientation_start=scaffolds.edge_orientation_start.detach().clone(),

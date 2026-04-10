@@ -19,11 +19,6 @@ CHAIN_PRIMITIVE_LIBRARY = (
     "truss",
 )
 
-# During scaffold-to-mesh debugging we intentionally keep a single active
-# primitive family so we can inspect one geometry/conectivity pattern at a
-# time before re-introducing the others.
-ACTIVE_CHAIN_PRIMITIVE_LIBRARY = CHAIN_PRIMITIVE_LIBRARY
-
 
 @dataclass(frozen=True)
 class PrimitiveConfig:
@@ -41,7 +36,9 @@ class PrimitiveConfig:
     neighbor_count: int = 2
     extra_connection_probability: float = 0.10
     connection_length_scale: float = 0.22
-    chain_connection_probability: float = 0.72
+    max_scaffold_degree: int = 4
+    long_range_connection_probability: float = 0.10
+    long_range_min_index_gap: int = 4
     free_z_min: float = 0.28
     free_z_max: float = 0.72
     fixed_anchor_z: float = 0.10
@@ -144,23 +141,35 @@ def _localized_edge_probability(
     return math.exp(-(distance**2) / max(config.connection_length_scale**2, 1e-8))
 
 
-def _ensure_min_degree_two(
-    centers: torch.Tensor,
+def _try_add_scaffold_edge(
     adjacency: torch.Tensor,
-) -> None:
-    pairwise = torch.linalg.vector_norm(
-        centers[:, None, :] - centers[None, :, :], dim=-1
-    )
-    num_nodes = centers.shape[0]
-    for node_index in range(num_nodes):
-        while int(adjacency[node_index].sum().item()) < 2:
-            candidate_order = torch.argsort(pairwise[node_index])
-            for candidate in candidate_order.tolist():
-                if candidate == node_index or adjacency[node_index, candidate] > 0.0:
-                    continue
-                adjacency[node_index, candidate] = 1.0
-                adjacency[candidate, node_index] = 1.0
-                break
+    source: int,
+    target: int,
+    max_degree: int,
+) -> bool:
+    if source == target or adjacency[source, target] > 0.0:
+        return False
+    if int(adjacency[source].sum().item()) >= max_degree:
+        return False
+    if int(adjacency[target].sum().item()) >= max_degree:
+        return False
+    adjacency[source, target] = 1.0
+    adjacency[target, source] = 1.0
+    return True
+
+
+def _default_extra_scaffold_edge_count(num_nodes: int) -> int:
+    if num_nodes <= 2:
+        return 0
+    return max(2, (num_nodes - 2) // 4)
+
+
+def _default_scaffold_primitive_count(num_nodes: int) -> int:
+    if num_nodes <= 1:
+        return 0
+    if num_nodes == 2:
+        return 1
+    return 3 * _default_extra_scaffold_edge_count(num_nodes) - 1
 
 
 def _sample_scaffold_connectivity(
@@ -169,55 +178,100 @@ def _sample_scaffold_connectivity(
     rng: random.Random,
 ) -> torch.Tensor:
     num_nodes = centers.shape[0]
-    if set(ACTIVE_CHAIN_PRIMITIVE_LIBRARY).issubset(
-        {"rod", "rod_helix", "sheet", "sheet_helix", "truss"}
-    ):
-        adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
-        for source, target in _intertwined_scaffold_edges(num_nodes):
-            adjacency[source, target] = 1.0
-            adjacency[target, source] = 1.0
-        return adjacency
+    if config.max_scaffold_degree < 2:
+        raise ValueError("max_scaffold_degree must be at least 2")
+    if config.long_range_min_index_gap < 2:
+        raise ValueError("long_range_min_index_gap must be at least 2")
 
     adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
     pairwise = torch.linalg.vector_norm(
         centers[:, None, :] - centers[None, :, :], dim=-1
     )
 
-    # First build a localized spanning tree so every scaffold node belongs to a
-    # connected support graph before we add random local redundancy.
-    for node_index in range(1, num_nodes):
-        candidate_indices = list(range(node_index))
-        candidate_indices.sort(
-            key=lambda index: float(pairwise[node_index, index].item())
-        )
-        local_candidates = candidate_indices[: max(2, config.neighbor_count)]
-        weights = [
-            _localized_edge_probability(
-                float(pairwise[node_index, candidate].item()), config
-            )
-            for candidate in local_candidates
-        ]
-        connected_to = rng.choices(local_candidates, weights=weights, k=1)[0]
-        adjacency[node_index, connected_to] = 1.0
-        adjacency[connected_to, node_index] = 1.0
-
-    for node_index in range(num_nodes):
-        nearest = torch.argsort(pairwise[node_index])[1 : config.neighbor_count + 2]
-        for candidate in nearest.tolist():
-            if adjacency[node_index, candidate] > 0.0:
+    def sample_candidate(
+        long_range: bool,
+        required_node: int | None = None,
+    ) -> tuple[int, int] | None:
+        candidates: list[tuple[int, int]] = []
+        weights: list[float] = []
+        for source in range(num_nodes - 1):
+            if int(adjacency[source].sum().item()) >= config.max_scaffold_degree:
                 continue
-            probability = (
-                config.extra_connection_probability
-                * _localized_edge_probability(
-                    float(pairwise[node_index, candidate].item()),
-                    config,
+            for target in range(source + 1, num_nodes):
+                if required_node is not None and required_node not in {source, target}:
+                    continue
+                if adjacency[source, target] > 0.0:
+                    continue
+                if abs(target - source) <= 1:
+                    continue
+                if required_node is None:
+                    if int(adjacency[source].sum().item()) != 2:
+                        continue
+                    if int(adjacency[target].sum().item()) != 2:
+                        continue
+                if int(adjacency[target].sum().item()) >= config.max_scaffold_degree:
+                    continue
+                index_gap = abs(target - source)
+                if long_range and index_gap < config.long_range_min_index_gap:
+                    continue
+                distance = float(pairwise[source, target].item())
+                weight = (
+                    distance * index_gap
+                    if long_range
+                    else _localized_edge_probability(distance, config)
+                    * max(index_gap - 1, 1)
                 )
-            )
-            if rng.random() < probability:
-                adjacency[node_index, candidate] = 1.0
-                adjacency[candidate, node_index] = 1.0
+                candidates.append((source, target))
+                weights.append(weight)
+        if not candidates:
+            return None
+        return rng.choices(candidates, weights=weights, k=1)[0]
 
-    _ensure_min_degree_two(centers, adjacency)
+    for source in range(num_nodes - 1):
+        adjacency[source, source + 1] = 1.0
+        adjacency[source + 1, source] = 1.0
+
+    extra_edges_to_add = _default_extra_scaffold_edge_count(num_nodes)
+    extra_edges_added = 0
+    for endpoint in (0, num_nodes - 1):
+        if (
+            extra_edges_added >= extra_edges_to_add
+            or int(adjacency[endpoint].sum().item()) >= 2
+        ):
+            continue
+        candidate = sample_candidate(long_range=False, required_node=endpoint)
+        if candidate is None:
+            candidate = sample_candidate(long_range=True, required_node=endpoint)
+        if candidate is None:
+            raise ValueError(
+                "unable to connect scaffold endpoint within the degree cap"
+            )
+        source, target = candidate
+        if not _try_add_scaffold_edge(
+            adjacency,
+            source,
+            target,
+            config.max_scaffold_degree,
+        ):
+            raise ValueError("sampled scaffold endpoint edge violates degree cap")
+        extra_edges_added += 1
+
+    for _ in range(extra_edges_added, extra_edges_to_add):
+        prefer_long_range = rng.random() < config.long_range_connection_probability
+        candidate = sample_candidate(long_range=prefer_long_range)
+        if candidate is None and prefer_long_range:
+            candidate = sample_candidate(long_range=False)
+        if candidate is None:
+            raise ValueError("unable to sample scaffold edges within the degree cap")
+        source, target = candidate
+        if not _try_add_scaffold_edge(
+            adjacency,
+            source,
+            target,
+            config.max_scaffold_degree,
+        ):
+            raise ValueError("sampled scaffold edge violates degree cap")
+
     return adjacency
 
 
@@ -313,11 +367,53 @@ def _sample_chain_primitives(
 
 def _extract_primitive_segments(adjacency: torch.Tensor) -> list[list[int]]:
     num_nodes = adjacency.shape[0]
-    segments = []
+    degrees = adjacency.sum(dim=1).to(dtype=torch.long)
+    terminals = {
+        node_index
+        for node_index in range(num_nodes)
+        if node_index in {0, num_nodes - 1} or int(degrees[node_index].item()) != 2
+    }
+    visited_edges: set[tuple[int, int]] = set()
+    segments: list[list[int]] = []
+
+    def edge_key(source: int, target: int) -> tuple[int, int]:
+        return tuple(sorted((source, target)))
+
+    def neighbors(node_index: int) -> list[int]:
+        return (
+            torch.nonzero(adjacency[node_index] > 0.0, as_tuple=False)
+            .flatten()
+            .tolist()
+        )
+
+    def trace_chain(start: int, next_node: int) -> list[int]:
+        chain = [start, next_node]
+        visited_edges.add(edge_key(start, next_node))
+        previous = start
+        current = next_node
+        while current not in terminals:
+            current_neighbors = [
+                neighbor for neighbor in neighbors(current) if neighbor != previous
+            ]
+            if not current_neighbors:
+                break
+            previous, current = current, current_neighbors[0]
+            chain.append(current)
+            visited_edges.add(edge_key(previous, current))
+        return chain
+
+    for start in sorted(terminals):
+        for next_node in sorted(neighbors(start)):
+            if edge_key(start, next_node) in visited_edges:
+                continue
+            segments.append(trace_chain(start, next_node))
+
     for source in range(num_nodes):
-        for target in range(source + 1, num_nodes):
-            if adjacency[source, target] > 0.0:
-                segments.append([source, target])
+        for target in neighbors(source):
+            if source >= target or edge_key(source, target) in visited_edges:
+                continue
+            segments.append(trace_chain(source, target))
+
     return segments
 
 
@@ -439,7 +535,6 @@ def _materialize_scaffold_node_triplets(
     config: PrimitiveConfig,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     degree = adjacency.sum(dim=1).to(dtype=torch.long)
-
     positions: list[torch.Tensor] = []
     roles: list[int] = []
     edges: set[tuple[int, int]] = set()
@@ -1200,6 +1295,20 @@ def _build_scaffold_primitive_types(
     return edge_primitive_types
 
 
+def _build_scaffold_primitive_ids(
+    scaffold_adjacency: torch.Tensor,
+    assignments: list[ChainPrimitiveAssignment],
+) -> torch.Tensor:
+    edge_primitive_ids = -torch.ones(scaffold_adjacency.shape, dtype=torch.long)
+    for primitive_id, assignment in enumerate(assignments):
+        for source, target in zip(assignment.chain[:-1], assignment.chain[1:]):
+            if scaffold_adjacency[source, target] <= 0.0:
+                continue
+            edge_primitive_ids[source, target] = primitive_id
+            edge_primitive_ids[target, source] = primitive_id
+    return edge_primitive_ids
+
+
 def _build_scaffold_roles(num_nodes: int) -> torch.Tensor:
     roles = torch.full((num_nodes,), int(NodeRole.FREE), dtype=torch.long)
     roles[0] = int(NodeRole.FIXED)
@@ -1231,24 +1340,109 @@ def _build_scaffold_assignment_tensors(
         "edge_sheet_width_nodes": -torch.ones(shape, dtype=torch.long),
     }
     for assignment in assignments:
-        source, target = assignment.chain
-        pair = ((source, target), (target, source))
-        for i, j in pair:
-            int_params["edge_sheet_width_nodes"][i, j] = assignment.sheet_width_nodes
-            float_params["edge_orientation_start"][i, j] = assignment.sheet_orientations[0]
-            float_params["edge_orientation_end"][i, j] = assignment.sheet_orientations[1]
-            float_params["edge_offset_start"][i, j] = assignment.offset_distances[0]
-            float_params["edge_offset_end"][i, j] = assignment.offset_distances[1]
-            float_params["edge_helix_phase"][i, j] = assignment.helix_phase
-            float_params["edge_helix_pitch"][i, j] = assignment.helix_pitch
-            float_params["edge_width_start"][i, j] = assignment.width_start
-            float_params["edge_width_end"][i, j] = assignment.width_end
-            float_params["edge_thickness_start"][i, j] = assignment.thickness_start
-            float_params["edge_thickness_end"][i, j] = assignment.thickness_end
-            float_params["edge_twist_start"][i, j] = assignment.twist_start
-            float_params["edge_twist_end"][i, j] = assignment.twist_end
-            float_params["edge_sweep_phase"][i, j] = assignment.sweep_phase
+        for local_index, (source, target) in enumerate(
+            zip(assignment.chain[:-1], assignment.chain[1:])
+        ):
+            int_params["edge_sheet_width_nodes"][source, target] = (
+                assignment.sheet_width_nodes
+            )
+            int_params["edge_sheet_width_nodes"][target, source] = (
+                assignment.sheet_width_nodes
+            )
+            float_params["edge_orientation_start"][source, target] = (
+                assignment.sheet_orientations[local_index]
+            )
+            float_params["edge_orientation_end"][source, target] = (
+                assignment.sheet_orientations[local_index + 1]
+            )
+            float_params["edge_orientation_start"][target, source] = (
+                assignment.sheet_orientations[local_index + 1]
+            )
+            float_params["edge_orientation_end"][target, source] = (
+                assignment.sheet_orientations[local_index]
+            )
+            float_params["edge_offset_start"][source, target] = (
+                assignment.offset_distances[local_index]
+            )
+            float_params["edge_offset_end"][source, target] = (
+                assignment.offset_distances[local_index + 1]
+            )
+            float_params["edge_offset_start"][target, source] = (
+                assignment.offset_distances[local_index + 1]
+            )
+            float_params["edge_offset_end"][target, source] = (
+                assignment.offset_distances[local_index]
+            )
+            float_params["edge_helix_phase"][source, target] = assignment.helix_phase
+            float_params["edge_helix_phase"][target, source] = assignment.helix_phase
+            float_params["edge_helix_pitch"][source, target] = assignment.helix_pitch
+            float_params["edge_helix_pitch"][target, source] = assignment.helix_pitch
+            float_params["edge_width_start"][source, target] = assignment.width_start
+            float_params["edge_width_end"][source, target] = assignment.width_end
+            float_params["edge_width_start"][target, source] = assignment.width_end
+            float_params["edge_width_end"][target, source] = assignment.width_start
+            float_params["edge_thickness_start"][source, target] = (
+                assignment.thickness_start
+            )
+            float_params["edge_thickness_end"][source, target] = (
+                assignment.thickness_end
+            )
+            float_params["edge_thickness_start"][target, source] = (
+                assignment.thickness_end
+            )
+            float_params["edge_thickness_end"][target, source] = (
+                assignment.thickness_start
+            )
+            float_params["edge_twist_start"][source, target] = assignment.twist_start
+            float_params["edge_twist_end"][source, target] = assignment.twist_end
+            float_params["edge_twist_start"][target, source] = assignment.twist_end
+            float_params["edge_twist_end"][target, source] = assignment.twist_start
+            float_params["edge_sweep_phase"][source, target] = assignment.sweep_phase
+            float_params["edge_sweep_phase"][target, source] = assignment.sweep_phase
     return {**int_params, **float_params}
+
+
+def _ordered_chain_from_primitive_edges(
+    adjacency: torch.Tensor,
+    primitive_ids: torch.Tensor,
+    primitive_id: int,
+) -> list[int]:
+    nodes: set[int] = set()
+    primitive_neighbors: dict[int, list[int]] = {}
+    for source in range(adjacency.shape[0]):
+        for target in range(source + 1, adjacency.shape[1]):
+            if adjacency[source, target] <= 0.0:
+                continue
+            if int(primitive_ids[source, target].item()) != primitive_id:
+                continue
+            nodes.update((source, target))
+            primitive_neighbors.setdefault(source, []).append(target)
+            primitive_neighbors.setdefault(target, []).append(source)
+    if not nodes:
+        raise ValueError("primitive id does not map to any scaffold edges")
+    endpoints = sorted(
+        node_index
+        for node_index, node_neighbors in primitive_neighbors.items()
+        if len(node_neighbors) == 1
+    )
+    start = endpoints[0] if endpoints else min(nodes)
+    chain = [start]
+    previous = -1
+    current = start
+    while True:
+        candidates = sorted(
+            node_index
+            for node_index in primitive_neighbors[current]
+            if node_index != previous
+        )
+        if not candidates:
+            break
+        next_node = candidates[0]
+        chain.append(next_node)
+        previous, current = current, next_node
+        if endpoints and current == endpoints[-1]:
+            break
+    return chain
 
 
 def _assignments_from_scaffold(
@@ -1257,73 +1451,115 @@ def _assignments_from_scaffold(
     config: PrimitiveConfig,
 ) -> list[ChainPrimitiveAssignment]:
     adjacency = scaffold.adjacency[batch_index]
+    primitive_ids = scaffold.edge_primitive_ids[batch_index]
     primitive_types = scaffold.edge_primitive_types[batch_index]
     primitive_names = list(CHAIN_PRIMITIVE_LIBRARY)
     assignments: list[ChainPrimitiveAssignment] = []
-    for source in range(adjacency.shape[0]):
-        for target in range(source + 1, adjacency.shape[1]):
-            if adjacency[source, target] <= 0.0:
-                continue
-            primitive_index = int(primitive_types[source, target].item())
-            primitive_type = primitive_names[primitive_index]
-            assignments.append(
-                ChainPrimitiveAssignment(
-                    chain=[source, target],
-                    primitive_type=primitive_type,
-                    sheet_width_nodes=int(
-                        scaffold.edge_sheet_width_nodes[batch_index, source, target].item()
-                    ),
-                    sheet_orientations=(
+    used_ids = sorted(
+        {
+            int(primitive_ids[source, target].item())
+            for source in range(adjacency.shape[0])
+            for target in range(source + 1, adjacency.shape[1])
+            if adjacency[source, target] > 0.0
+        }
+    )
+    for primitive_id in used_ids:
+        chain = _ordered_chain_from_primitive_edges(
+            adjacency, primitive_ids, primitive_id
+        )
+        edge_pairs = list(zip(chain[:-1], chain[1:]))
+        first_source, first_target = edge_pairs[0]
+        last_source, last_target = edge_pairs[-1]
+        primitive_index = int(primitive_types[first_source, first_target].item())
+        primitive_type = primitive_names[primitive_index]
+        assignments.append(
+            ChainPrimitiveAssignment(
+                chain=chain,
+                primitive_type=primitive_type,
+                sheet_width_nodes=int(
+                    scaffold.edge_sheet_width_nodes[
+                        batch_index, first_source, first_target
+                    ].item()
+                ),
+                sheet_orientations=tuple(
+                    [
                         float(
                             scaffold.edge_orientation_start[
-                                batch_index, source, target
+                                batch_index, first_source, first_target
                             ].item()
-                        ),
+                        )
+                    ]
+                    + [
                         float(
                             scaffold.edge_orientation_end[
                                 batch_index, source, target
                             ].item()
-                        ),
-                    ),
-                    offset_distances=(
+                        )
+                        for source, target in edge_pairs
+                    ]
+                ),
+                offset_distances=tuple(
+                    [
                         float(
-                            scaffold.edge_offset_start[batch_index, source, target].item()
-                        ),
+                            scaffold.edge_offset_start[
+                                batch_index, first_source, first_target
+                            ].item()
+                        )
+                    ]
+                    + [
                         float(
                             scaffold.edge_offset_end[batch_index, source, target].item()
-                        ),
-                    ),
-                    helix_phase=float(
-                        scaffold.edge_helix_phase[batch_index, source, target].item()
-                    ),
-                    helix_pitch=float(
-                        scaffold.edge_helix_pitch[batch_index, source, target].item()
-                    ),
-                    width_start=float(
-                        scaffold.edge_width_start[batch_index, source, target].item()
-                    ),
-                    width_end=float(
-                        scaffold.edge_width_end[batch_index, source, target].item()
-                    ),
-                    thickness_start=float(
-                        scaffold.edge_thickness_start[
-                            batch_index, source, target
-                        ].item()
-                    ),
-                    thickness_end=float(
-                        scaffold.edge_thickness_end[batch_index, source, target].item()
-                    ),
-                    twist_start=float(
-                        scaffold.edge_twist_start[batch_index, source, target].item()
-                    ),
-                    twist_end=float(
-                        scaffold.edge_twist_end[batch_index, source, target].item()
-                    ),
-                    sweep_phase=float(
-                        scaffold.edge_sweep_phase[batch_index, source, target].item()
-                    ),
-                )
+                        )
+                        for source, target in edge_pairs
+                    ]
+                ),
+                helix_phase=float(
+                    scaffold.edge_helix_phase[
+                        batch_index, first_source, first_target
+                    ].item()
+                ),
+                helix_pitch=float(
+                    scaffold.edge_helix_pitch[
+                        batch_index, first_source, first_target
+                    ].item()
+                ),
+                width_start=float(
+                    scaffold.edge_width_start[
+                        batch_index, first_source, first_target
+                    ].item()
+                ),
+                width_end=float(
+                    scaffold.edge_width_end[
+                        batch_index, last_source, last_target
+                    ].item()
+                ),
+                thickness_start=float(
+                    scaffold.edge_thickness_start[
+                        batch_index, first_source, first_target
+                    ].item()
+                ),
+                thickness_end=float(
+                    scaffold.edge_thickness_end[
+                        batch_index, last_source, last_target
+                    ].item()
+                ),
+                twist_start=float(
+                    scaffold.edge_twist_start[
+                        batch_index, first_source, first_target
+                    ].item()
+                ),
+                twist_end=float(
+                    scaffold.edge_twist_end[
+                        batch_index, last_source, last_target
+                    ].item()
+                ),
+                sweep_phase=float(
+                    scaffold.edge_sweep_phase[
+                        batch_index, first_source, first_target
+                    ].item()
+                ),
             )
+        )
     return assignments
 
 
@@ -1409,11 +1645,17 @@ def _sample_primitive_case(
         positions=styled_centers.unsqueeze(0).clamp(0.02, 0.98),
         roles=_build_scaffold_roles(styled_centers.shape[0]).unsqueeze(0),
         adjacency=symmetrize_matrix(scaffold_adjacency).unsqueeze(0),
+        edge_primitive_ids=_build_scaffold_primitive_ids(
+            scaffold_adjacency,
+            primitive_assignments,
+        ).unsqueeze(0),
         edge_primitive_types=_build_scaffold_primitive_types(
             scaffold_adjacency,
             primitive_assignments,
         ).unsqueeze(0),
-        edge_sheet_width_nodes=assignment_tensors["edge_sheet_width_nodes"].unsqueeze(0),
+        edge_sheet_width_nodes=assignment_tensors["edge_sheet_width_nodes"].unsqueeze(
+            0
+        ),
         edge_orientation_start=assignment_tensors["edge_orientation_start"].unsqueeze(
             0
         ),

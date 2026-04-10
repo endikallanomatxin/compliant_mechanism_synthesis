@@ -14,7 +14,8 @@ from compliant_mechanism_synthesis.dataset.optimization import (
 from compliant_mechanism_synthesis.dataset.primitives import (
     CHAIN_PRIMITIVE_LIBRARY,
     PrimitiveConfig,
-    _intertwined_scaffold_edges,
+    _default_extra_scaffold_edge_count,
+    _default_scaffold_primitive_count,
     sample_random_primitive,
 )
 from compliant_mechanism_synthesis.dataset.types import (
@@ -69,6 +70,9 @@ def _concatenate_scaffolds(batches: list[Scaffolds]) -> Scaffolds:
         positions=torch.cat([batch.positions for batch in batches], dim=0),
         roles=torch.cat([batch.roles for batch in batches], dim=0),
         adjacency=torch.cat([batch.adjacency for batch in batches], dim=0),
+        edge_primitive_ids=torch.cat(
+            [batch.edge_primitive_ids for batch in batches], dim=0
+        ),
         edge_primitive_types=torch.cat(
             [batch.edge_primitive_types for batch in batches],
             dim=0,
@@ -233,15 +237,12 @@ def generate_offline_dataset(
         primitive_config.forced_segment_primitive_types is None
         and primitive_config.forced_primitive_type is None
     ):
+        num_scaffold_nodes = primitive_config.num_free_nodes + 2
+        num_segments = _default_scaffold_primitive_count(num_scaffold_nodes)
         primitive_config = replace(
             primitive_config,
             forced_segment_primitive_types=tuple(
-                rng.choice(CHAIN_PRIMITIVE_LIBRARY)
-                for _ in range(
-                    len(
-                        _intertwined_scaffold_edges(primitive_config.num_free_nodes + 2)
-                    )
-                )
+                rng.choice(CHAIN_PRIMITIVE_LIBRARY) for _ in range(num_segments)
             ),
         )
     if primitive_config.sample_sheet_helix_width_nodes:
@@ -378,6 +379,7 @@ def load_offline_dataset(
             positions=payload["scaffolds"]["positions"],
             roles=payload["scaffolds"]["roles"],
             adjacency=payload["scaffolds"]["adjacency"],
+            edge_primitive_ids=payload["scaffolds"]["edge_primitive_ids"],
             edge_primitive_types=payload["scaffolds"]["edge_primitive_types"],
             edge_sheet_width_nodes=payload["scaffolds"]["edge_sheet_width_nodes"],
             edge_orientation_start=payload["scaffolds"]["edge_orientation_start"],
@@ -433,6 +435,7 @@ def _serialize_optimized_cases(
             "positions": serialized.scaffolds.positions,
             "roles": serialized.scaffolds.roles,
             "adjacency": serialized.scaffolds.adjacency,
+            "edge_primitive_ids": serialized.scaffolds.edge_primitive_ids,
             "edge_primitive_types": serialized.scaffolds.edge_primitive_types,
             "edge_sheet_width_nodes": serialized.scaffolds.edge_sheet_width_nodes,
             "edge_orientation_start": serialized.scaffolds.edge_orientation_start,

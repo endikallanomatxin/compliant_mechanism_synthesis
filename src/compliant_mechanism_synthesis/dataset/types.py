@@ -90,6 +90,7 @@ class Scaffolds:
     positions: torch.Tensor
     roles: torch.Tensor
     adjacency: torch.Tensor
+    edge_primitive_ids: torch.Tensor
     edge_primitive_types: torch.Tensor
     edge_sheet_width_nodes: torch.Tensor
     edge_orientation_start: torch.Tensor
@@ -111,6 +112,7 @@ class Scaffolds:
             positions=self.positions.to(device),
             roles=self.roles.to(device),
             adjacency=self.adjacency.to(device),
+            edge_primitive_ids=self.edge_primitive_ids.to(device),
             edge_primitive_types=self.edge_primitive_types.to(device),
             edge_sheet_width_nodes=self.edge_sheet_width_nodes.to(device),
             edge_orientation_start=self.edge_orientation_start.to(device),
@@ -133,6 +135,7 @@ class Scaffolds:
             positions=self.positions.index_select(0, batch_indices),
             roles=self.roles.index_select(0, batch_indices),
             adjacency=self.adjacency.index_select(0, batch_indices),
+            edge_primitive_ids=self.edge_primitive_ids.index_select(0, batch_indices),
             edge_primitive_types=self.edge_primitive_types.index_select(
                 0, batch_indices
             ),
@@ -164,6 +167,7 @@ class Scaffolds:
         _require_rank("positions", self.positions, 3)
         _require_rank("roles", self.roles, 2)
         _require_rank("adjacency", self.adjacency, 3)
+        _require_rank("edge_primitive_ids", self.edge_primitive_ids, 3)
         _require_rank("edge_primitive_types", self.edge_primitive_types, 3)
         int_parameter_tensors = {
             "edge_sheet_width_nodes": self.edge_sheet_width_nodes,
@@ -183,7 +187,10 @@ class Scaffolds:
             "edge_twist_end": self.edge_twist_end,
             "edge_sweep_phase": self.edge_sweep_phase,
         }
-        for name, tensor in {**int_parameter_tensors, **float_parameter_tensors}.items():
+        for name, tensor in {
+            **int_parameter_tensors,
+            **float_parameter_tensors,
+        }.items():
             _require_rank(name, tensor, 3)
 
         batch_size, num_nodes, spatial_dim = self.positions.shape
@@ -193,15 +200,24 @@ class Scaffolds:
             raise ValueError("scaffold roles must have shape [batch, nodes]")
         if self.adjacency.shape != (batch_size, num_nodes, num_nodes):
             raise ValueError("scaffold adjacency must have shape [batch, nodes, nodes]")
+        if self.edge_primitive_ids.shape != (batch_size, num_nodes, num_nodes):
+            raise ValueError("edge_primitive_ids must have shape [batch, nodes, nodes]")
         if self.edge_primitive_types.shape != (batch_size, num_nodes, num_nodes):
             raise ValueError(
                 "edge_primitive_types must have shape [batch, nodes, nodes]"
             )
-        for name, tensor in {**int_parameter_tensors, **float_parameter_tensors}.items():
+        for name, tensor in {
+            **int_parameter_tensors,
+            **float_parameter_tensors,
+        }.items():
             if tensor.shape != (batch_size, num_nodes, num_nodes):
                 raise ValueError(f"{name} must have shape [batch, nodes, nodes]")
         if not torch.allclose(self.adjacency, self.adjacency.transpose(1, 2)):
             raise ValueError("scaffold adjacency must be symmetric")
+        if not torch.equal(
+            self.edge_primitive_ids, self.edge_primitive_ids.transpose(1, 2)
+        ):
+            raise ValueError("edge_primitive_ids must be symmetric")
         if not torch.equal(
             self.edge_primitive_types, self.edge_primitive_types.transpose(1, 2)
         ):
@@ -209,13 +225,32 @@ class Scaffolds:
         for name, tensor in int_parameter_tensors.items():
             if not torch.equal(tensor, tensor.transpose(1, 2)):
                 raise ValueError(f"{name} must be symmetric")
-        for name, tensor in float_parameter_tensors.items():
+        directional_pairs = {
+            "edge_orientation_start": self.edge_orientation_end,
+            "edge_offset_start": self.edge_offset_end,
+            "edge_width_start": self.edge_width_end,
+            "edge_thickness_start": self.edge_thickness_end,
+            "edge_twist_start": self.edge_twist_end,
+        }
+        for start_name, end_tensor in directional_pairs.items():
+            start_tensor = float_parameter_tensors[start_name]
+            if not torch.allclose(start_tensor, end_tensor.transpose(1, 2)):
+                raise ValueError(
+                    f"{start_name} must match the reversed edge orientation"
+                )
+        for name in {"edge_helix_phase", "edge_helix_pitch", "edge_sweep_phase"}:
+            tensor = float_parameter_tensors[name]
             if not torch.allclose(tensor, tensor.transpose(1, 2)):
                 raise ValueError(f"{name} must be symmetric")
 
         adjacency_diagonal = torch.diagonal(self.adjacency, dim1=1, dim2=2)
         if not torch.allclose(adjacency_diagonal, torch.zeros_like(adjacency_diagonal)):
             raise ValueError("scaffold adjacency diagonal must be zero")
+        primitive_id_diagonal = torch.diagonal(self.edge_primitive_ids, dim1=1, dim2=2)
+        if not torch.equal(
+            primitive_id_diagonal, -torch.ones_like(primitive_id_diagonal)
+        ):
+            raise ValueError("edge_primitive_ids diagonal must be -1")
         primitive_diagonal = torch.diagonal(self.edge_primitive_types, dim1=1, dim2=2)
         if not torch.equal(primitive_diagonal, -torch.ones_like(primitive_diagonal)):
             raise ValueError("edge_primitive_types diagonal must be -1")
@@ -240,6 +275,10 @@ class Scaffolds:
             raise ValueError("scaffolds need at least one mobile node per structure")
 
         edge_mask = self.adjacency > 0.0
+        if torch.any(self.edge_primitive_ids[edge_mask] < 0):
+            raise ValueError("every scaffold edge must have an assigned primitive id")
+        if torch.any(self.edge_primitive_ids[~edge_mask] != -1):
+            raise ValueError("non-edges must use primitive id -1")
         if torch.any(self.edge_primitive_types[edge_mask] < 0):
             raise ValueError("every scaffold edge must have an assigned primitive type")
         if torch.any(self.edge_primitive_types[~edge_mask] != -1):
@@ -258,6 +297,7 @@ class Scaffolds:
             positions=self.positions[index : index + 1],
             roles=self.roles[index : index + 1],
             adjacency=self.adjacency[index : index + 1],
+            edge_primitive_ids=self.edge_primitive_ids[index : index + 1],
             edge_primitive_types=self.edge_primitive_types[index : index + 1],
             edge_sheet_width_nodes=self.edge_sheet_width_nodes[index : index + 1],
             edge_orientation_start=self.edge_orientation_start[index : index + 1],

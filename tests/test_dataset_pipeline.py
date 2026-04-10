@@ -17,6 +17,7 @@ from compliant_mechanism_synthesis.dataset import (
     sample_primitive_design,
     sample_random_primitive,
 )
+from compliant_mechanism_synthesis.dataset.primitives import _extract_primitive_segments
 from compliant_mechanism_synthesis.mechanics import normalize_generalized_stiffness
 from compliant_mechanism_synthesis.roles import NodeRole
 
@@ -73,15 +74,33 @@ def test_sample_random_primitive_assigns_multiple_segment_families() -> None:
     assert used_types.numel() >= 3
 
 
-def test_sample_random_primitive_builds_intertwined_scaffold_graph() -> None:
+def test_extract_primitive_segments_merges_degree_two_runs() -> None:
+    adjacency = torch.zeros((6, 6), dtype=torch.float32)
+    for source, target in ((0, 1), (1, 2), (2, 3), (2, 4), (4, 5)):
+        adjacency[source, target] = 1.0
+        adjacency[target, source] = 1.0
+
+    assert _extract_primitive_segments(adjacency) == [[0, 1, 2], [2, 3], [2, 4, 5]]
+
+
+def test_sample_random_primitive_builds_degree_capped_scaffold_graph() -> None:
     _, scaffolds = sample_random_primitive(
-        config=PrimitiveConfig(num_free_nodes=8),
+        config=PrimitiveConfig(
+            num_free_nodes=12,
+            max_scaffold_degree=4,
+            long_range_connection_probability=1.0,
+        ),
         seed=13,
     )
 
     degree = scaffolds.adjacency[0].sum(dim=1)
+    edge_pairs = torch.nonzero(torch.triu(scaffolds.adjacency[0], diagonal=1) > 0.0)
+    index_gaps = torch.abs(edge_pairs[:, 1] - edge_pairs[:, 0])
+
     assert torch.count_nonzero(degree >= 3.0) >= 2
     assert torch.all(degree[1:-1] >= 2.0)
+    assert torch.all(degree <= 4.0)
+    assert torch.any(index_gaps >= 4)
 
 
 def test_materialize_scaffold_returns_valid_structure() -> None:
@@ -90,7 +109,9 @@ def test_materialize_scaffold_returns_valid_structure() -> None:
         seed=15,
     )
 
-    rematerialized = materialize_scaffold(scaffold, config=PrimitiveConfig(num_free_nodes=8))
+    rematerialized = materialize_scaffold(
+        scaffold, config=PrimitiveConfig(num_free_nodes=8)
+    )
 
     rematerialized.validate()
     assert rematerialized.batch_size == structures.batch_size
@@ -114,6 +135,9 @@ def test_optimize_scaffolds_returns_valid_batch() -> None:
         positions=torch.cat([scaffold_a.positions, scaffold_b.positions], dim=0),
         roles=torch.cat([scaffold_a.roles, scaffold_b.roles], dim=0),
         adjacency=torch.cat([scaffold_a.adjacency, scaffold_b.adjacency], dim=0),
+        edge_primitive_ids=torch.cat(
+            [scaffold_a.edge_primitive_ids, scaffold_b.edge_primitive_ids], dim=0
+        ),
         edge_primitive_types=torch.cat(
             [scaffold_a.edge_primitive_types, scaffold_b.edge_primitive_types], dim=0
         ),
@@ -268,11 +292,11 @@ def test_case_optimizer_can_increase_batch_stiffness_diversity(
     )
     structure_a = sample_primitive_design(
         config=primitive_config,
-        seed=29,
+        seed=20,
     )
     structure_b = sample_primitive_design(
         config=primitive_config,
-        seed=31,
+        seed=21,
     )
     initial_structures = type(structure_a)(
         positions=torch.cat([structure_a.positions, structure_b.positions], dim=0),
@@ -296,7 +320,9 @@ def test_case_optimizer_can_increase_batch_stiffness_diversity(
         logdir=tmp_path / "tb_interested",
     )
 
-    neutral_score = _stiffness_interest_score(neutral.last_analyses.generalized_stiffness)
+    neutral_score = _stiffness_interest_score(
+        neutral.last_analyses.generalized_stiffness
+    )
     interested_score = _stiffness_interest_score(
         interested.last_analyses.generalized_stiffness
     )
