@@ -6,4 +6,8 @@ from compliant_mechanism_synthesis.visualization.dataset import (
 )
 from compliant_mechanism_synthesis.visualization.plots import plot_design_3d
 
-__all__ = ["load_visualizable_dataset", "plot_design_3d", "write_dataset_visualizations"]
+__all__ = [
+    "load_visualizable_dataset",
+    "plot_design_3d",
+    "write_dataset_visualizations",
+]

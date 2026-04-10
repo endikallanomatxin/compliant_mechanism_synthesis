@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 cms-dataset-generate = "compliant_mechanism_synthesis.cli:dataset_generate_main"
+cms-sample = "compliant_mechanism_synthesis.cli:sample_supervised_main"
 cms-train-supervised = "compliant_mechanism_synthesis.cli:train_supervised_main"
 cms-dataset-visualize = "compliant_mechanism_synthesis.cli:visualize_dataset_main"
 

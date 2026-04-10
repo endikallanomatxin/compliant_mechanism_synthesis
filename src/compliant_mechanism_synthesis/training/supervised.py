@@ -162,6 +162,14 @@ def _dataset_adjacency_statistics(
     return mean, std
 
 
+def dataset_noise_statistics(
+    optimized_cases: OptimizedCases,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    position_mean, position_std = _dataset_position_statistics(optimized_cases)
+    adjacency_mean, adjacency_std = _dataset_adjacency_statistics(optimized_cases)
+    return position_mean, position_std, adjacency_mean, adjacency_std
+
+
 def _role_pair_adjacency_matrices(
     roles: torch.Tensor,
     adjacency_mean: torch.Tensor,
@@ -293,6 +301,27 @@ def _match_oracle_to_source(
     matched_structures.validate()
     matched_analyses.validate(batch_size)
     return matched_structures, matched_analyses
+
+
+def match_oracle_to_source(
+    source_structures: Structures,
+    oracle_structures: Structures,
+    oracle_analyses: Analyses,
+) -> tuple[Structures, Analyses]:
+    source_structures.validate()
+    oracle_structures.validate()
+    oracle_analyses.validate(oracle_structures.batch_size)
+    if source_structures.positions.shape != oracle_structures.positions.shape:
+        raise ValueError("source and oracle positions must have matching shapes")
+    if source_structures.adjacency.shape != oracle_structures.adjacency.shape:
+        raise ValueError("source and oracle adjacency must have matching shapes")
+    if not torch.equal(source_structures.roles, oracle_structures.roles):
+        raise ValueError("source and oracle must use the same node roles")
+    return _match_oracle_to_source(
+        source_structures=source_structures,
+        oracle_structures=oracle_structures,
+        oracle_analyses=oracle_analyses,
+    )
 
 
 def sample_noisy_structures(

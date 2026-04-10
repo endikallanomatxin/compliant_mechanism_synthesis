@@ -4,6 +4,7 @@ from pathlib import Path
 
 from compliant_mechanism_synthesis.cli import (
     dataset_generate_main,
+    sample_supervised_main,
     train_supervised_main,
     visualize_dataset_main,
 )
@@ -321,3 +322,63 @@ def test_train_supervised_main_can_disable_style_token(tmp_path: Path) -> None:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     assert checkpoint["model_config"]["use_style_token"] is False
     assert checkpoint["train_config"]["use_style_token"] is False
+
+
+def test_sample_supervised_main_writes_comparison_outputs(tmp_path: Path) -> None:
+    output_path = tmp_path / "dataset.pt"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_dataset"),
+        ]
+    )
+
+    checkpoint_path = tmp_path / "refiner.pt"
+    train_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--num-steps",
+            "4",
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--logdir",
+            str(tmp_path / "runs_supervised"),
+        ]
+    )
+
+    samples_dir = tmp_path / "samples"
+    sample_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--output-dir",
+            str(samples_dir),
+            "--device",
+            "cpu",
+            "--max-cases",
+            "1",
+            "--num-steps",
+            "2",
+        ]
+    )
+
+    assert (samples_dir / "summary.txt").exists()
+    assert (samples_dir / "case_0000_comparison.png").exists()
+    assert (samples_dir / "case_0000_rollout.gif").exists()

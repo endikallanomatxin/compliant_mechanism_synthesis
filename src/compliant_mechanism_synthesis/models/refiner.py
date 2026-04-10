@@ -542,7 +542,7 @@ class SupervisedRefiner(nn.Module):
             node_latents=node_latents,
         )
 
-    def rollout(
+    def rollout_trajectory(
         self,
         source_structures: Structures,
         target_stiffness: torch.Tensor,
@@ -550,7 +550,7 @@ class SupervisedRefiner(nn.Module):
         num_steps: int | None = None,
         style_structures: Structures | None = None,
         style_analyses: Analyses | None = None,
-    ) -> Structures:
+    ) -> list[Structures]:
         source_structures.validate()
         if self.config.use_style_token and style_structures is not None:
             style_structures.validate()
@@ -584,8 +584,7 @@ class SupervisedRefiner(nn.Module):
             raise ValueError("style_structures must use the same node roles")
 
         current = source_structures
-        initial_position_gap = current.positions.new_zeros(current.batch_size)
-        initial_adjacency_gap = current.adjacency.new_zeros(current.batch_size)
+        trajectory = [current]
         _, _, free_mask = role_masks(current.roles)
         free_mask = free_mask.unsqueeze(-1).to(dtype=current.positions.dtype)
 
@@ -624,8 +623,27 @@ class SupervisedRefiner(nn.Module):
                 roles=current.roles,
                 adjacency=adjacency,
             )
-        current.validate()
-        return current
+            trajectory.append(current)
+        trajectory[-1].validate()
+        return trajectory
+
+    def rollout(
+        self,
+        source_structures: Structures,
+        target_stiffness: torch.Tensor,
+        analysis_fn,
+        num_steps: int | None = None,
+        style_structures: Structures | None = None,
+        style_analyses: Analyses | None = None,
+    ) -> Structures:
+        return self.rollout_trajectory(
+            source_structures=source_structures,
+            target_stiffness=target_stiffness,
+            analysis_fn=analysis_fn,
+            num_steps=num_steps,
+            style_structures=style_structures,
+            style_analyses=style_analyses,
+        )[-1]
 
     def forward(
         self,
