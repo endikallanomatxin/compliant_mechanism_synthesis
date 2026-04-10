@@ -301,18 +301,46 @@ def _sample_chain_primitives(
                 raise ValueError(
                     "forced_segment_primitive_types must contain known primitive families"
                 )
+
+    def allowed_primitive_types(chain: list[int]) -> tuple[str, ...]:
+        if len(chain) > 4:
+            return ("truss",)
+        if len(chain) > 3:
+            return ("rod", "sheet", "truss")
+        return CHAIN_PRIMITIVE_LIBRARY
+
+    def coerce_primitive_type(chain: list[int], primitive_type: str) -> str:
+        allowed = allowed_primitive_types(chain)
+        if primitive_type in allowed:
+            return primitive_type
+        if len(chain) > 4:
+            return "truss"
+        if primitive_type == "rod_helix":
+            return "rod"
+        if primitive_type == "sheet_helix":
+            return "sheet"
+        return allowed[0]
+
     primitive_types = []
     if config.forced_segment_primitive_types is not None:
         if len(config.forced_segment_primitive_types) != len(chains):
             raise ValueError(
                 "forced_segment_primitive_types must match the number of scaffold segments"
             )
-        primitive_types = list(config.forced_segment_primitive_types)
+        primitive_types = [
+            coerce_primitive_type(chain, primitive_type)
+            for chain, primitive_type in zip(
+                chains, config.forced_segment_primitive_types
+            )
+        ]
     elif config.forced_primitive_type is not None:
-        primitive_types = [config.forced_primitive_type] * len(chains)
+        primitive_types = [
+            coerce_primitive_type(chain, config.forced_primitive_type)
+            for chain in chains
+        ]
     else:
         primitive_types = [
-            rng.choice(CHAIN_PRIMITIVE_LIBRARY) for _ in range(len(chains))
+            rng.choice(allowed_primitive_types(chain)) for chain in chains
         ]
 
     for chain, primitive_type in zip(chains, primitive_types):

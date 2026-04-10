@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import random
 
 import torch
 
@@ -17,7 +18,10 @@ from compliant_mechanism_synthesis.dataset import (
     sample_primitive_design,
     sample_random_primitive,
 )
-from compliant_mechanism_synthesis.dataset.primitives import _extract_primitive_segments
+from compliant_mechanism_synthesis.dataset.primitives import (
+    _extract_primitive_segments,
+    _sample_chain_primitives,
+)
 from compliant_mechanism_synthesis.mechanics import normalize_generalized_stiffness
 from compliant_mechanism_synthesis.roles import NodeRole
 
@@ -81,6 +85,26 @@ def test_extract_primitive_segments_merges_degree_two_runs() -> None:
         adjacency[target, source] = 1.0
 
     assert _extract_primitive_segments(adjacency) == [[0, 1, 2], [2, 3], [2, 4, 5]]
+
+
+def test_sample_chain_primitives_disables_helices_on_longer_runs() -> None:
+    assignments = _sample_chain_primitives(
+        chains=[[0, 1, 2, 3]],
+        config=PrimitiveConfig(forced_primitive_type="rod_helix"),
+        rng=random.Random(7),
+    )
+
+    assert assignments[0].primitive_type == "rod"
+
+
+def test_sample_chain_primitives_restricts_very_long_runs_to_truss() -> None:
+    assignments = _sample_chain_primitives(
+        chains=[[0, 1, 2, 3, 4]],
+        config=PrimitiveConfig(forced_primitive_type="sheet"),
+        rng=random.Random(7),
+    )
+
+    assert assignments[0].primitive_type == "truss"
 
 
 def test_sample_random_primitive_builds_degree_capped_scaffold_graph() -> None:

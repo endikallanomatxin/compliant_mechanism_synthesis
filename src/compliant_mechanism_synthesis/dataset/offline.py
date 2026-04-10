@@ -239,11 +239,13 @@ def generate_offline_dataset(
     ):
         num_scaffold_nodes = primitive_config.num_free_nodes + 2
         num_segments = _default_scaffold_primitive_count(num_scaffold_nodes)
+        # Offline batches need a stable materialized node count across cases.
+        # Since long control-point runs are coerced to structurally safer
+        # families, we use the always-valid truss family for the batch-fixed
+        # scaffold primitive template.
         primitive_config = replace(
             primitive_config,
-            forced_segment_primitive_types=tuple(
-                rng.choice(CHAIN_PRIMITIVE_LIBRARY) for _ in range(num_segments)
-            ),
+            forced_segment_primitive_types=("truss",) * num_segments,
         )
     if primitive_config.sample_sheet_helix_width_nodes:
         if (
