@@ -51,6 +51,8 @@ class SupervisedTrainingConfig:
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 1.0
     stiffness_loss_weight: float = 0.0
+    style_kl_loss_weight: float = 1e-3
+    style_kl_anneal_steps: int = 1_024
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
     seed: int = 7
@@ -115,6 +117,19 @@ def _scheduled_learning_rate(
 def _synchronize_device_if_needed(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _style_kl_weight(step: int, config: SupervisedTrainingConfig) -> float:
+    if config.style_kl_loss_weight < 0.0:
+        raise ValueError("style_kl_loss_weight must be non-negative")
+    if config.style_kl_anneal_steps < 0:
+        raise ValueError("style_kl_anneal_steps must be non-negative")
+    if config.style_kl_loss_weight == 0.0:
+        return 0.0
+    if config.style_kl_anneal_steps == 0:
+        return config.style_kl_loss_weight
+    progress = min(max((step + 1) / config.style_kl_anneal_steps, 0.0), 1.0)
+    return config.style_kl_loss_weight * progress
 
 
 def load_supervised_cases(dataset_path: str) -> OptimizedCases:
@@ -563,6 +578,7 @@ def _training_losses(
     prediction: FlowPrediction,
     batch: SupervisedBatch,
     config: SupervisedTrainingConfig,
+    step: int,
     profile: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     position_error = _position_velocity_loss(prediction, batch)
@@ -595,6 +611,11 @@ def _training_losses(
         )
     else:
         stiffness_error = position_error.new_zeros(position_error.shape)
+    if prediction.style_kl is None or not config.use_style_token:
+        style_kl = position_error.new_zeros(position_error.shape)
+    else:
+        style_kl = prediction.style_kl
+    kl_weight = _style_kl_weight(step, config)
     loss_contributions = {
         "position_error_loss_contribution": config.position_loss_weight
         * position_error,
@@ -602,16 +623,20 @@ def _training_losses(
         * adjacency_error,
         "stiffness_error_loss_contribution": config.stiffness_loss_weight
         * stiffness_error,
+        "style_kl_loss_contribution": kl_weight * style_kl,
     }
     total_loss = (
         loss_contributions["position_error_loss_contribution"]
         + loss_contributions["adjacency_error_loss_contribution"]
         + loss_contributions["stiffness_error_loss_contribution"]
+        + loss_contributions["style_kl_loss_contribution"]
     )
     metrics = {
         "position_error": position_error.mean(),
         "adjacency_error": adjacency_error.mean(),
         "stiffness_error": stiffness_error.mean(),
+        "style_kl": style_kl.mean(),
+        "style_kl_weight": position_error.new_tensor(kl_weight),
     }
     loss_summary = {name: value.mean() for name, value in loss_contributions.items()}
     loss_summary["total_loss"] = total_loss.mean()
@@ -643,6 +668,10 @@ def train_supervised_refiner(
         raise ValueError("min_learning_rate must be non-negative")
     if train_config.min_learning_rate > train_config.learning_rate:
         raise ValueError("min_learning_rate must be <= learning_rate")
+    if train_config.style_kl_loss_weight < 0.0:
+        raise ValueError("style_kl_loss_weight must be non-negative")
+    if train_config.style_kl_anneal_steps < 0:
+        raise ValueError("style_kl_anneal_steps must be non-negative")
 
     dataset_cases = optimized_cases.optimized_structures.batch_size
     steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
@@ -659,6 +688,7 @@ def train_supervised_refiner(
         "position_error_loss_contribution": [],
         "adjacency_error_loss_contribution": [],
         "stiffness_error_loss_contribution": [],
+        "style_kl_loss_contribution": [],
     }
     checkpoint_path = (
         Path(train_config.checkpoint_path)
@@ -672,7 +702,9 @@ def train_supervised_refiner(
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"use_style_token={'yes' if model.config.use_style_token else 'no'} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
-        f"min_learning_rate={train_config.min_learning_rate}",
+        f"min_learning_rate={train_config.min_learning_rate} "
+        f"style_kl_loss_weight={train_config.style_kl_loss_weight} "
+        f"style_kl_anneal_steps={train_config.style_kl_anneal_steps}",
         flush=True,
     )
     try:
@@ -725,7 +757,11 @@ def train_supervised_refiner(
                 forward_time = time.perf_counter()
                 loss_analysis_profile: dict[str, float] = {}
                 total_loss, metrics, loss_terms = _training_losses(
-                    prediction, batch, train_config, profile=loss_analysis_profile
+                    prediction,
+                    batch,
+                    train_config,
+                    step=step,
+                    profile=loss_analysis_profile,
                 )
                 _synchronize_device_if_needed(device)
                 loss_time = time.perf_counter()

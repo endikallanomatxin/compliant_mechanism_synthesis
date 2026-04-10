@@ -22,7 +22,10 @@ from compliant_mechanism_synthesis.training import (
     load_supervised_cases,
     train_supervised_refiner,
 )
-from compliant_mechanism_synthesis.training.supervised import _scheduled_learning_rate
+from compliant_mechanism_synthesis.training.supervised import (
+    _scheduled_learning_rate,
+    _style_kl_weight,
+)
 
 
 def _build_cases(tmp_path: Path):
@@ -88,6 +91,22 @@ def test_scheduled_learning_rate_warms_up_then_cosine_decays() -> None:
     assert learning_rates[2] > learning_rates[5] > learning_rates[8]
 
 
+def test_style_kl_weight_anneals_to_target() -> None:
+    config = SupervisedTrainingConfig(
+        dataset_path="dataset.pt",
+        style_kl_loss_weight=2e-3,
+        style_kl_anneal_steps=4,
+    )
+
+    weights = [_style_kl_weight(step, config) for step in range(6)]
+
+    assert weights[0] == pytest.approx(5e-4)
+    assert weights[1] == pytest.approx(1e-3)
+    assert weights[2] == pytest.approx(1.5e-3)
+    assert weights[3] == pytest.approx(2e-3)
+    assert weights[4] == pytest.approx(2e-3)
+
+
 def test_flow_times_cover_unit_interval_without_curriculum(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
     batch = make_supervised_batch(optimized_cases=cases, seed=3)
@@ -118,6 +137,7 @@ def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
     )
 
     assert summary.checkpoint_path.exists()
+    assert "style_kl_loss_contribution" in summary.history
     first_window = sum(summary.history["total_loss"][:4]) / 4.0
     best_observed = min(summary.history["total_loss"])
     assert best_observed <= first_window
@@ -216,6 +236,47 @@ def test_predict_flow_ignores_style_inputs_when_style_token_disabled(
 
     assert prediction.position_velocity.shape == batch.target_position_velocity.shape
     assert prediction.adjacency_velocity.shape == batch.target_adjacency_velocity.shape
+    assert prediction.style_mean is None
+    assert prediction.style_logvar is None
+    assert prediction.style_kl is None
+
+
+def test_predict_flow_returns_variational_style_statistics(tmp_path: Path) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            latent_dim=32,
+            num_attention_layers=3,
+            num_heads=4,
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        seed=15,
+    )
+
+    prediction = model.predict_flow(
+        structures=batch.flow_structures,
+        target_stiffness=batch.target_stiffness,
+        current_stiffness=batch.current_analyses.generalized_stiffness,
+        nodal_displacements=batch.current_analyses.nodal_displacements,
+        edge_von_mises=batch.current_analyses.edge_von_mises,
+        flow_times=batch.flow_times,
+        style_structures=batch.oracle_structures,
+        style_analyses=batch.oracle_analyses,
+    )
+
+    assert prediction.style_mean is not None
+    assert prediction.style_logvar is not None
+    assert prediction.style_kl is not None
+    assert prediction.style_mean.shape == (cases.optimized_structures.batch_size, 1, 64)
+    assert prediction.style_logvar.shape == prediction.style_mean.shape
+    assert prediction.style_kl.shape == (cases.optimized_structures.batch_size,)
+    assert torch.isfinite(prediction.style_mean).all()
+    assert torch.isfinite(prediction.style_logvar).all()
+    assert torch.isfinite(prediction.style_kl).all()
+    assert (prediction.style_kl >= 0.0).all()
 
 
 def test_predict_flow_stabilizes_large_mechanics_inputs(tmp_path: Path) -> None:

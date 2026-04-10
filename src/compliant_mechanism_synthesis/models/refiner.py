@@ -41,6 +41,17 @@ class FlowPrediction:
     adjacency_velocity: torch.Tensor
     predicted_adjacency: torch.Tensor
     node_latents: torch.Tensor
+    style_mean: torch.Tensor | None = None
+    style_logvar: torch.Tensor | None = None
+    style_kl: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class StyleTokenDistribution:
+    token: torch.Tensor
+    mean: torch.Tensor
+    logvar: torch.Tensor
+    kl: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -54,7 +65,8 @@ class SupervisedRefinerConfig:
     transition_width: float = 0.08
     use_style_token: bool = True
     style_token_dropout: float = 0.1
-    style_token_noise_std: float = 0.01
+    style_token_logvar_min: float = -6.0
+    style_token_logvar_max: float = 2.0
 
 
 class GraphAttentionBlock(nn.Module):
@@ -241,15 +253,23 @@ class StyleTokenEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(config.hidden_dim, config.hidden_dim),
         )
+        self.token_logvar_proj = nn.Sequential(
+            nn.Linear(style_hidden_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+        )
         self.dropout = nn.Dropout(config.style_token_dropout)
-        self.noise_std = config.style_token_noise_std
+        self.logvar_min = config.style_token_logvar_min
+        self.logvar_max = config.style_token_logvar_max
 
     def forward(
         self,
         structures: Structures,
         analyses: Analyses,
         target_stiffness: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> StyleTokenDistribution:
         if analyses.nodal_displacements is None:
             raise ValueError("style analyses must provide nodal_displacements")
         if analyses.edge_von_mises is None:
@@ -299,11 +319,21 @@ class StyleTokenEncoder(nn.Module):
                 ),
             )
         hidden = self.final_norm(hidden)
-        token = self.token_proj(hidden.mean(dim=1, keepdim=True))
-        token = self.dropout(token)
-        if self.training and self.noise_std > 0.0:
-            token = token + self.noise_std * torch.randn_like(token)
-        return token
+        pooled_hidden = hidden.mean(dim=1, keepdim=True)
+        mean = self.dropout(self.token_proj(pooled_hidden))
+        logvar = self.token_logvar_proj(pooled_hidden).clamp(
+            min=self.logvar_min,
+            max=self.logvar_max,
+        )
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            token = mean + std * torch.randn_like(std)
+        else:
+            token = mean
+        kl = -0.5 * (
+            1.0 + logvar - mean.square() - torch.exp(logvar)
+        ).mean(dim=(1, 2))
+        return StyleTokenDistribution(token=token, mean=mean, logvar=logvar, kl=kl)
 
 
 class SupervisedRefiner(nn.Module):
@@ -492,16 +522,23 @@ class SupervisedRefiner(nn.Module):
             ]
         )
         style_context = None
+        style_mean = None
+        style_logvar = None
+        style_kl = None
         if self.config.use_style_token and style_structures is not None:
             if self.style_token_encoder is None:
                 raise RuntimeError("style token encoder is not initialized")
             if style_analyses is None:
                 raise RuntimeError("style analyses are required for style conditioning")
-            style_context = self.style_token_encoder(
+            style_distribution = self.style_token_encoder(
                 structures=style_structures,
                 analyses=style_analyses,
                 target_stiffness=target_stiffness,
             )
+            style_context = style_distribution.token
+            style_mean = style_distribution.mean
+            style_logvar = style_distribution.logvar
+            style_kl = style_distribution.kl
 
         for layer in self.layers:
             hidden = layer(
@@ -540,6 +577,9 @@ class SupervisedRefiner(nn.Module):
             adjacency_velocity=adjacency_velocity,
             predicted_adjacency=predicted_adjacency,
             node_latents=node_latents,
+            style_mean=style_mean,
+            style_logvar=style_logvar,
+            style_kl=style_kl,
         )
 
     def rollout_trajectory(
