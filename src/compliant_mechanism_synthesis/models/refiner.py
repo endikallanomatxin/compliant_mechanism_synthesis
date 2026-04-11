@@ -56,10 +56,10 @@ class StyleTokenDistribution:
 
 @dataclass(frozen=True)
 class SupervisedRefinerConfig:
-    hidden_dim: int = 128
-    latent_dim: int = 64
-    num_attention_layers: int = 8
-    num_heads: int = 4
+    hidden_dim: int = 512
+    latent_dim: int = 256
+    num_attention_layers: int = 12
+    num_heads: int = 8
     num_integration_steps: int = 8
     max_distance: float = 0.24
     transition_width: float = 0.08
