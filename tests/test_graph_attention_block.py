@@ -34,7 +34,9 @@ def test_graph_attention_block_supports_context_and_stress_heads() -> None:
 def test_supervised_refiner_uses_hybrid_attention_defaults() -> None:
     model = SupervisedRefiner(SupervisedRefinerConfig())
 
-    assert model.config.hidden_dim == 512
+    assert model.config.hidden_dim == 1024
+    assert model.config.latent_dim == 512
+    assert model.config.num_attention_layers == 6
     assert model.config.num_heads == 16
     assert model.edge_von_mises_mlp[-1].out_features == 4
     assert all(layer.num_heads == 16 for layer in model.layers)
