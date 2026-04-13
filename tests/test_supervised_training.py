@@ -57,7 +57,10 @@ def test_supervised_refiner_preserves_structure_shapes(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
     model = SupervisedRefiner(
         SupervisedRefinerConfig(
-            hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=16
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
         )
     )
     prediction = model(
@@ -121,7 +124,10 @@ def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
     _, summary = train_supervised_refiner(
         optimized_cases=cases,
         model_config=SupervisedRefinerConfig(
-            hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=16
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
         ),
         train_config=SupervisedTrainingConfig(
             dataset_path=str(tmp_path / "dataset.pt"),
@@ -145,7 +151,10 @@ def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
 def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
     config = SupervisedRefinerConfig(
-        hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=16
+        hidden_dim=64,
+        connectivity_latent_dim=32,
+        num_attention_layers=3,
+        num_heads=16,
     )
     _, summary = train_supervised_refiner(
         optimized_cases=cases,
@@ -172,7 +181,10 @@ def test_predict_flow_rejects_mismatched_style_roles(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
     model = SupervisedRefiner(
         SupervisedRefinerConfig(
-            hidden_dim=64, latent_dim=32, num_attention_layers=3, num_heads=16
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
         )
     )
     batch = make_supervised_batch(
@@ -206,7 +218,7 @@ def test_predict_flow_ignores_style_inputs_when_style_token_disabled(
     model = SupervisedRefiner(
         SupervisedRefinerConfig(
             hidden_dim=64,
-            latent_dim=32,
+            connectivity_latent_dim=32,
             num_attention_layers=3,
             num_heads=16,
             use_style_token=False,
@@ -245,7 +257,7 @@ def test_predict_flow_returns_variational_style_statistics(tmp_path: Path) -> No
     model = SupervisedRefiner(
         SupervisedRefinerConfig(
             hidden_dim=64,
-            latent_dim=32,
+            connectivity_latent_dim=32,
             num_attention_layers=3,
             num_heads=16,
         )
@@ -283,7 +295,7 @@ def test_predict_flow_stabilizes_large_mechanics_inputs(tmp_path: Path) -> None:
     model = SupervisedRefiner(
         SupervisedRefinerConfig(
             hidden_dim=64,
-            latent_dim=32,
+            connectivity_latent_dim=32,
             num_attention_layers=3,
             num_heads=16,
         )
@@ -312,6 +324,40 @@ def test_predict_flow_stabilizes_large_mechanics_inputs(tmp_path: Path) -> None:
     assert torch.isfinite(prediction.adjacency_velocity).all()
 
 
+def test_predict_flow_produces_symmetric_bounded_adjacency(tmp_path: Path) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        seed=23,
+    )
+
+    prediction = model.predict_flow(
+        structures=batch.flow_structures,
+        target_stiffness=batch.target_stiffness,
+        current_stiffness=batch.current_analyses.generalized_stiffness,
+        nodal_displacements=batch.current_analyses.nodal_displacements,
+        edge_von_mises=batch.current_analyses.edge_von_mises,
+        flow_times=batch.flow_times,
+        style_structures=batch.oracle_structures,
+        style_analyses=batch.oracle_analyses,
+    )
+
+    assert torch.allclose(
+        prediction.predicted_adjacency,
+        prediction.predicted_adjacency.transpose(1, 2),
+    )
+    assert torch.all(prediction.predicted_adjacency >= 0.0)
+    assert torch.all(prediction.predicted_adjacency <= 1.0)
+
+
 def test_predict_flow_requires_style_analyses_with_style_structures(
     tmp_path: Path,
 ) -> None:
@@ -319,7 +365,7 @@ def test_predict_flow_requires_style_analyses_with_style_structures(
     model = SupervisedRefiner(
         SupervisedRefinerConfig(
             hidden_dim=64,
-            latent_dim=32,
+            connectivity_latent_dim=32,
             num_attention_layers=3,
             num_heads=16,
         )

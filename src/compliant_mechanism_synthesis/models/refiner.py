@@ -14,6 +14,7 @@ from compliant_mechanism_synthesis.tensor_ops import (
     distance_affinity,
     enforce_role_adjacency_constraints,
     max_length_gate,
+    symmetrize_matrix,
     symmetric_matrix_unique_values,
 )
 
@@ -40,7 +41,7 @@ class FlowPrediction:
     position_velocity: torch.Tensor
     adjacency_velocity: torch.Tensor
     predicted_adjacency: torch.Tensor
-    node_latents: torch.Tensor
+    connectivity_latents: torch.Tensor
     style_mean: torch.Tensor | None = None
     style_logvar: torch.Tensor | None = None
     style_kl: torch.Tensor | None = None
@@ -57,9 +58,11 @@ class StyleTokenDistribution:
 @dataclass(frozen=True)
 class SupervisedRefinerConfig:
     hidden_dim: int = 1024
-    latent_dim: int = 512
+    connectivity_latent_dim: int = 512
     num_attention_layers: int = 6
     num_heads: int = 16
+    pair_edge_hidden_dim: int = 256
+    pair_edge_logit_eps: float = 1e-4
     local_incident_bar_limit: int = 5
     local_relation_hidden_dim: int = 32
     local_bar_hidden_dim: int = 96
@@ -442,6 +445,29 @@ class LocalNodeGeometryEncoder(nn.Module):
         return self.output_proj(node_summary)
 
 
+def _symmetric_pair_edge_features(
+    connectivity_latents: torch.Tensor,
+    positions: torch.Tensor,
+    current_adjacency: torch.Tensor,
+) -> torch.Tensor:
+    latent_i = connectivity_latents.unsqueeze(2)
+    latent_j = connectivity_latents.unsqueeze(1)
+    position_deltas = positions.unsqueeze(2) - positions.unsqueeze(1)
+    pair_distance = torch.linalg.vector_norm(position_deltas, dim=-1, keepdim=True)
+    latent_dot_product = (latent_i * latent_j).sum(dim=-1, keepdim=True)
+    return torch.cat(
+        [
+            latent_i + latent_j,
+            torch.abs(latent_i - latent_j),
+            latent_i * latent_j,
+            latent_dot_product,
+            pair_distance,
+            current_adjacency.unsqueeze(-1),
+        ],
+        dim=-1,
+    )
+
+
 class StyleTokenEncoder(nn.Module):
     def __init__(
         self,
@@ -577,6 +603,8 @@ class SupervisedRefiner(nn.Module):
     def __init__(self, config: SupervisedRefinerConfig | None = None) -> None:
         super().__init__()
         self.config = config or SupervisedRefinerConfig()
+        if not (0.0 < self.config.pair_edge_logit_eps < 0.5):
+            raise ValueError("pair_edge_logit_eps must be in (0, 0.5)")
         self.position_mlp = nn.Sequential(
             nn.Linear(3, self.config.hidden_dim),
             nn.GELU(),
@@ -648,14 +676,24 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, 3),
         )
-        self.node_latent_head = nn.Sequential(
+        self.connectivity_latent_head = nn.Sequential(
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
-            nn.Linear(self.config.hidden_dim, self.config.latent_dim),
+            nn.Linear(self.config.hidden_dim, self.config.connectivity_latent_dim),
+        )
+        pair_edge_input_dim = 3 * self.config.connectivity_latent_dim + 3
+        self.pair_edge_mlp = nn.Sequential(
+            nn.Linear(pair_edge_input_dim, self.config.pair_edge_hidden_dim),
+            nn.GELU(),
+            nn.Linear(
+                self.config.pair_edge_hidden_dim, self.config.pair_edge_hidden_dim
+            ),
+            nn.GELU(),
+            nn.Linear(self.config.pair_edge_hidden_dim, 1),
         )
         nn.init.normal_(self.position_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.position_head[-1].bias)
@@ -790,24 +828,30 @@ class SupervisedRefiner(nn.Module):
 
         hidden = self.final_norm(hidden)
         position_velocity = self.position_head(hidden)
-        node_latents = self.node_latent_head(hidden)
-        # Connectivity updates stay factored through node latents so the model
-        # cannot bypass the intended graph-inductive bias with edge-wise heads.
-        scores = torch.matmul(node_latents, node_latents.transpose(1, 2)) / math.sqrt(
-            self.config.latent_dim
+        connectivity_latents = self.connectivity_latent_head(hidden)
+        # Connectivity updates stay grounded in node latents, but use a
+        # symmetric pair scorer and update adjacency in logit space.
+        pair_features = _symmetric_pair_edge_features(
+            connectivity_latents,
+            positions,
+            current_adjacency,
         )
-        delta_scores = torch.tanh(scores)
+        delta_logit = self.pair_edge_mlp(pair_features).squeeze(-1)
+        delta_logit = symmetrize_matrix(delta_logit)
         update_gate = max_length_gate(
             positions,
             max_distance=self.config.max_distance,
             transition_width=self.config.transition_width,
         )
+        current_logits = torch.logit(
+            current_adjacency.clamp(
+                self.config.pair_edge_logit_eps,
+                1.0 - self.config.pair_edge_logit_eps,
+            )
+        )
+        updated_logits = current_logits + delta_logit * update_gate
         predicted_adjacency = enforce_role_adjacency_constraints(
-            (
-                current_adjacency
-                + delta_scores * update_gate
-                - current_adjacency * (1.0 - update_gate)
-            ).clamp(0.0, 1.0),
+            torch.sigmoid(updated_logits),
             roles,
         )
         adjacency_velocity = predicted_adjacency - current_adjacency
@@ -815,7 +859,7 @@ class SupervisedRefiner(nn.Module):
             position_velocity=position_velocity,
             adjacency_velocity=adjacency_velocity,
             predicted_adjacency=predicted_adjacency,
-            node_latents=node_latents,
+            connectivity_latents=connectivity_latents,
             style_mean=style_mean,
             style_logvar=style_logvar,
             style_kl=style_kl,

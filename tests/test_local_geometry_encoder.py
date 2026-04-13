@@ -36,7 +36,7 @@ def test_local_geometry_encoder_is_invariant_to_incident_bar_permutations() -> N
     encoder = LocalNodeGeometryEncoder(
         SupervisedRefinerConfig(
             hidden_dim=32,
-            latent_dim=16,
+            connectivity_latent_dim=16,
             num_heads=4,
             local_relation_hidden_dim=16,
             local_bar_hidden_dim=32,
@@ -76,7 +76,7 @@ def test_local_geometry_encoder_returns_hidden_dim_features() -> None:
     encoder = LocalNodeGeometryEncoder(
         SupervisedRefinerConfig(
             hidden_dim=48,
-            latent_dim=16,
+            connectivity_latent_dim=16,
             num_heads=4,
             local_relation_hidden_dim=16,
             local_bar_hidden_dim=32,
