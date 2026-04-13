@@ -60,6 +60,12 @@ class SupervisedRefinerConfig:
     latent_dim: int = 256
     num_attention_layers: int = 12
     num_heads: int = 8
+    local_incident_bar_limit: int = 5
+    local_relation_hidden_dim: int = 32
+    local_bar_hidden_dim: int = 96
+    local_num_heads: int = 4
+    local_pair_transformer_layers: int = 1
+    local_bar_transformer_layers: int = 1
     num_integration_steps: int = 8
     max_distance: float = 0.24
     transition_width: float = 0.08
@@ -205,6 +211,201 @@ class GraphAttentionBlock(nn.Module):
         return hidden
 
 
+def _cross2d_abs(vectors_a: torch.Tensor, vectors_b: torch.Tensor) -> torch.Tensor:
+    return (
+        vectors_a[..., 0] * vectors_b[..., 1] - vectors_a[..., 1] * vectors_b[..., 0]
+    ).abs()
+
+
+def _incident_bar_pair_features(
+    directions_2d: torch.Tensor,
+    lengths: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    direction_a = directions_2d.unsqueeze(-2)
+    direction_b = directions_2d.unsqueeze(-3)
+    dot_products = (direction_a * direction_b).sum(dim=-1).clamp(-1.0, 1.0)
+    sin_magnitudes = _cross2d_abs(direction_a, direction_b).clamp(0.0, 1.0)
+    length_a = lengths.unsqueeze(-1).expand_as(dot_products)
+    length_b = lengths.unsqueeze(-2).expand_as(dot_products)
+    weight_a = weights.unsqueeze(-1).expand_as(dot_products)
+    weight_b = weights.unsqueeze(-2).expand_as(dot_products)
+    return torch.stack(
+        [dot_products, sin_magnitudes, length_a, length_b, weight_a, weight_b],
+        dim=-1,
+    )
+
+
+class LocalNodeGeometryEncoder(nn.Module):
+    def __init__(self, config: SupervisedRefinerConfig) -> None:
+        super().__init__()
+        if config.local_relation_hidden_dim % config.local_num_heads != 0:
+            raise ValueError(
+                "local_relation_hidden_dim must be divisible by local_num_heads"
+            )
+        if config.local_bar_hidden_dim % config.local_num_heads != 0:
+            raise ValueError(
+                "local_bar_hidden_dim must be divisible by local_num_heads"
+            )
+        if config.local_incident_bar_limit <= 0:
+            raise ValueError("local_incident_bar_limit must be positive")
+        self.max_incident_bars = config.local_incident_bar_limit
+        self.relation_hidden_dim = config.local_relation_hidden_dim
+        self.bar_hidden_dim = config.local_bar_hidden_dim
+        self.bar_feature_mlp = nn.Sequential(
+            nn.Linear(4, self.relation_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.relation_hidden_dim, self.relation_hidden_dim),
+        )
+        self.pair_mlp = nn.Sequential(
+            nn.Linear(6, self.relation_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.relation_hidden_dim, self.relation_hidden_dim),
+        )
+        self.bar_up_proj = nn.Sequential(
+            nn.Linear(self.relation_hidden_dim, self.bar_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.bar_hidden_dim, self.bar_hidden_dim),
+        )
+        relation_layer = nn.TransformerEncoderLayer(
+            d_model=self.relation_hidden_dim,
+            nhead=config.local_num_heads,
+            dim_feedforward=self.relation_hidden_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.relation_encoder = nn.TransformerEncoder(
+            relation_layer,
+            num_layers=config.local_pair_transformer_layers,
+            enable_nested_tensor=False,
+        )
+        bar_layer = nn.TransformerEncoderLayer(
+            d_model=self.bar_hidden_dim,
+            nhead=config.local_num_heads,
+            dim_feedforward=self.bar_hidden_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.bar_encoder = nn.TransformerEncoder(
+            bar_layer,
+            num_layers=config.local_bar_transformer_layers,
+            enable_nested_tensor=False,
+        )
+        self.output_proj = nn.Sequential(
+            nn.Linear(self.bar_hidden_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+        )
+
+    def _pool_encoded_set(
+        self,
+        encoded_tokens: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        weights = valid_mask.to(dtype=encoded_tokens.dtype).unsqueeze(-1)
+        return (encoded_tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+    def _encode_relation_sets(
+        self,
+        relation_tokens: torch.Tensor,
+        relation_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, num_nodes, num_bars, _, hidden_dim = relation_tokens.shape
+        flat_tokens = relation_tokens.reshape(
+            batch_size * num_nodes * num_bars, num_bars, hidden_dim
+        )
+        flat_valid = relation_valid.reshape(batch_size * num_nodes * num_bars, num_bars)
+        if flat_valid.shape[1] == 0:
+            return flat_tokens.new_zeros(batch_size, num_nodes, num_bars, hidden_dim)
+        empty_rows = ~flat_valid.any(dim=1)
+        flat_tokens = flat_tokens.clone()
+        flat_valid = flat_valid.clone()
+        flat_valid[empty_rows, 0] = True
+        flat_tokens[empty_rows, 0] = 0.0
+        encoded = self.relation_encoder(
+            flat_tokens,
+            src_key_padding_mask=~flat_valid,
+        )
+        pooled = self._pool_encoded_set(encoded, flat_valid)
+        return pooled.view(batch_size, num_nodes, num_bars, hidden_dim)
+
+    def _encode_bar_set(
+        self,
+        bar_tokens: torch.Tensor,
+        bar_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, num_nodes, num_bars, hidden_dim = bar_tokens.shape
+        flat_tokens = bar_tokens.reshape(batch_size * num_nodes, num_bars, hidden_dim)
+        flat_valid = bar_valid.reshape(batch_size * num_nodes, num_bars)
+        if flat_valid.shape[1] == 0:
+            return flat_tokens.new_zeros(batch_size, num_nodes, hidden_dim)
+        empty_rows = ~flat_valid.any(dim=1)
+        flat_tokens = flat_tokens.clone()
+        flat_valid = flat_valid.clone()
+        flat_valid[empty_rows, 0] = True
+        flat_tokens[empty_rows, 0] = 0.0
+        encoded = self.bar_encoder(flat_tokens, src_key_padding_mask=~flat_valid)
+        pooled = self._pool_encoded_set(encoded, flat_valid)
+        return pooled.view(batch_size, num_nodes, hidden_dim)
+
+    def forward(self, positions: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+        batch_size, num_nodes, spatial_dim = positions.shape
+        if spatial_dim != 3:
+            raise ValueError("LocalNodeGeometryEncoder expects 3D positions")
+        if adjacency.shape != (batch_size, num_nodes, num_nodes):
+            raise ValueError("adjacency must match positions batch and node dimensions")
+        if num_nodes <= 1:
+            return positions.new_zeros(
+                batch_size, num_nodes, self.output_proj[-1].out_features
+            )
+
+        num_bars = min(self.max_incident_bars, num_nodes - 1)
+        edge_weights = adjacency.clamp_min(0.0)
+        edge_weights = edge_weights.masked_fill(
+            torch.eye(num_nodes, device=adjacency.device, dtype=torch.bool).unsqueeze(
+                0
+            ),
+            0.0,
+        )
+        top_weights, top_indices = torch.topk(edge_weights, k=num_bars, dim=-1)
+        bar_valid = top_weights > 0.0
+        batch_index = torch.arange(batch_size, device=positions.device)[:, None, None]
+        neighbor_positions = positions[batch_index, top_indices]
+        node_positions = positions[:, :, None, :]
+        bar_vectors = neighbor_positions - node_positions
+        bar_lengths = torch.linalg.vector_norm(bar_vectors, dim=-1)
+        planar_vectors = bar_vectors[..., :2]
+        planar_lengths = torch.linalg.vector_norm(planar_vectors, dim=-1, keepdim=True)
+        safe_planar_lengths = planar_lengths.clamp_min(1e-6)
+        directions_2d = planar_vectors / safe_planar_lengths
+        directions_2d = directions_2d * bar_valid.unsqueeze(-1)
+        bar_lengths = bar_lengths * bar_valid
+        top_weights = top_weights * bar_valid
+
+        pair_features = _incident_bar_pair_features(
+            directions_2d, bar_lengths, top_weights
+        )
+        relation_tokens = self.pair_mlp(pair_features)
+        eye_mask = torch.eye(num_bars, device=adjacency.device, dtype=torch.bool).view(
+            1, 1, num_bars, num_bars
+        )
+        relation_valid = bar_valid.unsqueeze(-1) & bar_valid.unsqueeze(-2) & ~eye_mask
+        relation_summary = self._encode_relation_sets(relation_tokens, relation_valid)
+
+        bar_features = torch.cat(
+            [directions_2d, bar_lengths.unsqueeze(-1), top_weights.unsqueeze(-1)],
+            dim=-1,
+        )
+        bar_tokens = self.bar_feature_mlp(bar_features) + relation_summary
+        bar_tokens = self.bar_up_proj(bar_tokens) * bar_valid.unsqueeze(-1)
+        node_summary = self._encode_bar_set(bar_tokens, bar_valid)
+        return self.output_proj(node_summary)
+
+
 class StyleTokenEncoder(nn.Module):
     def __init__(
         self,
@@ -214,6 +415,7 @@ class StyleTokenEncoder(nn.Module):
         edge_von_mises_mlp: nn.Module,
         role_embedding: nn.Embedding,
         mechanics_condition_mlp: nn.Module,
+        local_geometry_encoder: nn.Module,
     ) -> None:
         super().__init__()
         style_hidden_dim = max(config.num_heads, config.hidden_dim // 2)
@@ -228,6 +430,7 @@ class StyleTokenEncoder(nn.Module):
         self.edge_von_mises_mlp = edge_von_mises_mlp
         self.role_embedding = role_embedding
         self.mechanics_condition_mlp = mechanics_condition_mlp
+        self.local_geometry_encoder = local_geometry_encoder
         self.stem_down_proj = nn.Sequential(
             nn.Linear(config.hidden_dim, style_hidden_dim),
             nn.GELU(),
@@ -278,6 +481,10 @@ class StyleTokenEncoder(nn.Module):
             structures.positions
         ) + self.nodal_displacement_mlp(
             _signed_log1p_features(analyses.nodal_displacements)
+        )
+        shared_hidden = shared_hidden + self.local_geometry_encoder(
+            structures.positions,
+            structures.adjacency,
         )
         shared_hidden = shared_hidden + self.role_embedding(structures.roles)
         normalized_target_stiffness = normalize_generalized_stiffness(target_stiffness)
@@ -330,9 +537,7 @@ class StyleTokenEncoder(nn.Module):
             token = mean + std * torch.randn_like(std)
         else:
             token = mean
-        kl = -0.5 * (
-            1.0 + logvar - mean.square() - torch.exp(logvar)
-        ).mean(dim=(1, 2))
+        kl = -0.5 * (1.0 + logvar - mean.square() - torch.exp(logvar)).mean(dim=(1, 2))
         return StyleTokenDistribution(token=token, mean=mean, logvar=logvar, kl=kl)
 
 
@@ -361,6 +566,8 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.num_heads),
         )
+        self.local_geometry_encoder = LocalNodeGeometryEncoder(self.config)
+        self.style_local_geometry_encoder = LocalNodeGeometryEncoder(self.config)
         self.role_embedding = nn.Embedding(3, self.config.hidden_dim)
         self.mechanics_condition_mlp = nn.Sequential(
             nn.Linear(63, self.config.hidden_dim),
@@ -384,6 +591,7 @@ class SupervisedRefiner(nn.Module):
                 edge_von_mises_mlp=self.edge_von_mises_mlp,
                 role_embedding=self.role_embedding,
                 mechanics_condition_mlp=self.mechanics_condition_mlp,
+                local_geometry_encoder=self.style_local_geometry_encoder,
             )
             if self.config.use_style_token
             else None
@@ -496,6 +704,7 @@ class SupervisedRefiner(nn.Module):
         hidden = self.position_mlp(positions) + self.nodal_displacement_mlp(
             _signed_log1p_features(nodal_displacements)
         )
+        hidden = hidden + self.local_geometry_encoder(positions, current_adjacency)
         hidden = hidden + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
         edge_stress_conditioning = self.edge_von_mises_mlp(
