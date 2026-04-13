@@ -59,7 +59,7 @@ class SupervisedRefinerConfig:
     hidden_dim: int = 512
     latent_dim: int = 256
     num_attention_layers: int = 12
-    num_heads: int = 8
+    num_heads: int = 16
     local_incident_bar_limit: int = 5
     local_relation_hidden_dim: int = 32
     local_bar_hidden_dim: int = 96
@@ -76,16 +76,21 @@ class SupervisedRefinerConfig:
 
 
 class GraphAttentionBlock(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, mode: str) -> None:
+    def __init__(self, hidden_dim: int, num_heads: int) -> None:
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
-        if mode not in {"distance", "connectivity", "stress", "free"}:
-            raise ValueError("mode must be distance, connectivity, stress, or free")
+        if num_heads != 16:
+            raise ValueError("GraphAttentionBlock requires exactly 16 heads")
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.mode = mode
+        self.hybrid_head_slices = (
+            ("distance", slice(0, 4)),
+            ("connectivity", slice(4, 8)),
+            ("stress", slice(8, 12)),
+            ("free", slice(12, 16)),
+        )
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
@@ -100,16 +105,102 @@ class GraphAttentionBlock(nn.Module):
 
     def _conditioning_matrix(
         self,
+        mode: str,
         adjacency: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor | None:
-        if self.mode == "free":
+        if mode == "free":
             return None
-        if self.mode == "connectivity":
+        if mode == "connectivity":
             return adjacency
-        if self.mode == "stress":
+        if mode == "stress":
             return None
         return distance_affinity(positions, length_scale=0.22)
+
+    def _extend_nodal_conditioning(
+        self,
+        conditioning: torch.Tensor,
+        context_tokens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if context_tokens is None:
+            return conditioning
+        batch, num_nodes, _ = conditioning.shape
+        context_count = context_tokens.shape[1]
+        return torch.cat(
+            [
+                conditioning,
+                torch.zeros(
+                    batch,
+                    num_nodes,
+                    context_count,
+                    device=conditioning.device,
+                    dtype=conditioning.dtype,
+                ),
+            ],
+            dim=-1,
+        )
+
+    def _extend_edge_conditioning(
+        self,
+        edge_head_conditioning: torch.Tensor,
+        num_nodes: int,
+        context_tokens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if context_tokens is None:
+            return edge_head_conditioning
+        batch, num_heads, _, _ = edge_head_conditioning.shape
+        context_count = context_tokens.shape[1]
+        return torch.cat(
+            [
+                edge_head_conditioning,
+                torch.zeros(
+                    batch,
+                    num_heads,
+                    num_nodes,
+                    context_count,
+                    device=edge_head_conditioning.device,
+                    dtype=edge_head_conditioning.dtype,
+                ),
+            ],
+            dim=-1,
+        )
+
+    def _hybrid_attention(
+        self,
+        logits: torch.Tensor,
+        adjacency: torch.Tensor,
+        positions: torch.Tensor,
+        context_tokens: torch.Tensor | None,
+        edge_head_conditioning: torch.Tensor | None,
+    ) -> torch.Tensor:
+        logits_bias = torch.zeros_like(logits)
+        weight_scale = torch.ones_like(logits)
+        for mode, head_slice in self.hybrid_head_slices:
+            conditioning = self._conditioning_matrix(mode, adjacency, positions)
+            if conditioning is not None:
+                extended_conditioning = self._extend_nodal_conditioning(
+                    conditioning,
+                    context_tokens,
+                )
+                logits_bias[:, head_slice] = (
+                    2.0 * extended_conditioning[:, None, :, :] - 1.0
+                )
+                weight_scale[:, head_slice] = (
+                    0.25 + 0.75 * extended_conditioning[:, None]
+                )
+        if edge_head_conditioning is not None:
+            if edge_head_conditioning.shape[1] != 4:
+                raise ValueError("hybrid stress conditioning must have 4 head channels")
+            extended_edge_conditioning = self._extend_edge_conditioning(
+                edge_head_conditioning,
+                logits.shape[2],
+                context_tokens,
+            )
+            logits_bias[:, 8:12] = logits_bias[:, 8:12] + extended_edge_conditioning
+        weights = torch.softmax(logits + logits_bias, dim=-1)
+        weights = weights * weight_scale
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return weights
 
     def forward(
         self,
@@ -141,68 +232,13 @@ class GraphAttentionBlock(nn.Module):
             .transpose(1, 2)
         )
         logits = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(self.head_dim)
-
-        conditioning = self._conditioning_matrix(adjacency, positions)
-        if conditioning is not None:
-            if context_tokens is not None:
-                context_count = context_tokens.shape[1]
-                conditioning_bias = torch.cat(
-                    [
-                        2.0 * conditioning - 1.0,
-                        torch.zeros(
-                            batch,
-                            num_nodes,
-                            context_count,
-                            device=conditioning.device,
-                            dtype=conditioning.dtype,
-                        ),
-                    ],
-                    dim=-1,
-                )
-            else:
-                conditioning_bias = 2.0 * conditioning - 1.0
-            logits = logits + conditioning_bias[:, None, :, :]
-
-        if edge_head_conditioning is not None:
-            if context_tokens is not None:
-                context_count = context_tokens.shape[1]
-                edge_head_conditioning = torch.cat(
-                    [
-                        edge_head_conditioning,
-                        torch.zeros(
-                            batch,
-                            self.num_heads,
-                            num_nodes,
-                            context_count,
-                            device=edge_head_conditioning.device,
-                            dtype=edge_head_conditioning.dtype,
-                        ),
-                    ],
-                    dim=-1,
-                )
-            logits = logits + edge_head_conditioning
-
-        weights = torch.softmax(logits, dim=-1)
-        if conditioning is not None:
-            if context_tokens is not None:
-                context_count = context_tokens.shape[1]
-                weight_scale = torch.cat(
-                    [
-                        0.25 + 0.75 * conditioning,
-                        torch.ones(
-                            batch,
-                            num_nodes,
-                            context_count,
-                            device=conditioning.device,
-                            dtype=conditioning.dtype,
-                        ),
-                    ],
-                    dim=-1,
-                )
-            else:
-                weight_scale = 0.25 + 0.75 * conditioning
-            weights = weights * weight_scale[:, None, :, :]
-            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        weights = self._hybrid_attention(
+            logits,
+            adjacency,
+            positions,
+            context_tokens,
+            edge_head_conditioning,
+        )
 
         attended = torch.matmul(weights, value)
         attended = attended.transpose(1, 2).reshape(batch, num_nodes, self.hidden_dim)
@@ -437,13 +473,11 @@ class StyleTokenEncoder(nn.Module):
             nn.Linear(style_hidden_dim, style_hidden_dim),
         )
         self.input_norm = nn.LayerNorm(style_hidden_dim)
-        layer_modes = ("distance", "connectivity", "stress", "free")
         self.layers = nn.ModuleList(
             [
                 GraphAttentionBlock(
                     hidden_dim=style_hidden_dim,
                     num_heads=config.num_heads,
-                    mode=layer_modes[index % len(layer_modes)],
                 )
                 for index in range(max(1, config.num_attention_layers // 2))
             ]
@@ -521,9 +555,7 @@ class StyleTokenEncoder(nn.Module):
                 hidden,
                 structures.adjacency,
                 structures.positions,
-                edge_head_conditioning=(
-                    edge_stress_conditioning if layer.mode == "stress" else None
-                ),
+                edge_head_conditioning=edge_stress_conditioning,
             )
         hidden = self.final_norm(hidden)
         pooled_hidden = hidden.mean(dim=1, keepdim=True)
@@ -564,7 +596,7 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
             nn.GELU(),
-            nn.Linear(self.config.hidden_dim, self.config.num_heads),
+            nn.Linear(self.config.hidden_dim, 4),
         )
         self.local_geometry_encoder = LocalNodeGeometryEncoder(self.config)
         self.style_local_geometry_encoder = LocalNodeGeometryEncoder(self.config)
@@ -597,13 +629,11 @@ class SupervisedRefiner(nn.Module):
             else None
         )
         self.input_norm = nn.LayerNorm(self.config.hidden_dim)
-        layer_modes = ("distance", "connectivity", "stress", "free")
         self.layers = nn.ModuleList(
             [
                 GraphAttentionBlock(
                     hidden_dim=self.config.hidden_dim,
                     num_heads=self.config.num_heads,
-                    mode=layer_modes[index % len(layer_modes)],
                 )
                 for index in range(self.config.num_attention_layers)
             ]
@@ -755,7 +785,7 @@ class SupervisedRefiner(nn.Module):
                 current_adjacency,
                 positions,
                 style_context,
-                edge_stress_conditioning if layer.mode == "stress" else None,
+                edge_stress_conditioning,
             )
 
         hidden = self.final_norm(hidden)
