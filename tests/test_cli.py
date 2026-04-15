@@ -110,8 +110,10 @@ def test_dataset_generate_main_logs_batch_progress(
 
     captured = capsys.readouterr()
     assert "dataset generation started" in captured.out
-    assert "dataset batch 1/2" in captured.out
-    assert "dataset batch 2/2" in captured.out
+    assert "dataset batch 1 " in captured.out
+    assert "dataset batch 2 " in captured.out
+    assert "cases=2/3" in captured.out
+    assert "cases=3/3" in captured.out
 
 
 def test_dataset_generate_main_names_run(tmp_path: Path) -> None:
