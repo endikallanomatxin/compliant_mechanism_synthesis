@@ -57,21 +57,27 @@ class StyleTokenDistribution:
 
 @dataclass(frozen=True)
 class SupervisedRefinerConfig:
+    # Global
     hidden_dim: int = 1024
-    connectivity_latent_dim: int = 256
     num_attention_layers: int = 6
     num_heads: int = 16
-    pair_edge_hidden_dim: int = 128
+    # Output
+    connectivity_latent_dim: int = 128
+    pair_edge_hidden_dim: int = 256
     pair_edge_logit_eps: float = 1e-4
+    # Local bar angles nodal encoding
     local_incident_bar_limit: int = 5
     local_relation_hidden_dim: int = 32
     local_bar_hidden_dim: int = 64
     local_num_heads: int = 4
     local_pair_transformer_layers: int = 1
     local_bar_transformer_layers: int = 1
+    # Inference
     num_integration_steps: int = 8
+    # Units
     max_distance: float = 0.24
     transition_width: float = 0.08
+    # Style token
     use_style_token: bool = True
     style_token_dropout: float = 0.1
     style_token_logvar_min: float = -6.0
