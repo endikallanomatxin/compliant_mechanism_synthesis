@@ -20,12 +20,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=defaults.device)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--log-every-steps", type=int, default=defaults.log_every_steps)
+    parser.add_argument(
+        "--eval-every-steps", type=int, default=defaults.eval_every_steps
+    )
     parser.add_argument("--num-steps", type=int, default=defaults.num_steps)
     parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
     parser.add_argument("--warmup-steps", type=int, default=defaults.warmup_steps)
     parser.add_argument(
         "--min-learning-rate", type=float, default=defaults.min_learning_rate
     )
+    parser.add_argument("--eval-fraction", type=float, default=defaults.eval_fraction)
     parser.add_argument(
         "--no-style-token",
         dest="use_style_token",
@@ -48,10 +52,12 @@ def train_supervised_main(argv: list[str] | None = None) -> None:
             device=args.device,
             batch_size=args.batch_size,
             log_every_steps=args.log_every_steps,
+            eval_every_steps=args.eval_every_steps,
             num_steps=args.num_steps,
             learning_rate=args.learning_rate,
             warmup_steps=args.warmup_steps,
             min_learning_rate=args.min_learning_rate,
+            eval_fraction=args.eval_fraction,
             use_style_token=args.use_style_token,
             checkpoint_path=args.checkpoint_path,
             logdir=str(logdir_path),

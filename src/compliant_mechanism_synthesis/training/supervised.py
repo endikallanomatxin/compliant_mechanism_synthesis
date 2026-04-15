@@ -42,11 +42,13 @@ class SupervisedTrainingConfig:
     device: str = "auto"
     batch_size: int = 224
     log_every_steps: int = 10
+    eval_every_steps: int = 100
     max_grad_norm: float = 1.0
     num_steps: int = 150_000  # 16h
     learning_rate: float = 4e-5
     warmup_steps: int = 1000
     min_learning_rate: float = 4e-6
+    eval_fraction: float = 0.02
     use_style_token: bool = True
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.5
@@ -79,6 +81,20 @@ class SupervisedBatch:
 class SupervisedTrainingSummary:
     history: dict[str, list[float]]
     checkpoint_path: Path
+
+
+@dataclass(frozen=True)
+class EvalSplit:
+    train_cases: OptimizedCases
+    eval_cases: OptimizedCases | None
+
+
+@dataclass(frozen=True)
+class EvalRunResult:
+    losses: dict[str, float]
+    metrics: dict[str, float]
+    num_batches: int
+    num_cases: int
 
 
 def _scheduled_learning_rate(
@@ -514,6 +530,34 @@ def select_batch(
     return optimized_cases.index_select(batch_indices)
 
 
+def split_train_eval_cases(
+    optimized_cases: OptimizedCases,
+    eval_fraction: float,
+) -> EvalSplit:
+    optimized_cases.validate()
+    if not 0.0 <= eval_fraction < 1.0:
+        raise ValueError("eval_fraction must be in [0.0, 1.0)")
+
+    num_cases = optimized_cases.optimized_structures.batch_size
+    if num_cases <= 1 or eval_fraction == 0.0:
+        return EvalSplit(train_cases=optimized_cases, eval_cases=None)
+
+    eval_count = int(math.ceil(num_cases * eval_fraction))
+    eval_count = min(max(eval_count, 1), num_cases - 1)
+    split_index = num_cases - eval_count
+    all_indices = torch.arange(
+        num_cases,
+        device=optimized_cases.optimized_structures.positions.device,
+        dtype=torch.long,
+    )
+    train_indices = all_indices[:split_index]
+    eval_indices = all_indices[split_index:]
+    return EvalSplit(
+        train_cases=select_batch(optimized_cases, train_indices),
+        eval_cases=select_batch(optimized_cases, eval_indices),
+    )
+
+
 def iter_supervised_batches(
     optimized_cases: OptimizedCases,
     batch_size: int,
@@ -643,6 +687,98 @@ def _training_losses(
     return total_loss.mean(), metrics, loss_summary
 
 
+def _append_prefixed_history(
+    history: dict[str, list[float]],
+    prefix: str,
+    values: dict[str, float],
+) -> None:
+    for name, value in values.items():
+        history.setdefault(f"{prefix}{name}", []).append(value)
+
+
+def _evaluate_supervised_batches(
+    model: SupervisedRefiner,
+    optimized_cases: OptimizedCases,
+    train_config: SupervisedTrainingConfig,
+    position_mean: torch.Tensor,
+    position_std: torch.Tensor,
+    adjacency_mean: torch.Tensor,
+    adjacency_std: torch.Tensor,
+    step: int,
+    seed: int,
+    use_style: bool,
+) -> EvalRunResult:
+    if optimized_cases.optimized_structures.batch_size == 0:
+        raise ValueError("eval requires at least one case")
+
+    total_losses: dict[str, float] = {}
+    total_metrics: dict[str, float] = {}
+    num_batches = 0
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for batch_index, batch_cases in enumerate(
+                iter_supervised_batches(
+                    optimized_cases,
+                    batch_size=train_config.batch_size,
+                    shuffle=False,
+                )
+            ):
+                batch_cases = batch_cases.to(position_mean.device)
+                batch = make_supervised_batch(
+                    optimized_cases=batch_cases,
+                    position_mean=position_mean,
+                    position_std=position_std,
+                    adjacency_mean=adjacency_mean,
+                    adjacency_std=adjacency_std,
+                    seed=seed + batch_index,
+                )
+                prediction = model.predict_flow(
+                    structures=batch.flow_structures,
+                    target_stiffness=batch.target_stiffness,
+                    current_stiffness=batch.current_analyses.generalized_stiffness,
+                    nodal_displacements=batch.current_analyses.nodal_displacements,
+                    edge_von_mises=batch.current_analyses.edge_von_mises,
+                    flow_times=batch.flow_times,
+                    style_structures=(
+                        batch.oracle_structures if use_style else None
+                    ),
+                    style_analyses=(batch.oracle_analyses if use_style else None),
+                )
+                _, metrics, loss_terms = _training_losses(
+                    prediction,
+                    batch,
+                    train_config,
+                    step=step,
+                )
+                for name, value_tensor in loss_terms.items():
+                    total_losses[name] = total_losses.get(name, 0.0) + float(
+                        value_tensor.detach().item()
+                    )
+                for name, value_tensor in metrics.items():
+                    total_metrics[name] = total_metrics.get(name, 0.0) + float(
+                        value_tensor.detach().item()
+                    )
+                num_batches += 1
+    finally:
+        if was_training:
+            model.train()
+
+    averaged_losses = {
+        name: value / num_batches for name, value in total_losses.items()
+    }
+    averaged_metrics = {
+        name: value / num_batches for name, value in total_metrics.items()
+    }
+    return EvalRunResult(
+        losses=averaged_losses,
+        metrics=averaged_metrics,
+        num_batches=num_batches,
+        num_cases=optimized_cases.optimized_structures.batch_size,
+    )
+
+
 def train_supervised_refiner(
     optimized_cases: OptimizedCases,
     model_config: SupervisedRefinerConfig | None = None,
@@ -660,6 +796,8 @@ def train_supervised_refiner(
 
     if train_config.log_every_steps <= 0:
         raise ValueError("log_every_steps must be positive")
+    if train_config.eval_every_steps <= 0:
+        raise ValueError("eval_every_steps must be positive")
     if train_config.max_grad_norm <= 0.0:
         raise ValueError("max_grad_norm must be positive")
     if train_config.warmup_steps < 0:
@@ -672,14 +810,20 @@ def train_supervised_refiner(
         raise ValueError("style_kl_loss_weight must be non-negative")
     if train_config.style_kl_anneal_steps < 0:
         raise ValueError("style_kl_anneal_steps must be non-negative")
+    if not 0.0 <= train_config.eval_fraction < 1.0:
+        raise ValueError("eval_fraction must be in [0.0, 1.0)")
 
-    dataset_cases = optimized_cases.optimized_structures.batch_size
+    split = split_train_eval_cases(optimized_cases, train_config.eval_fraction)
+    train_cases = split.train_cases
+    eval_cases = split.eval_cases
+    dataset_cases = train_cases.optimized_structures.batch_size
+    eval_case_count = 0 if eval_cases is None else eval_cases.optimized_structures.batch_size
     steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
     global_position_mean, global_position_std = _dataset_position_statistics(
-        optimized_cases
+        train_cases
     )
     global_adjacency_mean, global_adjacency_std = _dataset_adjacency_statistics(
-        optimized_cases
+        train_cases
     )
     model = SupervisedRefiner(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
@@ -699,6 +843,8 @@ def train_supervised_refiner(
     writer = SummaryWriter(log_dir=train_config.logdir)
     print(
         f"training started dataset_cases={dataset_cases} batch_size={train_config.batch_size} "
+        f"eval_cases={eval_case_count} eval_every_steps={train_config.eval_every_steps} "
+        f"eval_fraction={train_config.eval_fraction:.4f} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"use_style_token={'yes' if model.config.use_style_token else 'no'} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
@@ -712,7 +858,7 @@ def train_supervised_refiner(
         examples_seen = 0
         while step < train_config.num_steps:
             for batch_cases in iter_supervised_batches(
-                optimized_cases,
+                train_cases,
                 batch_size=train_config.batch_size,
                 shuffle=True,
                 seed=train_config.seed + step,
@@ -838,6 +984,78 @@ def train_supervised_refiner(
                         f"t_loss_solve={loss_analysis_profile.get('solve', 0.0):.3f}s",
                         flush=True,
                     )
+                should_run_eval = (
+                    eval_cases is not None
+                    and (
+                        (step + 1) % train_config.eval_every_steps == 0
+                        or step == train_config.num_steps - 1
+                    )
+                )
+                if should_run_eval:
+                    eval_seed = train_config.seed + 100_000 + step
+                    eval_runs = {
+                        "no_style": _evaluate_supervised_batches(
+                            model=model,
+                            optimized_cases=eval_cases,
+                            train_config=train_config,
+                            position_mean=global_position_mean.to(device),
+                            position_std=global_position_std.to(device),
+                            adjacency_mean=global_adjacency_mean.to(device),
+                            adjacency_std=global_adjacency_std.to(device),
+                            step=step,
+                            seed=eval_seed,
+                            use_style=False,
+                        )
+                    }
+                    if model.config.use_style_token:
+                        eval_runs["with_style"] = _evaluate_supervised_batches(
+                            model=model,
+                            optimized_cases=eval_cases,
+                            train_config=train_config,
+                            position_mean=global_position_mean.to(device),
+                            position_std=global_position_std.to(device),
+                            adjacency_mean=global_adjacency_mean.to(device),
+                            adjacency_std=global_adjacency_std.to(device),
+                            step=step,
+                            seed=eval_seed,
+                            use_style=True,
+                        )
+                    for mode_name, result in eval_runs.items():
+                        _append_prefixed_history(
+                            history,
+                            prefix=f"eval_{mode_name}_",
+                            values=result.losses,
+                        )
+                        _append_prefixed_history(
+                            history,
+                            prefix=f"eval_{mode_name}_metric_",
+                            values=result.metrics,
+                        )
+                        for name, value in result.losses.items():
+                            writer.add_scalar(
+                                f"eval/{mode_name}/loss/{name}",
+                                value,
+                                step,
+                            )
+                        for name, value in result.metrics.items():
+                            writer.add_scalar(
+                                f"eval/{mode_name}/metrics/{name}",
+                                value,
+                                step,
+                            )
+                    no_style_total = eval_runs["no_style"].losses["total_loss"]
+                    eval_message = (
+                        f"eval step={step + 1}/{train_config.num_steps} "
+                        f"eval_cases={eval_case_count} "
+                        f"loss_total_no_style={no_style_total:.6f}"
+                    )
+                    if "with_style" in eval_runs:
+                        with_style_total = eval_runs["with_style"].losses["total_loss"]
+                        eval_message += (
+                            f" loss_total_with_style={with_style_total:.6f} "
+                            f"delta_with_minus_no={with_style_total - no_style_total:.6f}"
+                        )
+                    print(eval_message, flush=True)
                 step += 1
                 if step >= train_config.num_steps:
                     break

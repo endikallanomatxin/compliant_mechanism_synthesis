@@ -25,6 +25,7 @@ from compliant_mechanism_synthesis.training import (
 from compliant_mechanism_synthesis.training.supervised import (
     _scheduled_learning_rate,
     _style_kl_weight,
+    split_train_eval_cases,
 )
 
 
@@ -109,6 +110,24 @@ def test_style_kl_weight_anneals_to_target() -> None:
     assert weights[4] == pytest.approx(2e-3)
 
 
+def test_split_train_eval_cases_uses_deterministic_tail_subset(tmp_path: Path) -> None:
+    cases = _build_cases(tmp_path)
+
+    split = split_train_eval_cases(cases, eval_fraction=0.26)
+
+    assert split.eval_cases is not None
+    assert split.train_cases.optimized_structures.batch_size == 2
+    assert split.eval_cases.optimized_structures.batch_size == 2
+    assert torch.equal(
+        split.train_cases.target_stiffness,
+        cases.target_stiffness[:2],
+    )
+    assert torch.equal(
+        split.eval_cases.target_stiffness,
+        cases.target_stiffness[2:],
+    )
+
+
 def test_flow_times_cover_unit_interval_without_curriculum(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
     batch = make_supervised_batch(optimized_cases=cases, seed=3)
@@ -134,6 +153,8 @@ def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
             device="cpu",
             batch_size=2,
             num_steps=16,
+            eval_every_steps=4,
+            eval_fraction=0.25,
             learning_rate=5e-4,
             checkpoint_path=str(tmp_path / "refiner.pt"),
             logdir=str(tmp_path / "runs"),
@@ -143,6 +164,8 @@ def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
 
     assert summary.checkpoint_path.exists()
     assert "style_kl_loss_contribution" in summary.history
+    assert "eval_no_style_total_loss" in summary.history
+    assert "eval_with_style_total_loss" in summary.history
     first_window = sum(summary.history["total_loss"][:4]) / 4.0
     best_observed = min(summary.history["total_loss"])
     assert best_observed <= first_window
