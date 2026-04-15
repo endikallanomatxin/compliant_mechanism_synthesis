@@ -40,10 +40,10 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class SupervisedTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 200
+    batch_size: int = 224
     log_every_steps: int = 10
     max_grad_norm: float = 1.0
-    num_steps: int = 150_000  # 15h
+    num_steps: int = 150_000  # 16h
     learning_rate: float = 6e-5
     warmup_steps: int = 500
     min_learning_rate: float = 1e-5
