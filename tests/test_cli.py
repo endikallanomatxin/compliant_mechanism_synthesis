@@ -326,6 +326,48 @@ def test_train_supervised_main_can_disable_style_token(tmp_path: Path) -> None:
     assert checkpoint["train_config"]["use_style_token"] is False
 
 
+def test_train_supervised_main_uses_default_style_token_count(tmp_path: Path) -> None:
+    output_path = tmp_path / "dataset.pt"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_dataset"),
+        ]
+    )
+
+    checkpoint_path = tmp_path / "refiner_style_count.pt"
+    train_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--num-steps",
+            "4",
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--logdir",
+            str(tmp_path / "runs_supervised_style_count"),
+        ]
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    assert checkpoint["model_config"]["style_token_count"] == 2
+    assert checkpoint["train_config"]["style_token_count"] == 2
+
+
 def test_sample_supervised_main_writes_comparison_outputs(tmp_path: Path) -> None:
     output_path = tmp_path / "dataset.pt"
     dataset_generate_main(

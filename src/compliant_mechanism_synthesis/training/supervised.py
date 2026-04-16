@@ -50,6 +50,7 @@ class SupervisedTrainingConfig:
     min_learning_rate: float = 4e-6
     eval_fraction: float = 0.02
     use_style_token: bool = True
+    style_token_count: int = 2
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.5
     stiffness_loss_weight: float = 0.0
@@ -787,7 +788,8 @@ def train_supervised_refiner(
     optimized_cases.validate()
     train_config = train_config or SupervisedTrainingConfig(dataset_path="")
     model_config = model_config or SupervisedRefinerConfig(
-        use_style_token=train_config.use_style_token
+        use_style_token=train_config.use_style_token,
+        style_token_count=train_config.style_token_count,
     )
     device = resolve_torch_device(train_config.device)
 
@@ -810,6 +812,8 @@ def train_supervised_refiner(
         raise ValueError("style_kl_loss_weight must be non-negative")
     if train_config.style_kl_anneal_steps < 0:
         raise ValueError("style_kl_anneal_steps must be non-negative")
+    if train_config.style_token_count <= 0:
+        raise ValueError("style_token_count must be positive")
     if not 0.0 <= train_config.eval_fraction < 1.0:
         raise ValueError("eval_fraction must be in [0.0, 1.0)")
 
@@ -847,6 +851,7 @@ def train_supervised_refiner(
         f"eval_fraction={train_config.eval_fraction:.4f} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"use_style_token={'yes' if model.config.use_style_token else 'no'} "
+        f"style_token_count={model.config.style_token_count} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
         f"min_learning_rate={train_config.min_learning_rate} "
         f"style_kl_loss_weight={train_config.style_kl_loss_weight} "

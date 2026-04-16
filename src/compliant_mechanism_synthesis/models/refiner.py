@@ -79,6 +79,7 @@ class SupervisedRefinerConfig:
     transition_width: float = 0.08
     # Style token
     use_style_token: bool = True
+    style_token_count: int = 2
     style_token_dropout: float = 0.1
     style_token_logvar_min: float = -6.0
     style_token_logvar_max: float = 2.0
@@ -504,6 +505,7 @@ class StyleTokenEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
         )
+        self.style_token_count = config.style_token_count
         self.input_norm = nn.LayerNorm(style_hidden_dim)
         self.layers = nn.ModuleList(
             [
@@ -529,9 +531,13 @@ class StyleTokenEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(config.hidden_dim, config.hidden_dim),
         )
+        self.token_seed = nn.Parameter(
+            torch.zeros(1, config.style_token_count, style_hidden_dim)
+        )
         self.dropout = nn.Dropout(config.style_token_dropout)
         self.logvar_min = config.style_token_logvar_min
         self.logvar_max = config.style_token_logvar_max
+        nn.init.normal_(self.token_seed, mean=0.0, std=0.02)
 
     def forward(
         self,
@@ -590,7 +596,10 @@ class StyleTokenEncoder(nn.Module):
                 edge_head_conditioning=edge_stress_conditioning,
             )
         hidden = self.final_norm(hidden)
-        pooled_hidden = hidden.mean(dim=1, keepdim=True)
+        pooled_hidden = hidden.mean(dim=1, keepdim=True).expand(
+            -1, self.style_token_count, -1
+        )
+        pooled_hidden = pooled_hidden + self.token_seed
         mean = self.dropout(self.token_proj(pooled_hidden))
         logvar = self.token_logvar_proj(pooled_hidden).clamp(
             min=self.logvar_min,
@@ -611,6 +620,8 @@ class SupervisedRefiner(nn.Module):
         self.config = config or SupervisedRefinerConfig()
         if not (0.0 < self.config.pair_edge_logit_eps < 0.5):
             raise ValueError("pair_edge_logit_eps must be in (0, 0.5)")
+        if self.config.style_token_count <= 0:
+            raise ValueError("style_token_count must be positive")
         self.position_mlp = nn.Sequential(
             nn.Linear(3, self.config.hidden_dim),
             nn.GELU(),

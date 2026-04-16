@@ -304,13 +304,46 @@ def test_predict_flow_returns_variational_style_statistics(tmp_path: Path) -> No
     assert prediction.style_mean is not None
     assert prediction.style_logvar is not None
     assert prediction.style_kl is not None
-    assert prediction.style_mean.shape == (cases.optimized_structures.batch_size, 1, 64)
+    assert prediction.style_mean.shape == (cases.optimized_structures.batch_size, 2, 64)
     assert prediction.style_logvar.shape == prediction.style_mean.shape
     assert prediction.style_kl.shape == (cases.optimized_structures.batch_size,)
     assert torch.isfinite(prediction.style_mean).all()
     assert torch.isfinite(prediction.style_logvar).all()
     assert torch.isfinite(prediction.style_kl).all()
     assert (prediction.style_kl >= 0.0).all()
+
+
+def test_predict_flow_uses_configured_style_token_count(tmp_path: Path) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+            style_token_count=3,
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        seed=29,
+    )
+
+    prediction = model.predict_flow(
+        structures=batch.flow_structures,
+        target_stiffness=batch.target_stiffness,
+        current_stiffness=batch.current_analyses.generalized_stiffness,
+        nodal_displacements=batch.current_analyses.nodal_displacements,
+        edge_von_mises=batch.current_analyses.edge_von_mises,
+        flow_times=batch.flow_times,
+        style_structures=batch.oracle_structures,
+        style_analyses=batch.oracle_analyses,
+    )
+
+    assert prediction.style_mean is not None
+    assert prediction.style_logvar is not None
+    assert prediction.style_mean.shape == (cases.optimized_structures.batch_size, 3, 64)
+    assert prediction.style_logvar.shape == prediction.style_mean.shape
 
 
 def test_predict_flow_stabilizes_large_mechanics_inputs(tmp_path: Path) -> None:
