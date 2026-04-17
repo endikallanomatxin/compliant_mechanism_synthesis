@@ -6,6 +6,7 @@ from compliant_mechanism_synthesis.cli import (
     dataset_generate_main,
     sample_supervised_main,
     train_rl_main,
+    train_rl_optimizer_supported_main,
     train_supervised_main,
     upgrade_supervised_checkpoint_main,
     visualize_dataset_main,
@@ -437,6 +438,78 @@ def test_train_rl_main_writes_checkpoint_and_supports_warm_start(
     checkpoint = torch.load(rl_checkpoint_path, map_location="cpu")
     assert rl_checkpoint_path.exists()
     assert checkpoint["train_config"]["gradient_accumulation_steps"] == 2
+    assert checkpoint["train_config"]["init_checkpoint_path"] == str(
+        supervised_checkpoint_path
+    )
+
+
+def test_train_rl_optimizer_supported_main_writes_checkpoint_and_supports_warm_start(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "dataset.pt"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_dataset"),
+        ]
+    )
+
+    supervised_checkpoint_path = tmp_path / "refiner_supervised.pt"
+    train_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--num-steps",
+            "2",
+            "--checkpoint-path",
+            str(supervised_checkpoint_path),
+            "--logdir",
+            str(tmp_path / "runs_supervised"),
+        ]
+    )
+
+    hybrid_checkpoint_path = tmp_path / "refiner_explore_optimize.pt"
+    train_rl_optimizer_supported_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--gradient-accumulation-steps",
+            "1",
+            "--num-steps",
+            "2",
+            "--explore-steps",
+            "2",
+            "--optimize-steps",
+            "2",
+            "--init-checkpoint-path",
+            str(supervised_checkpoint_path),
+            "--checkpoint-path",
+            str(hybrid_checkpoint_path),
+            "--logdir",
+            str(tmp_path / "runs_explore_optimize"),
+        ]
+    )
+
+    checkpoint = torch.load(hybrid_checkpoint_path, map_location="cpu")
+    assert hybrid_checkpoint_path.exists()
     assert checkpoint["train_config"]["init_checkpoint_path"] == str(
         supervised_checkpoint_path
     )
