@@ -35,7 +35,7 @@ def _build_cases(tmp_path: Path):
     return path, load_supervised_cases(str(path))
 
 
-def test_train_explore_optimize_refiner_writes_checkpoint_and_eval_history(
+def test_train_explore_optimize_refiner_writes_checkpoint_and_history(
     tmp_path: Path,
 ) -> None:
     dataset_path, cases = _build_cases(tmp_path)
@@ -65,6 +65,7 @@ def test_train_explore_optimize_refiner_writes_checkpoint_and_eval_history(
     assert summary.checkpoint_path.exists()
     assert "total_loss" in summary.history
     assert "stiffness_loss_contribution" in summary.history
+    assert "stress_loss_contribution" in summary.history
 
 
 def test_train_explore_optimize_refiner_can_initialize_from_supervised_checkpoint(
