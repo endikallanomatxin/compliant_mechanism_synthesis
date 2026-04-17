@@ -14,6 +14,7 @@ from compliant_mechanism_synthesis.dataset.types import (
     OptimizedCases,
     Structures,
 )
+from compliant_mechanism_synthesis.losses import stress_violation_terms
 from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
@@ -80,54 +81,6 @@ class RLTrainingSummary:
 class RolloutOutcome:
     final_structures: Structures
     step_analyses: list[Analyses]
-
-
-def _stress_violation_terms(
-    edge_von_mises: torch.Tensor,
-    adjacency: torch.Tensor,
-    allowable_von_mises: float,
-    stress_activation_threshold: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if allowable_von_mises <= 0.0:
-        raise ValueError("allowable_von_mises must be positive")
-    if not 0.0 <= stress_activation_threshold <= 1.0:
-        raise ValueError("stress_activation_threshold must be in [0.0, 1.0]")
-
-    _, num_nodes, _ = adjacency.shape
-    edge_i, edge_j = torch.triu_indices(
-        num_nodes,
-        num_nodes,
-        offset=1,
-        device=adjacency.device,
-    )
-    edge_activation = adjacency[:, edge_i, edge_j].clamp_min(0.0)
-    activation_weight = (
-        torch.sigmoid((edge_activation - stress_activation_threshold) / 0.05)
-        * edge_activation
-    )
-    safe_activation_weight = activation_weight.sum(dim=-1).clamp_min(1.0)
-    edge_stresses = torch.nan_to_num(
-        edge_von_mises[:, edge_i, edge_j],
-        nan=0.0,
-        posinf=allowable_von_mises * 1e6,
-        neginf=0.0,
-    )
-    edge_rms_stress = torch.sqrt(edge_stresses.square().mean(dim=-1) + 1e-12)
-    stress_ratio = edge_rms_stress / allowable_von_mises
-    stress_excess = torch.relu(stress_ratio - 1.0)
-    stress_violation = torch.log1p(stress_excess.square())
-    mean_stress_violation = (stress_violation * activation_weight).sum(
-        dim=-1
-    ) / safe_activation_weight
-    mean_stress_ratio = (stress_ratio * activation_weight).sum(
-        dim=-1
-    ) / safe_activation_weight
-    max_stress_ratio = torch.where(
-        edge_activation >= stress_activation_threshold,
-        stress_ratio,
-        torch.zeros_like(stress_ratio),
-    ).amax(dim=-1)
-    return mean_stress_violation, mean_stress_ratio, max_stress_ratio
 
 
 def _rollout_refiner_final(
@@ -227,7 +180,7 @@ def _rl_losses(
     free_node_spacing_penalty = final_analyses.free_node_spacing_penalty
     if final_analyses.edge_von_mises is None:
         raise ValueError("final_analyses must provide edge_von_mises")
-    stress_violation, mean_stress_ratio, max_stress_ratio = _stress_violation_terms(
+    stress_violation, mean_stress_ratio, max_stress_ratio = stress_violation_terms(
         edge_von_mises=final_analyses.edge_von_mises,
         adjacency=final_adjacency,
         allowable_von_mises=config.allowable_von_mises,
@@ -585,6 +538,20 @@ def train_rl_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 loss_time = time.perf_counter()
+                if not torch.isfinite(total_loss):
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulation_counter = 0
+                    accumulation_examples = 0
+                    accumulation_learning_rate = 0.0
+                    accumulation_step_start_time = 0.0
+                    accumulation_transfer_time = 0.0
+                    accumulation_batch_time = 0.0
+                    accumulation_rollout_time = 0.0
+                    accumulation_loss_time = 0.0
+                    accumulated_loss_terms = {}
+                    accumulated_metrics = {}
+                    step += 1
+                    continue
                 scaled_total_loss = total_loss * train_config.loss_scale
                 (
                     scaled_total_loss / train_config.gradient_accumulation_steps

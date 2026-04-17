@@ -19,6 +19,7 @@ from compliant_mechanism_synthesis.dataset.types import (
     OptimizedCases,
     Structures,
 )
+from compliant_mechanism_synthesis.losses import stress_violation_terms
 from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
@@ -43,7 +44,7 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class ExploreOptimizeTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 64
+    batch_size: int = 32
     gradient_accumulation_steps: int = 2
     log_every_steps: int = 10
     max_grad_norm: float = 1.0
@@ -87,54 +88,6 @@ class ExploreOptimizeOutcome:
     optimize_analyses: list[Analyses]
 
 
-def _stress_violation_terms(
-    edge_von_mises: torch.Tensor,
-    adjacency: torch.Tensor,
-    allowable_von_mises: float,
-    stress_activation_threshold: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if allowable_von_mises <= 0.0:
-        raise ValueError("allowable_von_mises must be positive")
-    if not 0.0 <= stress_activation_threshold <= 1.0:
-        raise ValueError("stress_activation_threshold must be in [0.0, 1.0]")
-
-    _, num_nodes, _ = adjacency.shape
-    edge_i, edge_j = torch.triu_indices(
-        num_nodes,
-        num_nodes,
-        offset=1,
-        device=adjacency.device,
-    )
-    edge_activation = adjacency[:, edge_i, edge_j].clamp_min(0.0)
-    activation_weight = (
-        torch.sigmoid((edge_activation - stress_activation_threshold) / 0.05)
-        * edge_activation
-    )
-    safe_activation_weight = activation_weight.sum(dim=-1).clamp_min(1.0)
-    edge_stresses = torch.nan_to_num(
-        edge_von_mises[:, edge_i, edge_j],
-        nan=0.0,
-        posinf=allowable_von_mises * 1e6,
-        neginf=0.0,
-    )
-    edge_rms_stress = torch.sqrt(edge_stresses.square().mean(dim=-1) + 1e-12)
-    stress_ratio = edge_rms_stress / allowable_von_mises
-    stress_excess = torch.relu(stress_ratio - 1.0)
-    stress_violation = torch.log1p(stress_excess.square())
-    mean_stress_violation = (stress_violation * activation_weight).sum(
-        dim=-1
-    ) / safe_activation_weight
-    mean_stress_ratio = (stress_ratio * activation_weight).sum(
-        dim=-1
-    ) / safe_activation_weight
-    max_stress_ratio = torch.where(
-        edge_activation >= stress_activation_threshold,
-        stress_ratio,
-        torch.zeros_like(stress_ratio),
-    ).amax(dim=-1)
-    return mean_stress_violation, mean_stress_ratio, max_stress_ratio
-
-
 def _load_initial_model(
     device: torch.device,
     train_config: ExploreOptimizeTrainingConfig,
@@ -173,7 +126,7 @@ def _loss_terms_from_analyses(
     free_node_spacing_penalty = analyses.free_node_spacing_penalty
     if analyses.edge_von_mises is None:
         raise ValueError("analyses must provide edge_von_mises")
-    stress_violation, mean_stress_ratio, max_stress_ratio = _stress_violation_terms(
+    stress_violation, mean_stress_ratio, max_stress_ratio = stress_violation_terms(
         edge_von_mises=analyses.edge_von_mises,
         adjacency=adjacency,
         allowable_von_mises=config.allowable_von_mises,
@@ -239,16 +192,37 @@ def _optimize_stage(
 
     current_structures = structures
     current_analyses = analyze_structures(structures)
+    last_finite_structures = current_structures
+    last_finite_analyses = current_analyses
     with torch.enable_grad():
         for _ in range(config.optimize_steps):
             optimizer.zero_grad()
             positions = structures.positions.clone()
-            clamped_free_positions = free_positions.clamp(0.0, 1.0)
+            clamped_free_positions = torch.nan_to_num(
+                free_positions,
+                nan=0.5,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
             positions[free_mask] = clamped_free_positions[free_mask]
-            adjacency = _build_adjacency(
-                edge_logits=edge_logits,
-                roles=structures.roles,
-                num_nodes=structures.num_nodes,
+            positions = torch.nan_to_num(
+                positions,
+                nan=0.5,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            adjacency = enforce_role_adjacency_constraints(
+                torch.nan_to_num(
+                    _build_adjacency(
+                        edge_logits=edge_logits,
+                        roles=structures.roles,
+                        num_nodes=structures.num_nodes,
+                    ),
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                ).clamp(0.0, 1.0),
+                structures.roles,
             )
             current_structures = Structures(
                 positions=positions,
@@ -262,17 +236,43 @@ def _optimize_stage(
                 target_stiffness=target_stiffness,
                 config=config,
             )
+            if not torch.isfinite(total_loss):
+                optimizer.zero_grad(set_to_none=True)
+                break
             total_loss.backward()
+            local_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    [free_positions, edge_logits], max_norm=config.max_grad_norm
+                ).item()
+            )
+            if not math.isfinite(local_grad_norm):
+                optimizer.zero_grad(set_to_none=True)
+                break
             optimizer.step()
+            last_finite_structures = current_structures
+            last_finite_analyses = current_analyses
 
-    optimized_positions = positions.detach()
-    optimized_adjacency = adjacency.detach()
+    optimized_positions = torch.nan_to_num(
+        last_finite_structures.positions.detach(),
+        nan=0.5,
+        posinf=1.0,
+        neginf=0.0,
+    ).clamp(0.0, 1.0)
+    optimized_adjacency = enforce_role_adjacency_constraints(
+        torch.nan_to_num(
+            last_finite_structures.adjacency.detach(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0),
+        structures.roles,
+    )
     optimized_structures = Structures(
         positions=optimized_positions,
         roles=structures.roles,
         adjacency=optimized_adjacency,
     )
-    optimized_analyses = analyze_structures(optimized_structures)
+    optimized_analyses = last_finite_analyses.to(optimized_positions.device)
     return optimized_structures, optimized_analyses
 
 
@@ -622,6 +622,20 @@ def train_explore_optimize_refiner(
                 ).mean()
                 _synchronize_device_if_needed(device)
                 loss_time = time.perf_counter()
+                if not torch.isfinite(total_loss):
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulation_counter = 0
+                    accumulation_examples = 0
+                    accumulation_learning_rate = 0.0
+                    accumulation_step_start_time = 0.0
+                    accumulation_transfer_time = 0.0
+                    accumulation_batch_time = 0.0
+                    accumulation_rollout_time = 0.0
+                    accumulation_loss_time = 0.0
+                    accumulated_loss_terms = {}
+                    accumulated_metrics = {}
+                    step += 1
+                    continue
                 scaled_total_loss = total_loss * train_config.loss_scale
                 (
                     scaled_total_loss / train_config.gradient_accumulation_steps
