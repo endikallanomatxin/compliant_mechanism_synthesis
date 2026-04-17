@@ -21,11 +21,15 @@ from compliant_mechanism_synthesis.dataset.primitives import (
     PrimitiveConfig,
     materialize_scaffold,
 )
+from compliant_mechanism_synthesis.losses import (
+    psd_penalty,
+    stiffness_interest_loss,
+    stiffness_step_loss,
+)
 from compliant_mechanism_synthesis.mechanics import (
     Frame3DConfig,
     GeometryPenaltyConfig,
     mechanical_terms,
-    normalize_generalized_stiffness,
 )
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.tensor_ops import upper_triangle_edge_index
@@ -115,36 +119,6 @@ def _anchor_attachment_penalty(
     return penalty[0] if squeeze else penalty
 
 
-def _stiffness_step_loss(current: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
-    normalized_current = normalize_generalized_stiffness(current)
-    normalized_previous = normalize_generalized_stiffness(previous)
-    if normalized_previous.ndim == 2:
-        scale = normalized_previous.abs().amax().clamp_min(1e-3)
-        return ((normalized_current - normalized_previous) / scale).square().mean()
-    scale = normalized_previous.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1e-3)
-    return (
-        ((normalized_current - normalized_previous) / scale).square().mean(dim=(-2, -1))
-    )
-
-
-def _psd_penalty(matrix: torch.Tensor) -> torch.Tensor:
-    eigenvalues = torch.linalg.eigvalsh(normalize_generalized_stiffness(matrix))
-    if eigenvalues.ndim == 1:
-        return (-eigenvalues).clamp_min(0.0).square().mean()
-    return (-eigenvalues).clamp_min(0.0).square().mean(dim=-1)
-
-
-def _stiffness_interest_loss(matrix: torch.Tensor) -> torch.Tensor:
-    normalized = normalize_generalized_stiffness(matrix)
-    eigenvalues = torch.linalg.eigvalsh(normalized)
-    if eigenvalues.ndim == 1:
-        return normalized.new_zeros((1,))
-    if eigenvalues.shape[0] <= 1:
-        return normalized.new_zeros((eigenvalues.shape[0],))
-    batch_mean = eigenvalues.mean(dim=0, keepdim=True)
-    return -(eigenvalues - batch_mean).square().mean(dim=-1)
-
-
 def _loss_breakdown(
     structures: Structures,
     previous_stiffness: torch.Tensor,
@@ -163,9 +137,9 @@ def _loss_breakdown(
     sparsity = structures.adjacency.mean(dim=(-2, -1))
     breakdown = {
         "stiffness_loss": weights.stiffness
-        * _stiffness_step_loss(generalized_stiffness, previous_stiffness),
+        * stiffness_step_loss(generalized_stiffness, previous_stiffness),
         "stiffness_interest_loss": weights.stiffness_interest
-        * _stiffness_interest_loss(generalized_stiffness),
+        * stiffness_interest_loss(generalized_stiffness),
         "material_loss": weights.material * terms["material_usage"],
         "sparsity_loss": weights.sparsity * sparsity,
         "short_beam_loss": weights.short_beam * terms["short_beam_penalty"],
@@ -177,7 +151,7 @@ def _loss_breakdown(
         * _domain_penalty(structures.positions, structures.roles),
         "anchor_attachment_loss": weights.anchor_attachment
         * _anchor_attachment_penalty(structures.adjacency, structures.roles),
-        "psd_loss": weights.psd * _psd_penalty(generalized_stiffness),
+        "psd_loss": weights.psd * psd_penalty(generalized_stiffness),
     }
     breakdown["total_loss_per_case"] = torch.stack(tuple(breakdown.values())).sum(dim=0)
     breakdown["total_loss"] = breakdown["total_loss_per_case"].mean()

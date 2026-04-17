@@ -47,14 +47,14 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class ExploreOptimizeTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 32
-    gradient_accumulation_steps: int = 2
+    batch_size: int = 64
+    gradient_accumulation_steps: int = 4
     log_every_steps: int = 10
     max_grad_norm: float = 1.0
     num_steps: int = 50_000
-    explore_steps: int = 4
-    optimize_steps: int = 4
-    optimize_learning_rate: float = 5e-4
+    explore_steps: int = 2
+    optimize_steps: int = 3
+    optimize_learning_rate: float = 1e-4
     learning_rate: float = 1e-5
     warmup_steps: int = 500
     min_learning_rate: float = 1e-6
