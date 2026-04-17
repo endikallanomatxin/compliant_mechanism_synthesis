@@ -49,6 +49,7 @@ class RLTrainingConfig:
     use_style_token: bool = True
     style_token_count: int = 1
     stiffness_loss_weight: float = 1.0
+    rollout_monotonicity_loss_weight: float = 0.01
     material_loss_weight: float = 0.05
     short_beam_penalty_weight: float = 0.1
     long_beam_penalty_weight: float = 0.1
@@ -67,12 +68,18 @@ class RLTrainingSummary:
     checkpoint_path: Path
 
 
+@dataclass(frozen=True)
+class RolloutOutcome:
+    final_structures: Structures
+    step_analyses: list[Analyses]
+
+
 def _rollout_refiner_final(
     model: SupervisedRefiner,
     source_structures: Structures,
     target_stiffness: torch.Tensor,
     num_steps: int,
-) -> Structures:
+) -> RolloutOutcome:
     source_structures.validate()
     if target_stiffness.shape != (source_structures.batch_size, 6, 6):
         raise ValueError("target_stiffness must have shape [batch, 6, 6]")
@@ -82,8 +89,10 @@ def _rollout_refiner_final(
     current = source_structures
     _, _, free_mask = role_masks(current.roles)
     free_mask = free_mask.unsqueeze(-1).to(dtype=current.positions.dtype)
+    step_analyses: list[Analyses] = []
     for step in range(num_steps):
         analyses = analyze_structures(current)
+        step_analyses.append(analyses)
         if analyses.nodal_displacements is None:
             raise ValueError("analyze_structures must provide nodal_displacements")
         if analyses.edge_von_mises is None:
@@ -136,13 +145,16 @@ def _rollout_refiner_final(
             adjacency=adjacency,
         )
     current.validate()
-    return current
+    final_analyses = analyze_structures(current)
+    step_analyses.append(final_analyses)
+    return RolloutOutcome(final_structures=current, step_analyses=step_analyses)
 
 
 def _rl_losses(
     final_analyses: Analyses,
     target_stiffness: torch.Tensor,
     config: RLTrainingConfig,
+    step_analyses: list[Analyses] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     stiffness_error = torch.log1p(
         generalized_stiffness_error(
@@ -156,9 +168,28 @@ def _rl_losses(
     thin_beam_penalty = final_analyses.thin_beam_penalty
     thick_beam_penalty = final_analyses.thick_beam_penalty
     free_node_spacing_penalty = final_analyses.free_node_spacing_penalty
+    if step_analyses is None or len(step_analyses) < 2:
+        rollout_monotonicity = stiffness_error.new_zeros(stiffness_error.shape)
+    else:
+        per_step_stiffness_losses = [
+            generalized_stiffness_error(analysis.generalized_stiffness, target_stiffness)
+            for analysis in step_analyses
+        ]
+        per_step_stiffness_losses = [torch.log1p(loss) for loss in per_step_stiffness_losses]
+        monotonicity_terms = [
+            torch.relu(current - previous)
+            for previous, current in zip(
+                per_step_stiffness_losses[:-1],
+                per_step_stiffness_losses[1:],
+                strict=False,
+            )
+        ]
+        rollout_monotonicity = torch.stack(monotonicity_terms, dim=0).mean(dim=0)
 
     loss_contributions = {
         "stiffness_loss_contribution": config.stiffness_loss_weight * stiffness_error,
+        "rollout_monotonicity_loss_contribution": config.rollout_monotonicity_loss_weight
+        * rollout_monotonicity,
         "material_loss_contribution": config.material_loss_weight * material_usage,
         "short_beam_loss_contribution": config.short_beam_penalty_weight
         * short_beam_penalty,
@@ -175,6 +206,7 @@ def _rl_losses(
     metrics = {
         "stiffness_error": stiffness_error.mean(),
         "material_usage": material_usage.mean(),
+        "rollout_monotonicity": rollout_monotonicity.mean(),
         "short_beam_penalty": short_beam_penalty.mean(),
         "long_beam_penalty": long_beam_penalty.mean(),
         "thin_beam_penalty": thin_beam_penalty.mean(),
@@ -226,11 +258,12 @@ def _evaluate_rl_batches(
                     target_stiffness=batch_cases.target_stiffness,
                     num_steps=train_config.rollout_steps,
                 )
-                final_analyses = analyze_structures(final_structures)
+                final_analyses = final_structures.step_analyses[-1]
                 _, metrics, loss_terms = _rl_losses(
                     final_analyses=final_analyses,
                     target_stiffness=batch_cases.target_stiffness,
                     config=train_config,
+                    step_analyses=final_structures.step_analyses,
                 )
                 for name, value_tensor in loss_terms.items():
                     total_losses[name] = total_losses.get(name, 0.0) + float(
@@ -294,6 +327,8 @@ def train_rl_refiner(
         raise ValueError("max_grad_norm must be positive")
     if train_config.rollout_steps <= 0:
         raise ValueError("rollout_steps must be positive")
+    if train_config.rollout_monotonicity_loss_weight < 0.0:
+        raise ValueError("rollout_monotonicity_loss_weight must be non-negative")
     if train_config.material_loss_weight < 0.0:
         raise ValueError("material_loss_weight must be non-negative")
     if train_config.short_beam_penalty_weight < 0.0:
@@ -328,6 +363,7 @@ def train_rl_refiner(
     history = {
         "total_loss": [],
         "stiffness_loss_contribution": [],
+        "rollout_monotonicity_loss_contribution": [],
         "material_loss_contribution": [],
         "short_beam_loss_contribution": [],
         "long_beam_loss_contribution": [],
@@ -352,7 +388,8 @@ def train_rl_refiner(
         f"use_style_token={'yes' if effective_model_config.use_style_token else 'no'} "
         f"style_token_count={effective_model_config.style_token_count} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
-        f"min_learning_rate={train_config.min_learning_rate}",
+        f"min_learning_rate={train_config.min_learning_rate} "
+        f"rollout_monotonicity_loss_weight={train_config.rollout_monotonicity_loss_weight}",
         flush=True,
     )
     try:
@@ -543,7 +580,7 @@ def train_rl_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 batch_build_time = time.perf_counter()
-                final_structures = _rollout_refiner_final(
+                rollout_outcome = _rollout_refiner_final(
                     model=model,
                     source_structures=source_structures,
                     target_stiffness=batch_cases.target_stiffness,
@@ -551,11 +588,13 @@ def train_rl_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 forward_time = time.perf_counter()
-                final_analyses = analyze_structures(final_structures)
+                final_structures = rollout_outcome.final_structures
+                final_analyses = rollout_outcome.step_analyses[-1]
                 total_loss, metrics, loss_terms = _rl_losses(
                     final_analyses=final_analyses,
                     target_stiffness=batch_cases.target_stiffness,
                     config=train_config,
+                    step_analyses=rollout_outcome.step_analyses,
                 )
                 _synchronize_device_if_needed(device)
                 loss_time = time.perf_counter()

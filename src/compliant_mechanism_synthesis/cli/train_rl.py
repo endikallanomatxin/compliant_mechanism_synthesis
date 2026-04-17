@@ -34,6 +34,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-learning-rate", type=float, default=defaults.min_learning_rate
     )
+    parser.add_argument(
+        "--rollout-monotonicity-loss-weight",
+        type=float,
+        default=defaults.rollout_monotonicity_loss_weight,
+    )
     parser.add_argument("--eval-fraction", type=float, default=defaults.eval_fraction)
     parser.add_argument(
         "--init-checkpoint-path", default=defaults.init_checkpoint_path
@@ -61,6 +66,7 @@ def train_rl_main(argv: list[str] | None = None) -> None:
             learning_rate=args.learning_rate,
             warmup_steps=args.warmup_steps,
             min_learning_rate=args.min_learning_rate,
+            rollout_monotonicity_loss_weight=args.rollout_monotonicity_loss_weight,
             eval_fraction=args.eval_fraction,
             init_checkpoint_path=args.init_checkpoint_path,
             checkpoint_path=args.checkpoint_path,
