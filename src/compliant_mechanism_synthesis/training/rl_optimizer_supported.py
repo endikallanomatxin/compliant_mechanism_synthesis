@@ -61,7 +61,6 @@ class ExploreOptimizeTrainingConfig:
     stress_loss_weight: float = 0.02
     allowable_von_mises: float = 250e6
     stress_activation_threshold: float = 0.15
-    stress_ratio_soft_cap: float = 10.0
     material_loss_weight: float = 250.0
     short_beam_penalty_weight: float = 5.0
     long_beam_penalty_weight: float = 5.0
@@ -93,14 +92,11 @@ def _stress_violation_terms(
     adjacency: torch.Tensor,
     allowable_von_mises: float,
     stress_activation_threshold: float,
-    stress_ratio_soft_cap: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if allowable_von_mises <= 0.0:
         raise ValueError("allowable_von_mises must be positive")
     if not 0.0 <= stress_activation_threshold <= 1.0:
         raise ValueError("stress_activation_threshold must be in [0.0, 1.0]")
-    if stress_ratio_soft_cap <= 1.0:
-        raise ValueError("stress_ratio_soft_cap must be greater than 1.0")
 
     _, num_nodes, _ = adjacency.shape
     edge_i, edge_j = torch.triu_indices(
@@ -110,35 +106,33 @@ def _stress_violation_terms(
         device=adjacency.device,
     )
     edge_activation = adjacency[:, edge_i, edge_j].clamp_min(0.0)
-    active_mask = edge_activation >= stress_activation_threshold
-    active_weight = torch.where(
-        active_mask, edge_activation, torch.zeros_like(edge_activation)
+    activation_weight = (
+        torch.sigmoid((edge_activation - stress_activation_threshold) / 0.05)
+        * edge_activation
     )
-    safe_active_weight = active_weight.sum(dim=-1).clamp_min(1e-6)
-    edge_peak_stress = torch.nan_to_num(
+    safe_activation_weight = activation_weight.sum(dim=-1).clamp_min(1.0)
+    edge_stresses = torch.nan_to_num(
         edge_von_mises[:, edge_i, edge_j],
         nan=0.0,
         posinf=allowable_von_mises * 1e6,
         neginf=0.0,
-    ).amax(dim=-1)
-    stress_ratio = edge_peak_stress / allowable_von_mises
-    capped_stress_excess = torch.relu(stress_ratio - 1.0).clamp_max(
-        stress_ratio_soft_cap - 1.0
     )
-    stress_violation = torch.where(
-        active_mask,
-        torch.log1p(capped_stress_excess),
-        torch.zeros_like(stress_ratio),
-    )
-    mean_stress_violation = (stress_violation * active_weight).sum(
+    edge_rms_stress = torch.sqrt(edge_stresses.square().mean(dim=-1) + 1e-12)
+    stress_ratio = edge_rms_stress / allowable_von_mises
+    stress_excess = torch.relu(stress_ratio - 1.0)
+    stress_violation = torch.log1p(stress_excess.square())
+    mean_stress_violation = (stress_violation * activation_weight).sum(
         dim=-1
-    ) / safe_active_weight
+    ) / safe_activation_weight
+    mean_stress_ratio = (stress_ratio * activation_weight).sum(
+        dim=-1
+    ) / safe_activation_weight
     max_stress_ratio = torch.where(
-        active_mask,
+        edge_activation >= stress_activation_threshold,
         stress_ratio,
         torch.zeros_like(stress_ratio),
     ).amax(dim=-1)
-    return mean_stress_violation, max_stress_ratio
+    return mean_stress_violation, mean_stress_ratio, max_stress_ratio
 
 
 def _load_initial_model(
@@ -179,12 +173,11 @@ def _loss_terms_from_analyses(
     free_node_spacing_penalty = analyses.free_node_spacing_penalty
     if analyses.edge_von_mises is None:
         raise ValueError("analyses must provide edge_von_mises")
-    stress_violation, max_stress_ratio = _stress_violation_terms(
+    stress_violation, mean_stress_ratio, max_stress_ratio = _stress_violation_terms(
         edge_von_mises=analyses.edge_von_mises,
         adjacency=adjacency,
         allowable_von_mises=config.allowable_von_mises,
         stress_activation_threshold=config.stress_activation_threshold,
-        stress_ratio_soft_cap=config.stress_ratio_soft_cap,
     )
 
     loss_contributions = {
@@ -206,6 +199,7 @@ def _loss_terms_from_analyses(
     metrics = {
         "stiffness_error": stiffness_error.mean(),
         "stress_violation": stress_violation.mean(),
+        "mean_stress_ratio": mean_stress_ratio.mean(),
         "max_stress_ratio": max_stress_ratio.mean(),
         "material_usage": material_usage.mean(),
         "short_beam_penalty": short_beam_penalty.mean(),
@@ -402,8 +396,6 @@ def train_explore_optimize_refiner(
         raise ValueError("allowable_von_mises must be positive")
     if not 0.0 <= train_config.stress_activation_threshold <= 1.0:
         raise ValueError("stress_activation_threshold must be in [0.0, 1.0]")
-    if train_config.stress_ratio_soft_cap <= 1.0:
-        raise ValueError("stress_ratio_soft_cap must be greater than 1.0")
 
     train_cases = optimized_cases
     dataset_cases = train_cases.optimized_structures.batch_size
@@ -452,8 +444,7 @@ def train_explore_optimize_refiner(
         f"stiffness_loss_weight={train_config.stiffness_loss_weight} "
         f"stress_loss_weight={train_config.stress_loss_weight} "
         f"allowable_von_mises={train_config.allowable_von_mises:.3e} "
-        f"stress_activation_threshold={train_config.stress_activation_threshold:.3f} "
-        f"stress_ratio_soft_cap={train_config.stress_ratio_soft_cap:.3f}",
+        f"stress_activation_threshold={train_config.stress_activation_threshold:.3f}",
         flush=True,
     )
     try:
