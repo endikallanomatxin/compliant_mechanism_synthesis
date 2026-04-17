@@ -1,5 +1,11 @@
 """Supervised and online training stages built on top of the offline dataset."""
 
+from compliant_mechanism_synthesis.training.rl import (
+    RLTrainingConfig,
+    RLTrainingSummary,
+    run_rl_training,
+    train_rl_refiner,
+)
 from compliant_mechanism_synthesis.training.supervised import (
     SupervisedBatch,
     SupervisedTrainingSummary,
@@ -18,6 +24,8 @@ from compliant_mechanism_synthesis.training.supervised import (
 )
 
 __all__ = [
+    "RLTrainingConfig",
+    "RLTrainingSummary",
     "SupervisedBatch",
     "SupervisedTrainingSummary",
     "SupervisedTrainingConfig",
@@ -28,8 +36,10 @@ __all__ = [
     "load_supervised_cases",
     "make_supervised_batch",
     "match_oracle_to_source",
+    "run_rl_training",
     "run_supervised_training",
     "sample_noisy_structures",
     "select_batch",
+    "train_rl_refiner",
     "train_supervised_refiner",
 ]
