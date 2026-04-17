@@ -35,16 +35,16 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class RLTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 40
+    batch_size: int = 88
     gradient_accumulation_steps: int = 4
     log_every_steps: int = 10
     eval_every_steps: int = 100
     max_grad_norm: float = 1.0
     num_steps: int = 50_000
     rollout_steps: int = 4
-    learning_rate: float = 8e-6
+    learning_rate: float = 2e-6
     warmup_steps: int = 500
-    min_learning_rate: float = 1e-6
+    min_learning_rate: float = 2e-7
     eval_fraction: float = 0.02
     use_style_token: bool = True
     style_token_count: int = 1
