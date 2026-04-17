@@ -441,22 +441,31 @@ def _edge_von_mises_matrix(
         * radius.unsqueeze(-1)
         / polar_inertia.unsqueeze(-1)
     )
+    sqrt_eps = 1e-12
     bending_a = (
         radius.unsqueeze(-1)
         * torch.sqrt(
-            local_forces[..., 4, :].square() + local_forces[..., 5, :].square()
+            local_forces[..., 4, :].square()
+            + local_forces[..., 5, :].square()
+            + sqrt_eps
         )
         / bending_inertia.unsqueeze(-1)
     )
     bending_b = (
         radius.unsqueeze(-1)
         * torch.sqrt(
-            local_forces[..., 10, :].square() + local_forces[..., 11, :].square()
+            local_forces[..., 10, :].square()
+            + local_forces[..., 11, :].square()
+            + sqrt_eps
         )
         / bending_inertia.unsqueeze(-1)
     )
-    von_mises_a = torch.sqrt((axial_a + bending_a).square() + 3.0 * torsion_a.square())
-    von_mises_b = torch.sqrt((axial_b + bending_b).square() + 3.0 * torsion_b.square())
+    von_mises_a = torch.sqrt(
+        (axial_a + bending_a).square() + 3.0 * torsion_a.square() + sqrt_eps
+    )
+    von_mises_b = torch.sqrt(
+        (axial_b + bending_b).square() + 3.0 * torsion_b.square() + sqrt_eps
+    )
     edge_von_mises = torch.maximum(von_mises_a, von_mises_b)
 
     edge_matrix = torch.zeros(

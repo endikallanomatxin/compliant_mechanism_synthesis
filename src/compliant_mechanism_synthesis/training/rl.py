@@ -41,7 +41,7 @@ class RLTrainingConfig:
     eval_every_steps: int = 100
     max_grad_norm: float = 1.0
     num_steps: int = 50_000
-    rollout_steps: int = 8
+    rollout_steps: int = 4
     learning_rate: float = 2e-5
     warmup_steps: int = 500
     min_learning_rate: float = 2e-6
