@@ -304,7 +304,7 @@ def test_predict_flow_returns_variational_style_statistics(tmp_path: Path) -> No
     assert prediction.style_mean is not None
     assert prediction.style_logvar is not None
     assert prediction.style_kl is not None
-    assert prediction.style_mean.shape == (cases.optimized_structures.batch_size, 2, 64)
+    assert prediction.style_mean.shape == (cases.optimized_structures.batch_size, 1, 64)
     assert prediction.style_logvar.shape == prediction.style_mean.shape
     assert prediction.style_kl.shape == (cases.optimized_structures.batch_size,)
     assert torch.isfinite(prediction.style_mean).all()

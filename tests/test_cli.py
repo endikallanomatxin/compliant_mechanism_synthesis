@@ -364,8 +364,8 @@ def test_train_supervised_main_uses_default_style_token_count(tmp_path: Path) ->
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    assert checkpoint["model_config"]["style_token_count"] == 2
-    assert checkpoint["train_config"]["style_token_count"] == 2
+    assert checkpoint["model_config"]["style_token_count"] == 1
+    assert checkpoint["train_config"]["style_token_count"] == 1
 
 
 def test_sample_supervised_main_writes_comparison_outputs(tmp_path: Path) -> None:

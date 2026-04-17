@@ -50,7 +50,7 @@ class SupervisedTrainingConfig:
     min_learning_rate: float = 4e-6
     eval_fraction: float = 0.02
     use_style_token: bool = True
-    style_token_count: int = 2
+    style_token_count: int = 1
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.5
     stiffness_loss_weight: float = 0.0

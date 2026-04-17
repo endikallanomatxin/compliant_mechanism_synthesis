@@ -79,7 +79,7 @@ class SupervisedRefinerConfig:
     transition_width: float = 0.08
     # Style token
     use_style_token: bool = True
-    style_token_count: int = 2
+    style_token_count: int = 1
     style_token_dropout: float = 0.1
     style_token_logvar_min: float = -6.0
     style_token_logvar_max: float = 2.0
