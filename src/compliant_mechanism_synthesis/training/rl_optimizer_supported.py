@@ -14,8 +14,15 @@ from compliant_mechanism_synthesis.dataset.optimization import (
     _build_adjacency,
     _logits_from_adjacency,
 )
-from compliant_mechanism_synthesis.dataset.types import Analyses, OptimizedCases, Structures
-from compliant_mechanism_synthesis.models import SupervisedRefiner, SupervisedRefinerConfig
+from compliant_mechanism_synthesis.dataset.types import (
+    Analyses,
+    OptimizedCases,
+    Structures,
+)
+from compliant_mechanism_synthesis.models import (
+    SupervisedRefiner,
+    SupervisedRefinerConfig,
+)
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.tensor_ops import enforce_role_adjacency_constraints
 from compliant_mechanism_synthesis.training.supervised import (
@@ -27,7 +34,6 @@ from compliant_mechanism_synthesis.training.supervised import (
     iter_supervised_batches,
     load_supervised_cases,
     sample_noisy_structures,
-    split_train_eval_cases,
 )
 from compliant_mechanism_synthesis.training.supervised import analyze_structures
 from compliant_mechanism_synthesis.utils import resolve_torch_device
@@ -40,7 +46,6 @@ class ExploreOptimizeTrainingConfig:
     batch_size: int = 64
     gradient_accumulation_steps: int = 2
     log_every_steps: int = 10
-    eval_every_steps: int = 100
     max_grad_norm: float = 1.0
     num_steps: int = 50_000
     explore_steps: int = 4
@@ -49,7 +54,6 @@ class ExploreOptimizeTrainingConfig:
     learning_rate: float = 2e-6
     warmup_steps: int = 500
     min_learning_rate: float = 2e-7
-    eval_fraction: float = 0.02
     use_style_token: bool = True
     style_token_count: int = 1
     stiffness_loss_weight: float = 1.0
@@ -160,7 +164,9 @@ def _optimize_stage(
         device=structures.positions.device,
     )
     active_upper = _allowed_edge_mask(structures.roles[0])[edge_i, edge_j]
-    initial_edge_values = structures.adjacency[:, edge_i[active_upper], edge_j[active_upper]]
+    initial_edge_values = structures.adjacency[
+        :, edge_i[active_upper], edge_j[active_upper]
+    ]
     edge_logits = torch.nn.Parameter(_logits_from_adjacency(initial_edge_values))
     optimizer = torch.optim.Adam(
         [free_positions, edge_logits], lr=config.optimize_learning_rate
@@ -209,7 +215,8 @@ def _straight_through_structures(
     optimized: Structures,
 ) -> Structures:
     return Structures(
-        positions=explored.positions + (optimized.positions - explored.positions).detach(),
+        positions=explored.positions
+        + (optimized.positions - explored.positions).detach(),
         roles=explored.roles,
         adjacency=explored.adjacency
         + (optimized.adjacency - explored.adjacency).detach(),
@@ -256,7 +263,8 @@ def _explore_optimize_rollout(
         step_size = 1.0 / config.explore_steps
         explored = Structures(
             positions=torch.nan_to_num(
-                current.positions + step_size * prediction.position_velocity * free_mask,
+                current.positions
+                + step_size * prediction.position_velocity * free_mask,
                 nan=0.0,
                 posinf=1.0,
                 neginf=0.0,
@@ -288,92 +296,6 @@ def _explore_optimize_rollout(
     )
 
 
-def _evaluate_batches(
-    model: SupervisedRefiner,
-    optimized_cases: OptimizedCases,
-    train_config: ExploreOptimizeTrainingConfig,
-    position_mean: torch.Tensor,
-    position_std: torch.Tensor,
-    adjacency_mean: torch.Tensor,
-    adjacency_std: torch.Tensor,
-    seed: int,
-) -> tuple[dict[str, float], dict[str, float]]:
-    total_losses: dict[str, float] = {}
-    total_metrics: dict[str, float] = {}
-    num_batches = 0
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            for batch_index, batch_cases in enumerate(
-                iter_supervised_batches(
-                    optimized_cases,
-                    batch_size=train_config.batch_size,
-                    shuffle=False,
-                )
-            ):
-                batch_cases = batch_cases.to(position_mean.device)
-                source_structures = sample_noisy_structures(
-                    optimized_cases=batch_cases,
-                    position_mean=position_mean,
-                    position_std=position_std,
-                    adjacency_mean=adjacency_mean,
-                    adjacency_std=adjacency_std,
-                    seed=seed + batch_index,
-                )
-                outcome = _explore_optimize_rollout(
-                    model=model,
-                    source_structures=source_structures,
-                    target_stiffness=batch_cases.target_stiffness,
-                    config=train_config,
-                )
-                _, metrics, loss_terms = _loss_terms_from_analyses(
-                    outcome.final_analyses,
-                    target_stiffness=batch_cases.target_stiffness,
-                    config=train_config,
-                )
-                for name, value_tensor in loss_terms.items():
-                    total_losses[name] = total_losses.get(name, 0.0) + float(
-                        value_tensor.detach().item()
-                    )
-                for name, value_tensor in metrics.items():
-                    total_metrics[name] = total_metrics.get(name, 0.0) + float(
-                        value_tensor.detach().item()
-                    )
-                total_metrics["explore_stiffness_error"] = total_metrics.get(
-                    "explore_stiffness_error", 0.0
-                ) + float(
-                    torch.log1p(
-                        generalized_stiffness_error(
-                            outcome.explore_analyses[-1].generalized_stiffness,
-                            batch_cases.target_stiffness,
-                        )
-                    )
-                    .mean()
-                    .item()
-                )
-                total_metrics["optimize_stiffness_error"] = total_metrics.get(
-                    "optimize_stiffness_error", 0.0
-                ) + float(
-                    torch.log1p(
-                        generalized_stiffness_error(
-                            outcome.optimize_analyses[-1].generalized_stiffness,
-                            batch_cases.target_stiffness,
-                        )
-                    )
-                    .mean()
-                    .item()
-                )
-                num_batches += 1
-    finally:
-        if was_training:
-            model.train()
-    return (
-        {name: value / num_batches for name, value in total_losses.items()},
-        {name: value / num_batches for name, value in total_metrics.items()},
-    )
-
-
 def train_explore_optimize_refiner(
     optimized_cases: OptimizedCases,
     model_config: SupervisedRefinerConfig | None = None,
@@ -390,8 +312,6 @@ def train_explore_optimize_refiner(
         raise ValueError("gradient_accumulation_steps must be positive")
     if train_config.log_every_steps <= 0:
         raise ValueError("log_every_steps must be positive")
-    if train_config.eval_every_steps <= 0:
-        raise ValueError("eval_every_steps must be positive")
     if train_config.max_grad_norm <= 0.0:
         raise ValueError("max_grad_norm must be positive")
     if train_config.explore_steps <= 0:
@@ -402,18 +322,19 @@ def train_explore_optimize_refiner(
         raise ValueError("optimize_learning_rate must be positive")
     if train_config.style_token_count <= 0:
         raise ValueError("style_token_count must be positive")
-    if not 0.0 <= train_config.eval_fraction < 1.0:
-        raise ValueError("eval_fraction must be in [0.0, 1.0)")
 
-    split = split_train_eval_cases(optimized_cases, train_config.eval_fraction)
-    train_cases = split.train_cases
-    eval_cases = split.eval_cases
+    train_cases = optimized_cases
     dataset_cases = train_cases.optimized_structures.batch_size
-    eval_case_count = 0 if eval_cases is None else eval_cases.optimized_structures.batch_size
     steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
-    global_position_mean, global_position_std = _dataset_position_statistics(train_cases)
-    global_adjacency_mean, global_adjacency_std = _dataset_adjacency_statistics(train_cases)
-    model, effective_model_config = _load_initial_model(device, train_config, model_config)
+    global_position_mean, global_position_std = _dataset_position_statistics(
+        train_cases
+    )
+    global_adjacency_mean, global_adjacency_std = _dataset_adjacency_statistics(
+        train_cases
+    )
+    model, effective_model_config = _load_initial_model(
+        device, train_config, model_config
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
     history = {
         "total_loss": [],
@@ -436,8 +357,7 @@ def train_explore_optimize_refiner(
         f"explore-optimize training started dataset_cases={dataset_cases} "
         f"batch_size={train_config.batch_size} "
         f"effective_batch_size={train_config.batch_size * train_config.gradient_accumulation_steps} "
-        f"eval_cases={eval_case_count} eval_every_steps={train_config.eval_every_steps} "
-        f"eval_fraction={train_config.eval_fraction:.4f} explore_steps={train_config.explore_steps} "
+        f"explore_steps={train_config.explore_steps} "
         f"optimize_steps={train_config.optimize_steps} optimize_learning_rate={train_config.optimize_learning_rate} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"init_checkpoint={train_config.init_checkpoint_path or 'none'} "
@@ -478,7 +398,9 @@ def train_explore_optimize_refiner(
             skipped_update = not math.isfinite(raw_grad_norm)
             grad_norm = 0.0 if skipped_update else raw_grad_norm
             clipped = (grad_norm > train_config.max_grad_norm) and not skipped_update
-            clip_ratio = 0.0 if skipped_update else grad_norm / train_config.max_grad_norm
+            clip_ratio = (
+                0.0 if skipped_update else grad_norm / train_config.max_grad_norm
+            )
             if skipped_update:
                 optimizer.zero_grad(set_to_none=True)
             else:
@@ -499,7 +421,9 @@ def train_explore_optimize_refiner(
                 writer.add_scalar(f"train/loss/{name}", value, step)
             for name, value in averaged_metrics.items():
                 writer.add_scalar(f"train/metrics/{name}", value, step)
-            writer.add_scalar("train/parameters/learning_rate", accumulation_learning_rate, step)
+            writer.add_scalar(
+                "train/parameters/learning_rate", accumulation_learning_rate, step
+            )
             writer.add_scalar(
                 "train/parameters/effective_batch_size",
                 train_config.batch_size * accumulation_counter,
@@ -508,9 +432,14 @@ def train_explore_optimize_refiner(
             writer.add_scalar("train/gradients/grad_norm", grad_norm, step)
             writer.add_scalar("train/gradients/clip_ratio", clip_ratio, step)
             writer.add_scalar("train/gradients/clipped", float(clipped), step)
-            writer.add_scalar("train/gradients/skipped_update", float(skipped_update), step)
+            writer.add_scalar(
+                "train/gradients/skipped_update", float(skipped_update), step
+            )
             examples_seen += accumulation_examples
-            if step % train_config.log_every_steps == 0 or step == train_config.num_steps - 1:
+            if (
+                step % train_config.log_every_steps == 0
+                or step == train_config.num_steps - 1
+            ):
                 optimizer_duration = max(
                     0.0,
                     optimizer_time
@@ -544,40 +473,6 @@ def train_explore_optimize_refiner(
                     f"t_total={optimizer_time - accumulation_step_start_time:.3f}s",
                     flush=True,
                 )
-            should_run_eval = (
-                eval_cases is not None
-                and (
-                    (step + 1) % train_config.eval_every_steps == 0
-                    or step == train_config.num_steps - 1
-                )
-            )
-            if should_run_eval:
-                eval_losses, eval_metrics = _evaluate_batches(
-                    model=model,
-                    optimized_cases=eval_cases,
-                    train_config=train_config,
-                    position_mean=global_position_mean.to(device),
-                    position_std=global_position_std.to(device),
-                    adjacency_mean=global_adjacency_mean.to(device),
-                    adjacency_std=global_adjacency_std.to(device),
-                    seed=train_config.seed + 100_000 + step,
-                )
-                for name, value in eval_losses.items():
-                    history.setdefault(f"eval_{name}", []).append(value)
-                    writer.add_scalar(f"eval/loss/{name}", value, step)
-                for name, value in eval_metrics.items():
-                    history.setdefault(f"eval_metric_{name}", []).append(value)
-                    writer.add_scalar(f"eval/metrics/{name}", value, step)
-                print(
-                    f"explore-optimize eval step={step + 1}/{train_config.num_steps} "
-                    f"eval_cases={eval_case_count} "
-                    f"loss_total={eval_losses['total_loss']:.6f} "
-                    f"metric_stiffness={eval_metrics['stiffness_error']:.6f} "
-                    f"metric_explore_stiffness={eval_metrics['explore_stiffness_error']:.6f} "
-                    f"metric_optimize_stiffness={eval_metrics['optimize_stiffness_error']:.6f} "
-                    f"reward={eval_metrics['reward']:.6f}",
-                    flush=True,
-                )
             step += 1
             accumulation_counter = 0
             accumulation_examples = 0
@@ -604,7 +499,9 @@ def train_explore_optimize_refiner(
                 batch_transfer_time = time.perf_counter()
                 if accumulation_counter == 0:
                     accumulation_step_start_time = step_start_time
-                    accumulation_learning_rate = _scheduled_learning_rate(step, train_config)
+                    accumulation_learning_rate = _scheduled_learning_rate(
+                        step, train_config
+                    )
                     for parameter_group in optimizer.param_groups:
                         parameter_group["lr"] = accumulation_learning_rate
                 source_structures = sample_noisy_structures(
@@ -652,13 +549,13 @@ def train_explore_optimize_refiner(
                 accumulation_rollout_time += forward_time - batch_build_time
                 accumulation_loss_time += loss_time - forward_time
                 for name, value_tensor in loss_terms.items():
-                    accumulated_loss_terms[name] = accumulated_loss_terms.get(name, 0.0) + float(
-                        value_tensor.detach().item()
-                    )
+                    accumulated_loss_terms[name] = accumulated_loss_terms.get(
+                        name, 0.0
+                    ) + float(value_tensor.detach().item())
                 for name, value_tensor in metrics.items():
-                    accumulated_metrics[name] = accumulated_metrics.get(name, 0.0) + float(
-                        value_tensor.detach().item()
-                    )
+                    accumulated_metrics[name] = accumulated_metrics.get(
+                        name, 0.0
+                    ) + float(value_tensor.detach().item())
                 writer.add_scalar(
                     "train/parameters/mean_final_adjacency",
                     float(outcome.final_structures.adjacency.mean().detach().item()),

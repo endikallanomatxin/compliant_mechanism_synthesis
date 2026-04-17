@@ -56,7 +56,6 @@ def test_train_explore_optimize_refiner_writes_checkpoint_and_eval_history(
             num_steps=2,
             explore_steps=2,
             optimize_steps=2,
-            eval_every_steps=2,
             checkpoint_path=str(tmp_path / "refiner_explore_optimize.pt"),
             logdir=str(tmp_path / "runs_explore_optimize"),
             seed=13,
@@ -66,8 +65,6 @@ def test_train_explore_optimize_refiner_writes_checkpoint_and_eval_history(
     assert summary.checkpoint_path.exists()
     assert "total_loss" in summary.history
     assert "stiffness_loss_contribution" in summary.history
-    assert "eval_total_loss" in summary.history
-    assert "eval_metric_optimize_stiffness_error" in summary.history
 
 
 def test_train_explore_optimize_refiner_can_initialize_from_supervised_checkpoint(
@@ -104,9 +101,10 @@ def test_train_explore_optimize_refiner_can_initialize_from_supervised_checkpoin
             num_steps=2,
             explore_steps=2,
             optimize_steps=2,
-            eval_every_steps=2,
             init_checkpoint_path=str(supervised_summary.checkpoint_path),
-            checkpoint_path=str(tmp_path / "refiner_explore_optimize_from_supervised.pt"),
+            checkpoint_path=str(
+                tmp_path / "refiner_explore_optimize_from_supervised.pt"
+            ),
             logdir=str(tmp_path / "runs_explore_optimize_from_supervised"),
             seed=19,
         ),

@@ -24,9 +24,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=defaults.gradient_accumulation_steps,
     )
     parser.add_argument("--log-every-steps", type=int, default=defaults.log_every_steps)
-    parser.add_argument(
-        "--eval-every-steps", type=int, default=defaults.eval_every_steps
-    )
     parser.add_argument("--num-steps", type=int, default=defaults.num_steps)
     parser.add_argument("--rollout-steps", type=int, default=defaults.rollout_steps)
     parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
@@ -39,10 +36,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=defaults.rollout_monotonicity_loss_weight,
     )
-    parser.add_argument("--eval-fraction", type=float, default=defaults.eval_fraction)
-    parser.add_argument(
-        "--init-checkpoint-path", default=defaults.init_checkpoint_path
-    )
+    parser.add_argument("--init-checkpoint-path", default=defaults.init_checkpoint_path)
     parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
     parser.add_argument("--logdir", default=defaults.logdir)
     parser.add_argument("--name", "-n", default="rl")
@@ -60,14 +54,12 @@ def train_rl_main(argv: list[str] | None = None) -> None:
             batch_size=args.batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             log_every_steps=args.log_every_steps,
-            eval_every_steps=args.eval_every_steps,
             num_steps=args.num_steps,
             rollout_steps=args.rollout_steps,
             learning_rate=args.learning_rate,
             warmup_steps=args.warmup_steps,
             min_learning_rate=args.min_learning_rate,
             rollout_monotonicity_loss_weight=args.rollout_monotonicity_loss_weight,
-            eval_fraction=args.eval_fraction,
             init_checkpoint_path=args.init_checkpoint_path,
             checkpoint_path=args.checkpoint_path,
             logdir=str(logdir_path),

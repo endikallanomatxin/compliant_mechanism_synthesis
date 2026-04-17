@@ -52,7 +52,6 @@ def test_train_rl_refiner_writes_checkpoint_and_eval_history(tmp_path: Path) -> 
             batch_size=2,
             num_steps=4,
             rollout_steps=2,
-            eval_every_steps=2,
             checkpoint_path=str(tmp_path / "refiner_rl.pt"),
             logdir=str(tmp_path / "runs_rl"),
             seed=5,
@@ -63,8 +62,6 @@ def test_train_rl_refiner_writes_checkpoint_and_eval_history(tmp_path: Path) -> 
     assert "total_loss" in summary.history
     assert "stiffness_loss_contribution" in summary.history
     assert "rollout_monotonicity_loss_contribution" in summary.history
-    assert "eval_total_loss" in summary.history
-    assert "eval_metric_reward" in summary.history
 
 
 def test_train_rl_refiner_supports_gradient_accumulation(
@@ -87,7 +84,6 @@ def test_train_rl_refiner_supports_gradient_accumulation(
             gradient_accumulation_steps=2,
             num_steps=2,
             rollout_steps=2,
-            eval_every_steps=2,
             checkpoint_path=str(tmp_path / "refiner_rl_accum.pt"),
             logdir=str(tmp_path / "runs_rl_accum"),
             seed=11,
@@ -134,7 +130,6 @@ def test_train_rl_refiner_can_initialize_from_supervised_checkpoint(
             batch_size=2,
             num_steps=2,
             rollout_steps=2,
-            eval_every_steps=2,
             init_checkpoint_path=str(supervised_summary.checkpoint_path),
             checkpoint_path=str(tmp_path / "refiner_rl_from_supervised.pt"),
             logdir=str(tmp_path / "runs_rl_from_supervised"),

@@ -9,8 +9,15 @@ from pathlib import Path
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from compliant_mechanism_synthesis.dataset.types import Analyses, OptimizedCases, Structures
-from compliant_mechanism_synthesis.models import SupervisedRefiner, SupervisedRefinerConfig
+from compliant_mechanism_synthesis.dataset.types import (
+    Analyses,
+    OptimizedCases,
+    Structures,
+)
+from compliant_mechanism_synthesis.models import (
+    SupervisedRefiner,
+    SupervisedRefinerConfig,
+)
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.tensor_ops import (
     enforce_role_adjacency_constraints,
@@ -25,7 +32,6 @@ from compliant_mechanism_synthesis.training.supervised import (
     iter_supervised_batches,
     load_supervised_cases,
     sample_noisy_structures,
-    split_train_eval_cases,
 )
 from compliant_mechanism_synthesis.training.supervised import analyze_structures
 from compliant_mechanism_synthesis.utils import resolve_torch_device
@@ -38,14 +44,12 @@ class RLTrainingConfig:
     batch_size: int = 88
     gradient_accumulation_steps: int = 4
     log_every_steps: int = 10
-    eval_every_steps: int = 100
     max_grad_norm: float = 1.0
     num_steps: int = 50_000
     rollout_steps: int = 4
     learning_rate: float = 2e-6
     warmup_steps: int = 500
     min_learning_rate: float = 2e-7
-    eval_fraction: float = 0.02
     use_style_token: bool = True
     style_token_count: int = 1
     stiffness_loss_weight: float = 1.0
@@ -172,10 +176,14 @@ def _rl_losses(
         rollout_monotonicity = stiffness_error.new_zeros(stiffness_error.shape)
     else:
         per_step_stiffness_losses = [
-            generalized_stiffness_error(analysis.generalized_stiffness, target_stiffness)
+            generalized_stiffness_error(
+                analysis.generalized_stiffness, target_stiffness
+            )
             for analysis in step_analyses
         ]
-        per_step_stiffness_losses = [torch.log1p(loss) for loss in per_step_stiffness_losses]
+        per_step_stiffness_losses = [
+            torch.log1p(loss) for loss in per_step_stiffness_losses
+        ]
         monotonicity_terms = [
             torch.relu(current - previous)
             for previous, current in zip(
@@ -219,71 +227,6 @@ def _rl_losses(
     return total_loss.mean(), metrics, loss_summary
 
 
-def _evaluate_rl_batches(
-    model: SupervisedRefiner,
-    optimized_cases: OptimizedCases,
-    train_config: RLTrainingConfig,
-    position_mean: torch.Tensor,
-    position_std: torch.Tensor,
-    adjacency_mean: torch.Tensor,
-    adjacency_std: torch.Tensor,
-    seed: int,
-) -> tuple[dict[str, float], dict[str, float]]:
-    total_losses: dict[str, float] = {}
-    total_metrics: dict[str, float] = {}
-    num_batches = 0
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            for batch_index, batch_cases in enumerate(
-                iter_supervised_batches(
-                    optimized_cases,
-                    batch_size=train_config.batch_size,
-                    shuffle=False,
-                )
-            ):
-                batch_cases = batch_cases.to(position_mean.device)
-                source_structures = sample_noisy_structures(
-                    optimized_cases=batch_cases,
-                    position_mean=position_mean,
-                    position_std=position_std,
-                    adjacency_mean=adjacency_mean,
-                    adjacency_std=adjacency_std,
-                    seed=seed + batch_index,
-                )
-                final_structures = _rollout_refiner_final(
-                    model=model,
-                    source_structures=source_structures,
-                    target_stiffness=batch_cases.target_stiffness,
-                    num_steps=train_config.rollout_steps,
-                )
-                final_analyses = final_structures.step_analyses[-1]
-                _, metrics, loss_terms = _rl_losses(
-                    final_analyses=final_analyses,
-                    target_stiffness=batch_cases.target_stiffness,
-                    config=train_config,
-                    step_analyses=final_structures.step_analyses,
-                )
-                for name, value_tensor in loss_terms.items():
-                    total_losses[name] = total_losses.get(name, 0.0) + float(
-                        value_tensor.detach().item()
-                    )
-                for name, value_tensor in metrics.items():
-                    total_metrics[name] = total_metrics.get(name, 0.0) + float(
-                        value_tensor.detach().item()
-                    )
-                num_batches += 1
-    finally:
-        if was_training:
-            model.train()
-
-    return (
-        {name: value / num_batches for name, value in total_losses.items()},
-        {name: value / num_batches for name, value in total_metrics.items()},
-    )
-
-
 def _load_initial_model(
     device: torch.device,
     train_config: RLTrainingConfig,
@@ -321,8 +264,6 @@ def train_rl_refiner(
         raise ValueError("log_every_steps must be positive")
     if train_config.gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
-    if train_config.eval_every_steps <= 0:
-        raise ValueError("eval_every_steps must be positive")
     if train_config.max_grad_norm <= 0.0:
         raise ValueError("max_grad_norm must be positive")
     if train_config.rollout_steps <= 0:
@@ -343,22 +284,19 @@ def train_rl_refiner(
         raise ValueError("free_node_spacing_penalty_weight must be non-negative")
     if train_config.style_token_count <= 0:
         raise ValueError("style_token_count must be positive")
-    if not 0.0 <= train_config.eval_fraction < 1.0:
-        raise ValueError("eval_fraction must be in [0.0, 1.0)")
 
-    split = split_train_eval_cases(optimized_cases, train_config.eval_fraction)
-    train_cases = split.train_cases
-    eval_cases = split.eval_cases
+    train_cases = optimized_cases
     dataset_cases = train_cases.optimized_structures.batch_size
-    eval_case_count = (
-        0 if eval_cases is None else eval_cases.optimized_structures.batch_size
-    )
     steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
-    global_position_mean, global_position_std = _dataset_position_statistics(train_cases)
+    global_position_mean, global_position_std = _dataset_position_statistics(
+        train_cases
+    )
     global_adjacency_mean, global_adjacency_std = _dataset_adjacency_statistics(
         train_cases
     )
-    model, effective_model_config = _load_initial_model(device, train_config, model_config)
+    model, effective_model_config = _load_initial_model(
+        device, train_config, model_config
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
     history = {
         "total_loss": [],
@@ -381,8 +319,7 @@ def train_rl_refiner(
     print(
         f"rl training started dataset_cases={dataset_cases} batch_size={train_config.batch_size} "
         f"effective_batch_size={train_config.batch_size * train_config.gradient_accumulation_steps} "
-        f"eval_cases={eval_case_count} eval_every_steps={train_config.eval_every_steps} "
-        f"eval_fraction={train_config.eval_fraction:.4f} rollout_steps={train_config.rollout_steps} "
+        f"rollout_steps={train_config.rollout_steps} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"init_checkpoint={train_config.init_checkpoint_path or 'none'} "
         f"use_style_token={'yes' if effective_model_config.use_style_token else 'no'} "
@@ -473,7 +410,10 @@ def train_rl_refiner(
             )
 
             examples_seen += accumulation_examples
-            if step % train_config.log_every_steps == 0 or step == train_config.num_steps - 1:
+            if (
+                step % train_config.log_every_steps == 0
+                or step == train_config.num_steps - 1
+            ):
                 optimizer_duration = max(
                     0.0,
                     optimizer_time
@@ -503,39 +443,6 @@ def train_rl_refiner(
                     f"t_loss={accumulation_loss_time:.3f}s "
                     f"t_opt={optimizer_duration:.3f}s "
                     f"t_total={optimizer_time - accumulation_step_start_time:.3f}s",
-                    flush=True,
-                )
-
-            should_run_eval = (
-                eval_cases is not None
-                and (
-                    (step + 1) % train_config.eval_every_steps == 0
-                    or step == train_config.num_steps - 1
-                )
-            )
-            if should_run_eval:
-                eval_losses, eval_metrics = _evaluate_rl_batches(
-                    model=model,
-                    optimized_cases=eval_cases,
-                    train_config=train_config,
-                    position_mean=global_position_mean.to(device),
-                    position_std=global_position_std.to(device),
-                    adjacency_mean=global_adjacency_mean.to(device),
-                    adjacency_std=global_adjacency_std.to(device),
-                    seed=train_config.seed + 100_000 + step,
-                )
-                for name, value in eval_losses.items():
-                    history.setdefault(f"eval_{name}", []).append(value)
-                    writer.add_scalar(f"eval/loss/{name}", value, step)
-                for name, value in eval_metrics.items():
-                    history.setdefault(f"eval_metric_{name}", []).append(value)
-                    writer.add_scalar(f"eval/metrics/{name}", value, step)
-                print(
-                    f"rl eval step={step + 1}/{train_config.num_steps} "
-                    f"eval_cases={eval_case_count} "
-                    f"loss_total={eval_losses['total_loss']:.6f} "
-                    f"metric_stiffness={eval_metrics['stiffness_error']:.6f} "
-                    f"reward={eval_metrics['reward']:.6f}",
                     flush=True,
                 )
 
@@ -607,9 +514,9 @@ def train_rl_refiner(
                 accumulation_rollout_time += forward_time - batch_build_time
                 accumulation_loss_time += loss_time - forward_time
                 for name, value_tensor in loss_terms.items():
-                    accumulated_loss_terms[name] = accumulated_loss_terms.get(name, 0.0) + float(
-                        value_tensor.detach().item()
-                    )
+                    accumulated_loss_terms[name] = accumulated_loss_terms.get(
+                        name, 0.0
+                    ) + float(value_tensor.detach().item())
                 writer.add_scalar(
                     "train/parameters/mean_final_adjacency",
                     float(final_structures.adjacency.mean().detach().item()),
@@ -621,9 +528,9 @@ def train_rl_refiner(
                     step,
                 )
                 for name, value_tensor in metrics.items():
-                    accumulated_metrics[name] = accumulated_metrics.get(name, 0.0) + float(
-                        value_tensor.detach().item()
-                    )
+                    accumulated_metrics[name] = accumulated_metrics.get(
+                        name, 0.0
+                    ) + float(value_tensor.detach().item())
 
                 if accumulation_counter >= train_config.gradient_accumulation_steps:
                     finalize_accumulation()
