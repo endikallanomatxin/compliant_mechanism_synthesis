@@ -9,10 +9,10 @@ from pathlib import Path
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from compliant_mechanism_synthesis.dataset.optimization import (
-    _allowed_edge_mask,
-    _build_adjacency,
-    _logits_from_adjacency,
+from compliant_mechanism_synthesis.adjacency import (
+    allowed_edge_mask,
+    build_adjacency,
+    logits_from_adjacency,
 )
 from compliant_mechanism_synthesis.dataset.types import (
     Analyses,
@@ -157,11 +157,11 @@ def _optimize_stage(
         offset=1,
         device=structures.positions.device,
     )
-    active_upper = _allowed_edge_mask(structures.roles[0])[edge_i, edge_j]
+    active_upper = allowed_edge_mask(structures.roles[0])[edge_i, edge_j]
     initial_edge_values = structures.adjacency[
         :, edge_i[active_upper], edge_j[active_upper]
     ]
-    edge_logits = torch.nn.Parameter(_logits_from_adjacency(initial_edge_values))
+    edge_logits = torch.nn.Parameter(logits_from_adjacency(initial_edge_values))
     optimizer = torch.optim.Adam(
         [free_positions, edge_logits], lr=config.optimize_learning_rate
     )
@@ -189,7 +189,7 @@ def _optimize_stage(
             ).clamp(0.0, 1.0)
             adjacency = enforce_role_adjacency_constraints(
                 torch.nan_to_num(
-                    _build_adjacency(
+                    build_adjacency(
                         edge_logits=edge_logits,
                         roles=structures.roles,
                         num_nodes=structures.num_nodes,
