@@ -42,9 +42,9 @@ class RLTrainingConfig:
     max_grad_norm: float = 1.0
     num_steps: int = 50_000
     rollout_steps: int = 4
-    learning_rate: float = 2e-5
+    learning_rate: float = 8e-6
     warmup_steps: int = 500
-    min_learning_rate: float = 2e-6
+    min_learning_rate: float = 1e-6
     eval_fraction: float = 0.02
     use_style_token: bool = True
     style_token_count: int = 1
