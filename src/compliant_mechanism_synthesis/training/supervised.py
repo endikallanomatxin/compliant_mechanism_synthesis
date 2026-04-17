@@ -17,11 +17,14 @@ from compliant_mechanism_synthesis.dataset.types import (
     Scaffolds,
     Structures,
 )
+from compliant_mechanism_synthesis.losses import (
+    generalized_stiffness_error,
+    log_generalized_stiffness_error,
+)
 from compliant_mechanism_synthesis.mechanics import (
     Frame3DConfig,
     GeometryPenaltyConfig,
     mechanical_terms,
-    normalize_generalized_stiffness,
 )
 from compliant_mechanism_synthesis.models import (
     FlowPrediction,
@@ -587,15 +590,6 @@ def iter_supervised_batches(
         yield select_batch(optimized_cases, batch_indices)
 
 
-def generalized_stiffness_error(
-    generalized_stiffness: torch.Tensor,
-    target_stiffness: torch.Tensor,
-) -> torch.Tensor:
-    normalized_current = normalize_generalized_stiffness(generalized_stiffness)
-    normalized_target = normalize_generalized_stiffness(target_stiffness)
-    return (normalized_current - normalized_target).square().mean(dim=(1, 2))
-
-
 def _position_velocity_loss(
     prediction: FlowPrediction, batch: SupervisedBatch
 ) -> torch.Tensor:
@@ -649,10 +643,9 @@ def _training_losses(
             adjacency=estimated_adjacency,
         )
         endpoint_analyses = analyze_structures(estimated, profile=profile)
-        stiffness_error = torch.log1p(
-            generalized_stiffness_error(
-                endpoint_analyses.generalized_stiffness, batch.target_stiffness
-            )
+        stiffness_error = log_generalized_stiffness_error(
+            endpoint_analyses.generalized_stiffness,
+            batch.target_stiffness,
         )
     else:
         stiffness_error = position_error.new_zeros(position_error.shape)
@@ -742,9 +735,7 @@ def _evaluate_supervised_batches(
                     nodal_displacements=batch.current_analyses.nodal_displacements,
                     edge_von_mises=batch.current_analyses.edge_von_mises,
                     flow_times=batch.flow_times,
-                    style_structures=(
-                        batch.oracle_structures if use_style else None
-                    ),
+                    style_structures=(batch.oracle_structures if use_style else None),
                     style_analyses=(batch.oracle_analyses if use_style else None),
                 )
                 _, metrics, loss_terms = _training_losses(
@@ -821,7 +812,9 @@ def train_supervised_refiner(
     train_cases = split.train_cases
     eval_cases = split.eval_cases
     dataset_cases = train_cases.optimized_structures.batch_size
-    eval_case_count = 0 if eval_cases is None else eval_cases.optimized_structures.batch_size
+    eval_case_count = (
+        0 if eval_cases is None else eval_cases.optimized_structures.batch_size
+    )
     steps_per_epoch = max(1, math.ceil(dataset_cases / train_config.batch_size))
     global_position_mean, global_position_std = _dataset_position_statistics(
         train_cases
@@ -989,12 +982,9 @@ def train_supervised_refiner(
                         f"t_loss_solve={loss_analysis_profile.get('solve', 0.0):.3f}s",
                         flush=True,
                     )
-                should_run_eval = (
-                    eval_cases is not None
-                    and (
-                        (step + 1) % train_config.eval_every_steps == 0
-                        or step == train_config.num_steps - 1
-                    )
+                should_run_eval = eval_cases is not None and (
+                    (step + 1) % train_config.eval_every_steps == 0
+                    or step == train_config.num_steps - 1
                 )
                 if should_run_eval:
                     eval_seed = train_config.seed + 100_000 + step

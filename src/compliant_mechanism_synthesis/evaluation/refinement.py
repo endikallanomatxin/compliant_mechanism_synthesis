@@ -4,10 +4,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from compliant_mechanism_synthesis.dataset.types import OptimizedCases, Structures
+from compliant_mechanism_synthesis.losses import generalized_stiffness_error
 from compliant_mechanism_synthesis.models import SupervisedRefiner
 from compliant_mechanism_synthesis.training.supervised import (
     analyze_structures,
-    generalized_stiffness_error,
     make_supervised_batch,
 )
 

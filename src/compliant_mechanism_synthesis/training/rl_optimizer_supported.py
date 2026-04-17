@@ -19,7 +19,11 @@ from compliant_mechanism_synthesis.dataset.types import (
     OptimizedCases,
     Structures,
 )
-from compliant_mechanism_synthesis.losses import stress_violation_terms
+from compliant_mechanism_synthesis.losses import (
+    log_generalized_stiffness_error,
+    StructuralObjectiveWeights,
+    structural_objective_terms,
+)
 from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
@@ -31,7 +35,6 @@ from compliant_mechanism_synthesis.training.supervised import (
     _dataset_position_statistics,
     _scheduled_learning_rate,
     _synchronize_device_if_needed,
-    generalized_stiffness_error,
     iter_supervised_batches,
     load_supervised_cases,
     sample_noisy_structures,
@@ -55,7 +58,7 @@ class ExploreOptimizeTrainingConfig:
     learning_rate: float = 1e-5
     warmup_steps: int = 500
     min_learning_rate: float = 1e-6
-    loss_scale: float = 1e-8
+    loss_scale: float = 1e-9
     use_style_token: bool = True
     style_token_count: int = 1
     stiffness_loss_weight: float = 1.0
@@ -115,53 +118,26 @@ def _loss_terms_from_analyses(
     target_stiffness: torch.Tensor,
     config: ExploreOptimizeTrainingConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    stiffness_error = torch.log1p(
-        generalized_stiffness_error(analyses.generalized_stiffness, target_stiffness)
-    )
-    material_usage = analyses.material_usage
-    short_beam_penalty = analyses.short_beam_penalty
-    long_beam_penalty = analyses.long_beam_penalty
-    thin_beam_penalty = analyses.thin_beam_penalty
-    thick_beam_penalty = analyses.thick_beam_penalty
-    free_node_spacing_penalty = analyses.free_node_spacing_penalty
-    if analyses.edge_von_mises is None:
-        raise ValueError("analyses must provide edge_von_mises")
-    stress_violation, mean_stress_ratio, max_stress_ratio = stress_violation_terms(
-        edge_von_mises=analyses.edge_von_mises,
+    loss_contributions = structural_objective_terms(
+        analyses=analyses,
         adjacency=adjacency,
+        target_stiffness=target_stiffness,
+        weights=StructuralObjectiveWeights(
+            stiffness=config.stiffness_loss_weight,
+            stress=config.stress_loss_weight,
+            material=config.material_loss_weight,
+            short_beam=config.short_beam_penalty_weight,
+            long_beam=config.long_beam_penalty_weight,
+            thin_beam=config.thin_beam_penalty_weight,
+            thick_beam=config.thick_beam_penalty_weight,
+            free_node_spacing=config.free_node_spacing_penalty_weight,
+        ),
         allowable_von_mises=config.allowable_von_mises,
         stress_activation_threshold=config.stress_activation_threshold,
     )
-
-    loss_contributions = {
-        "stiffness_loss_contribution": config.stiffness_loss_weight * stiffness_error,
-        "stress_loss_contribution": config.stress_loss_weight * stress_violation,
-        "material_loss_contribution": config.material_loss_weight * material_usage,
-        "short_beam_loss_contribution": config.short_beam_penalty_weight
-        * short_beam_penalty,
-        "long_beam_loss_contribution": config.long_beam_penalty_weight
-        * long_beam_penalty,
-        "thin_beam_loss_contribution": config.thin_beam_penalty_weight
-        * thin_beam_penalty,
-        "thick_beam_loss_contribution": config.thick_beam_penalty_weight
-        * thick_beam_penalty,
-        "free_node_spacing_loss_contribution": config.free_node_spacing_penalty_weight
-        * free_node_spacing_penalty,
-    }
+    loss_contributions, metrics = loss_contributions
     total_loss = sum(loss_contributions.values())
-    metrics = {
-        "stiffness_error": stiffness_error.mean(),
-        "stress_violation": stress_violation.mean(),
-        "mean_stress_ratio": mean_stress_ratio.mean(),
-        "max_stress_ratio": max_stress_ratio.mean(),
-        "material_usage": material_usage.mean(),
-        "short_beam_penalty": short_beam_penalty.mean(),
-        "long_beam_penalty": long_beam_penalty.mean(),
-        "thin_beam_penalty": thin_beam_penalty.mean(),
-        "thick_beam_penalty": thick_beam_penalty.mean(),
-        "free_node_spacing_penalty": free_node_spacing_penalty.mean(),
-        "reward": -total_loss.mean(),
-    }
+    metrics = {**metrics, "reward": -total_loss.mean()}
     loss_summary = {name: value.mean() for name, value in loss_contributions.items()}
     loss_summary["total_loss"] = total_loss.mean()
     return total_loss.mean(), metrics, loss_summary
@@ -608,17 +584,13 @@ def train_explore_optimize_refiner(
                     target_stiffness=batch_cases.target_stiffness,
                     config=train_config,
                 )
-                metrics["explore_stiffness_error"] = torch.log1p(
-                    generalized_stiffness_error(
-                        outcome.explore_analyses[-1].generalized_stiffness,
-                        batch_cases.target_stiffness,
-                    )
+                metrics["explore_stiffness_error"] = log_generalized_stiffness_error(
+                    outcome.explore_analyses[-1].generalized_stiffness,
+                    batch_cases.target_stiffness,
                 ).mean()
-                metrics["optimize_stiffness_error"] = torch.log1p(
-                    generalized_stiffness_error(
-                        outcome.optimize_analyses[-1].generalized_stiffness,
-                        batch_cases.target_stiffness,
-                    )
+                metrics["optimize_stiffness_error"] = log_generalized_stiffness_error(
+                    outcome.optimize_analyses[-1].generalized_stiffness,
+                    batch_cases.target_stiffness,
                 ).mean()
                 _synchronize_device_if_needed(device)
                 loss_time = time.perf_counter()

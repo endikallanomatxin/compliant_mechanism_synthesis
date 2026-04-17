@@ -14,7 +14,11 @@ from compliant_mechanism_synthesis.dataset.types import (
     OptimizedCases,
     Structures,
 )
-from compliant_mechanism_synthesis.losses import stress_violation_terms
+from compliant_mechanism_synthesis.losses import (
+    log_generalized_stiffness_error,
+    StructuralObjectiveWeights,
+    structural_objective_terms,
+)
 from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
@@ -29,7 +33,6 @@ from compliant_mechanism_synthesis.training.supervised import (
     _dataset_position_statistics,
     _scheduled_learning_rate,
     _synchronize_device_if_needed,
-    generalized_stiffness_error,
     iter_supervised_batches,
     load_supervised_cases,
     sample_noisy_structures,
@@ -166,23 +169,24 @@ def _rl_losses(
     config: RLTrainingConfig,
     step_analyses: list[Analyses] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    stiffness_error = torch.log1p(
-        generalized_stiffness_error(
-            final_analyses.generalized_stiffness,
-            target_stiffness,
-        )
+    stiffness_error = log_generalized_stiffness_error(
+        final_analyses.generalized_stiffness,
+        target_stiffness,
     )
-    material_usage = final_analyses.material_usage
-    short_beam_penalty = final_analyses.short_beam_penalty
-    long_beam_penalty = final_analyses.long_beam_penalty
-    thin_beam_penalty = final_analyses.thin_beam_penalty
-    thick_beam_penalty = final_analyses.thick_beam_penalty
-    free_node_spacing_penalty = final_analyses.free_node_spacing_penalty
-    if final_analyses.edge_von_mises is None:
-        raise ValueError("final_analyses must provide edge_von_mises")
-    stress_violation, mean_stress_ratio, max_stress_ratio = stress_violation_terms(
-        edge_von_mises=final_analyses.edge_von_mises,
+    base_loss_contributions, metrics = structural_objective_terms(
+        analyses=final_analyses,
         adjacency=final_adjacency,
+        target_stiffness=target_stiffness,
+        weights=StructuralObjectiveWeights(
+            stiffness=config.stiffness_loss_weight,
+            stress=config.stress_loss_weight,
+            material=config.material_loss_weight,
+            short_beam=config.short_beam_penalty_weight,
+            long_beam=config.long_beam_penalty_weight,
+            thin_beam=config.thin_beam_penalty_weight,
+            thick_beam=config.thick_beam_penalty_weight,
+            free_node_spacing=config.free_node_spacing_penalty_weight,
+        ),
         allowable_von_mises=config.allowable_von_mises,
         stress_activation_threshold=config.stress_activation_threshold,
     )
@@ -190,13 +194,10 @@ def _rl_losses(
         rollout_monotonicity = stiffness_error.new_zeros(stiffness_error.shape)
     else:
         per_step_stiffness_losses = [
-            generalized_stiffness_error(
+            log_generalized_stiffness_error(
                 analysis.generalized_stiffness, target_stiffness
             )
             for analysis in step_analyses
-        ]
-        per_step_stiffness_losses = [
-            torch.log1p(loss) for loss in per_step_stiffness_losses
         ]
         monotonicity_terms = [
             torch.relu(current - previous)
@@ -209,35 +210,14 @@ def _rl_losses(
         rollout_monotonicity = torch.stack(monotonicity_terms, dim=0).mean(dim=0)
 
     loss_contributions = {
-        "stiffness_loss_contribution": config.stiffness_loss_weight * stiffness_error,
-        "stress_loss_contribution": config.stress_loss_weight * stress_violation,
+        **base_loss_contributions,
         "rollout_monotonicity_loss_contribution": config.rollout_monotonicity_loss_weight
         * rollout_monotonicity,
-        "material_loss_contribution": config.material_loss_weight * material_usage,
-        "short_beam_loss_contribution": config.short_beam_penalty_weight
-        * short_beam_penalty,
-        "long_beam_loss_contribution": config.long_beam_penalty_weight
-        * long_beam_penalty,
-        "thin_beam_loss_contribution": config.thin_beam_penalty_weight
-        * thin_beam_penalty,
-        "thick_beam_loss_contribution": config.thick_beam_penalty_weight
-        * thick_beam_penalty,
-        "free_node_spacing_loss_contribution": config.free_node_spacing_penalty_weight
-        * free_node_spacing_penalty,
     }
     total_loss = sum(loss_contributions.values())
     metrics = {
-        "stiffness_error": stiffness_error.mean(),
-        "stress_violation": stress_violation.mean(),
-        "mean_stress_ratio": mean_stress_ratio.mean(),
-        "max_stress_ratio": max_stress_ratio.mean(),
-        "material_usage": material_usage.mean(),
+        **metrics,
         "rollout_monotonicity": rollout_monotonicity.mean(),
-        "short_beam_penalty": short_beam_penalty.mean(),
-        "long_beam_penalty": long_beam_penalty.mean(),
-        "thin_beam_penalty": thin_beam_penalty.mean(),
-        "thick_beam_penalty": thick_beam_penalty.mean(),
-        "free_node_spacing_penalty": free_node_spacing_penalty.mean(),
         "reward": -total_loss.mean(),
     }
     loss_summary = {name: value.mean() for name, value in loss_contributions.items()}
