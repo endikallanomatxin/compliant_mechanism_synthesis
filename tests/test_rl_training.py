@@ -66,6 +66,39 @@ def test_train_rl_refiner_writes_checkpoint_and_eval_history(tmp_path: Path) -> 
     assert "eval_metric_reward" in summary.history
 
 
+def test_train_rl_refiner_supports_gradient_accumulation(
+    tmp_path: Path,
+) -> None:
+    dataset_path, cases = _build_cases(tmp_path)
+
+    _, summary = train_rl_refiner(
+        optimized_cases=cases,
+        model_config=SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        ),
+        train_config=RLTrainingConfig(
+            dataset_path=str(dataset_path),
+            device="cpu",
+            batch_size=1,
+            gradient_accumulation_steps=2,
+            num_steps=2,
+            rollout_steps=2,
+            eval_every_steps=2,
+            checkpoint_path=str(tmp_path / "refiner_rl_accum.pt"),
+            logdir=str(tmp_path / "runs_rl_accum"),
+            seed=11,
+        ),
+    )
+
+    checkpoint = torch.load(summary.checkpoint_path, map_location="cpu")
+    assert summary.checkpoint_path.exists()
+    assert checkpoint["train_config"]["gradient_accumulation_steps"] == 2
+    assert len(summary.history["total_loss"]) == 2
+
+
 def test_train_rl_refiner_can_initialize_from_supervised_checkpoint(
     tmp_path: Path,
 ) -> None:

@@ -36,6 +36,7 @@ class RLTrainingConfig:
     dataset_path: str
     device: str = "auto"
     batch_size: int = 40
+    gradient_accumulation_steps: int = 4
     log_every_steps: int = 10
     eval_every_steps: int = 100
     max_grad_norm: float = 1.0
@@ -285,6 +286,8 @@ def train_rl_refiner(
 
     if train_config.log_every_steps <= 0:
         raise ValueError("log_every_steps must be positive")
+    if train_config.gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
     if train_config.eval_every_steps <= 0:
         raise ValueError("eval_every_steps must be positive")
     if train_config.max_grad_norm <= 0.0:
@@ -341,6 +344,7 @@ def train_rl_refiner(
     writer = SummaryWriter(log_dir=train_config.logdir)
     print(
         f"rl training started dataset_cases={dataset_cases} batch_size={train_config.batch_size} "
+        f"effective_batch_size={train_config.batch_size * train_config.gradient_accumulation_steps} "
         f"eval_cases={eval_case_count} eval_every_steps={train_config.eval_every_steps} "
         f"eval_fraction={train_config.eval_fraction:.4f} rollout_steps={train_config.rollout_steps} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
@@ -354,6 +358,162 @@ def train_rl_refiner(
     try:
         step = 0
         examples_seen = 0
+        accumulation_counter = 0
+        accumulation_examples = 0
+        accumulation_learning_rate = 0.0
+        accumulation_step_start_time = 0.0
+        accumulation_transfer_time = 0.0
+        accumulation_batch_time = 0.0
+        accumulation_rollout_time = 0.0
+        accumulation_loss_time = 0.0
+        accumulated_loss_terms: dict[str, float] = {}
+        accumulated_metrics: dict[str, float] = {}
+        optimizer.zero_grad(set_to_none=True)
+
+        def finalize_accumulation() -> None:
+            nonlocal step
+            nonlocal accumulation_counter
+            nonlocal accumulation_examples
+            nonlocal accumulation_learning_rate
+            nonlocal accumulation_step_start_time
+            nonlocal accumulation_transfer_time
+            nonlocal accumulation_batch_time
+            nonlocal accumulation_rollout_time
+            nonlocal accumulation_loss_time
+            nonlocal accumulated_loss_terms
+            nonlocal accumulated_metrics
+            nonlocal examples_seen
+            if accumulation_counter == 0 or step >= train_config.num_steps:
+                return
+
+            raw_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=train_config.max_grad_norm
+                ).item()
+            )
+            skipped_update = not math.isfinite(raw_grad_norm)
+            grad_norm = 0.0 if skipped_update else raw_grad_norm
+            clipped = (grad_norm > train_config.max_grad_norm) and not skipped_update
+            clip_ratio = (
+                0.0 if skipped_update else grad_norm / train_config.max_grad_norm
+            )
+            if skipped_update:
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            _synchronize_device_if_needed(device)
+            optimizer_time = time.perf_counter()
+
+            averaged_loss_terms = {
+                name: value / accumulation_counter
+                for name, value in accumulated_loss_terms.items()
+            }
+            averaged_metrics = {
+                name: value / accumulation_counter
+                for name, value in accumulated_metrics.items()
+            }
+            for name, value in averaged_loss_terms.items():
+                history[name].append(value)
+                writer.add_scalar(f"train/loss/{name}", value, step)
+            for name, value in averaged_metrics.items():
+                writer.add_scalar(f"train/metrics/{name}", value, step)
+            writer.add_scalar(
+                "train/parameters/learning_rate", accumulation_learning_rate, step
+            )
+            writer.add_scalar(
+                "train/parameters/effective_batch_size",
+                train_config.batch_size * accumulation_counter,
+                step,
+            )
+            writer.add_scalar("train/gradients/grad_norm", grad_norm, step)
+            writer.add_scalar("train/gradients/clip_ratio", clip_ratio, step)
+            writer.add_scalar("train/gradients/clipped", float(clipped), step)
+            writer.add_scalar(
+                "train/gradients/skipped_update",
+                float(skipped_update),
+                step,
+            )
+
+            examples_seen += accumulation_examples
+            if step % train_config.log_every_steps == 0 or step == train_config.num_steps - 1:
+                optimizer_duration = max(
+                    0.0,
+                    optimizer_time
+                    - accumulation_step_start_time
+                    - accumulation_transfer_time
+                    - accumulation_batch_time
+                    - accumulation_rollout_time
+                    - accumulation_loss_time,
+                )
+                print(
+                    f"rl train step={step + 1}/{train_config.num_steps} "
+                    f"microbatches={accumulation_counter} "
+                    f"batch_cases={train_config.batch_size} "
+                    f"effective_batch_cases={accumulation_examples} "
+                    f"examples_seen={examples_seen} "
+                    f"learning_rate={accumulation_learning_rate:.8f} "
+                    f"loss_total={averaged_loss_terms['total_loss']:.6f} "
+                    f"loss_stiffness={averaged_loss_terms['stiffness_loss_contribution']:.6f} "
+                    f"metric_stiffness={averaged_metrics['stiffness_error']:.6f} "
+                    f"reward={averaged_metrics['reward']:.6f} "
+                    f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
+                    f"skipped_update={'yes' if skipped_update else 'no'} "
+                    f"clip_ratio={clip_ratio:.3f} "
+                    f"t_transfer={accumulation_transfer_time:.3f}s "
+                    f"t_batch={accumulation_batch_time:.3f}s "
+                    f"t_rollout={accumulation_rollout_time:.3f}s "
+                    f"t_loss={accumulation_loss_time:.3f}s "
+                    f"t_opt={optimizer_duration:.3f}s "
+                    f"t_total={optimizer_time - accumulation_step_start_time:.3f}s",
+                    flush=True,
+                )
+
+            should_run_eval = (
+                eval_cases is not None
+                and (
+                    (step + 1) % train_config.eval_every_steps == 0
+                    or step == train_config.num_steps - 1
+                )
+            )
+            if should_run_eval:
+                eval_losses, eval_metrics = _evaluate_rl_batches(
+                    model=model,
+                    optimized_cases=eval_cases,
+                    train_config=train_config,
+                    position_mean=global_position_mean.to(device),
+                    position_std=global_position_std.to(device),
+                    adjacency_mean=global_adjacency_mean.to(device),
+                    adjacency_std=global_adjacency_std.to(device),
+                    seed=train_config.seed + 100_000 + step,
+                )
+                for name, value in eval_losses.items():
+                    history.setdefault(f"eval_{name}", []).append(value)
+                    writer.add_scalar(f"eval/loss/{name}", value, step)
+                for name, value in eval_metrics.items():
+                    history.setdefault(f"eval_metric_{name}", []).append(value)
+                    writer.add_scalar(f"eval/metrics/{name}", value, step)
+                print(
+                    f"rl eval step={step + 1}/{train_config.num_steps} "
+                    f"eval_cases={eval_case_count} "
+                    f"loss_total={eval_losses['total_loss']:.6f} "
+                    f"metric_stiffness={eval_metrics['stiffness_error']:.6f} "
+                    f"reward={eval_metrics['reward']:.6f}",
+                    flush=True,
+                )
+
+            step += 1
+            accumulation_counter = 0
+            accumulation_examples = 0
+            accumulation_learning_rate = 0.0
+            accumulation_step_start_time = 0.0
+            accumulation_transfer_time = 0.0
+            accumulation_batch_time = 0.0
+            accumulation_rollout_time = 0.0
+            accumulation_loss_time = 0.0
+            accumulated_loss_terms = {}
+            accumulated_metrics = {}
+
         while step < train_config.num_steps:
             for batch_cases in iter_supervised_batches(
                 train_cases,
@@ -366,9 +526,13 @@ def train_rl_refiner(
                 batch_cases = batch_cases.to(device)
                 _synchronize_device_if_needed(device)
                 batch_transfer_time = time.perf_counter()
-                learning_rate = _scheduled_learning_rate(step, train_config)
-                for parameter_group in optimizer.param_groups:
-                    parameter_group["lr"] = learning_rate
+                if accumulation_counter == 0:
+                    accumulation_step_start_time = step_start_time
+                    accumulation_learning_rate = _scheduled_learning_rate(
+                        step, train_config
+                    )
+                    for parameter_group in optimizer.param_groups:
+                        parameter_group["lr"] = accumulation_learning_rate
                 source_structures = sample_noisy_structures(
                     optimized_cases=batch_cases,
                     position_mean=global_position_mean.to(device),
@@ -395,41 +559,18 @@ def train_rl_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 loss_time = time.perf_counter()
-                optimizer.zero_grad(set_to_none=True)
-                total_loss.backward()
-                raw_grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_norm=train_config.max_grad_norm
-                    ).item()
-                )
-                skipped_update = not math.isfinite(raw_grad_norm)
-                grad_norm = 0.0 if skipped_update else raw_grad_norm
-                clipped = (grad_norm > train_config.max_grad_norm) and not skipped_update
-                clip_ratio = (
-                    0.0
-                    if skipped_update
-                    else grad_norm / train_config.max_grad_norm
-                )
-                if skipped_update:
-                    optimizer.zero_grad(set_to_none=True)
-                else:
-                    optimizer.step()
-                _synchronize_device_if_needed(device)
-                optimizer_time = time.perf_counter()
+                (total_loss / train_config.gradient_accumulation_steps).backward()
 
+                accumulation_counter += 1
+                accumulation_examples += batch_cases.optimized_structures.batch_size
+                accumulation_transfer_time += batch_transfer_time - step_start_time
+                accumulation_batch_time += batch_build_time - batch_transfer_time
+                accumulation_rollout_time += forward_time - batch_build_time
+                accumulation_loss_time += loss_time - forward_time
                 for name, value_tensor in loss_terms.items():
-                    value = float(value_tensor.detach().item())
-                    history[name].append(value)
-                    writer.add_scalar(f"train/loss/{name}", value, step)
-                for name, value_tensor in metrics.items():
-                    writer.add_scalar(
-                        f"train/metrics/{name}",
-                        float(value_tensor.detach().item()),
-                        step,
+                    accumulated_loss_terms[name] = accumulated_loss_terms.get(name, 0.0) + float(
+                        value_tensor.detach().item()
                     )
-                writer.add_scalar(
-                    "train/parameters/learning_rate", learning_rate, step
-                )
                 writer.add_scalar(
                     "train/parameters/mean_final_adjacency",
                     float(final_structures.adjacency.mean().detach().item()),
@@ -440,74 +581,16 @@ def train_rl_refiner(
                     float(final_structures.positions.mean().detach().item()),
                     step,
                 )
-                writer.add_scalar("train/gradients/grad_norm", grad_norm, step)
-                writer.add_scalar("train/gradients/clip_ratio", clip_ratio, step)
-                writer.add_scalar("train/gradients/clipped", float(clipped), step)
-                writer.add_scalar(
-                    "train/gradients/skipped_update",
-                    float(skipped_update),
-                    step,
-                )
-                examples_seen += batch_cases.optimized_structures.batch_size
-                if (
-                    step % train_config.log_every_steps == 0
-                    or step == train_config.num_steps - 1
-                ):
-                    print(
-                        f"rl train step={step + 1}/{train_config.num_steps} "
-                        f"batch_cases={batch_cases.optimized_structures.batch_size} "
-                        f"examples_seen={examples_seen} "
-                        f"learning_rate={learning_rate:.8f} "
-                        f"loss_total={history['total_loss'][-1]:.6f} "
-                        f"loss_stiffness={history['stiffness_loss_contribution'][-1]:.6f} "
-                        f"metric_stiffness={float(metrics['stiffness_error'].detach().item()):.6f} "
-                        f"reward={float(metrics['reward'].detach().item()):.6f} "
-                        f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
-                        f"skipped_update={'yes' if skipped_update else 'no'} "
-                        f"clip_ratio={clip_ratio:.3f} "
-                        f"t_transfer={batch_transfer_time - step_start_time:.3f}s "
-                        f"t_batch={batch_build_time - batch_transfer_time:.3f}s "
-                        f"t_rollout={forward_time - batch_build_time:.3f}s "
-                        f"t_loss={loss_time - forward_time:.3f}s "
-                        f"t_opt={optimizer_time - loss_time:.3f}s "
-                        f"t_total={optimizer_time - step_start_time:.3f}s",
-                        flush=True,
+                for name, value_tensor in metrics.items():
+                    accumulated_metrics[name] = accumulated_metrics.get(name, 0.0) + float(
+                        value_tensor.detach().item()
                     )
-                should_run_eval = (
-                    eval_cases is not None
-                    and (
-                        (step + 1) % train_config.eval_every_steps == 0
-                        or step == train_config.num_steps - 1
-                    )
-                )
-                if should_run_eval:
-                    eval_losses, eval_metrics = _evaluate_rl_batches(
-                        model=model,
-                        optimized_cases=eval_cases,
-                        train_config=train_config,
-                        position_mean=global_position_mean.to(device),
-                        position_std=global_position_std.to(device),
-                        adjacency_mean=global_adjacency_mean.to(device),
-                        adjacency_std=global_adjacency_std.to(device),
-                        seed=train_config.seed + 100_000 + step,
-                    )
-                    for name, value in eval_losses.items():
-                        history.setdefault(f"eval_{name}", []).append(value)
-                        writer.add_scalar(f"eval/loss/{name}", value, step)
-                    for name, value in eval_metrics.items():
-                        history.setdefault(f"eval_metric_{name}", []).append(value)
-                        writer.add_scalar(f"eval/metrics/{name}", value, step)
-                    print(
-                        f"rl eval step={step + 1}/{train_config.num_steps} "
-                        f"eval_cases={eval_case_count} "
-                        f"loss_total={eval_losses['total_loss']:.6f} "
-                        f"metric_stiffness={eval_metrics['stiffness_error']:.6f} "
-                        f"reward={eval_metrics['reward']:.6f}",
-                        flush=True,
-                    )
-                step += 1
+
+                if accumulation_counter >= train_config.gradient_accumulation_steps:
+                    finalize_accumulation()
                 if step >= train_config.num_steps:
                     break
+            finalize_accumulation()
 
         torch.save(
             {

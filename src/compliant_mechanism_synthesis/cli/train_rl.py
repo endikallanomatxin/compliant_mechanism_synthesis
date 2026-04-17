@@ -18,6 +18,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-path", required=True)
     parser.add_argument("--device", default=defaults.device)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=defaults.gradient_accumulation_steps,
+    )
     parser.add_argument("--log-every-steps", type=int, default=defaults.log_every_steps)
     parser.add_argument(
         "--eval-every-steps", type=int, default=defaults.eval_every_steps
@@ -48,6 +53,7 @@ def train_rl_main(argv: list[str] | None = None) -> None:
             dataset_path=args.dataset_path,
             device=args.device,
             batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
             log_every_steps=args.log_every_steps,
             eval_every_steps=args.eval_every_steps,
             num_steps=args.num_steps,

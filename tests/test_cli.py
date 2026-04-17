@@ -419,6 +419,8 @@ def test_train_rl_main_writes_checkpoint_and_supports_warm_start(
             "cpu",
             "--batch-size",
             "2",
+            "--gradient-accumulation-steps",
+            "2",
             "--num-steps",
             "2",
             "--rollout-steps",
@@ -434,6 +436,7 @@ def test_train_rl_main_writes_checkpoint_and_supports_warm_start(
 
     checkpoint = torch.load(rl_checkpoint_path, map_location="cpu")
     assert rl_checkpoint_path.exists()
+    assert checkpoint["train_config"]["gradient_accumulation_steps"] == 2
     assert checkpoint["train_config"]["init_checkpoint_path"] == str(
         supervised_checkpoint_path
     )
