@@ -45,15 +45,15 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class RLTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 88
+    batch_size: int = 64
     gradient_accumulation_steps: int = 4
     log_every_steps: int = 10
     max_grad_norm: float = 1.0
     num_steps: int = 50_000
     rollout_steps: int = 4
-    learning_rate: float = 1e-5
-    warmup_steps: int = 500
-    min_learning_rate: float = 1e-6
+    learning_rate: float = 5e-6
+    warmup_steps: int = 1000
+    min_learning_rate: float = 1e-8
     loss_scale: float = 1e-8
     use_style_token: bool = True
     style_token_count: int = 1
@@ -354,6 +354,7 @@ def train_rl_refiner(
         accumulation_loss_time = 0.0
         accumulated_loss_terms: dict[str, float] = {}
         accumulated_metrics: dict[str, float] = {}
+        nonfinite_loss_skips = 0
         optimizer.zero_grad(set_to_none=True)
 
         def finalize_accumulation() -> None:
@@ -369,6 +370,7 @@ def train_rl_refiner(
             nonlocal accumulated_loss_terms
             nonlocal accumulated_metrics
             nonlocal examples_seen
+            nonlocal nonfinite_loss_skips
             if accumulation_counter == 0 or step >= train_config.num_steps:
                 return
 
@@ -420,6 +422,11 @@ def train_rl_refiner(
                 float(skipped_update),
                 step,
             )
+            writer.add_scalar(
+                "train/gradients/nonfinite_loss_skips",
+                float(nonfinite_loss_skips),
+                step,
+            )
 
             examples_seen += accumulation_examples
             if (
@@ -448,6 +455,7 @@ def train_rl_refiner(
                     f"reward={averaged_metrics['reward']:.6f} "
                     f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
                     f"skipped_update={'yes' if skipped_update else 'no'} "
+                    f"nonfinite_loss_skips={nonfinite_loss_skips} "
                     f"clip_ratio={clip_ratio:.3f} "
                     f"t_transfer={accumulation_transfer_time:.3f}s "
                     f"t_batch={accumulation_batch_time:.3f}s "
@@ -469,6 +477,7 @@ def train_rl_refiner(
             accumulation_loss_time = 0.0
             accumulated_loss_terms = {}
             accumulated_metrics = {}
+            nonfinite_loss_skips = 0
 
         while step < train_config.num_steps:
             for batch_cases in iter_supervised_batches(
@@ -530,7 +539,7 @@ def train_rl_refiner(
                     accumulation_loss_time = 0.0
                     accumulated_loss_terms = {}
                     accumulated_metrics = {}
-                    step += 1
+                    nonfinite_loss_skips += 1
                     continue
                 scaled_total_loss = total_loss * train_config.loss_scale
                 (

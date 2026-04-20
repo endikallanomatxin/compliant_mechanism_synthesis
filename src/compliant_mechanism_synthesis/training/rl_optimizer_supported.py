@@ -53,9 +53,9 @@ class ExploreOptimizeTrainingConfig:
     max_grad_norm: float = 1.0
     num_steps: int = 50_000
     explore_steps: int = 2
-    optimize_steps: int = 3
-    optimize_learning_rate: float = 1e-4
-    learning_rate: float = 1e-5
+    optimize_steps: int = 2
+    optimize_learning_rate: float = 1e-7
+    learning_rate: float = 2e-6
     warmup_steps: int = 500
     min_learning_rate: float = 1e-6
     loss_scale: float = 1e-9
@@ -436,6 +436,7 @@ def train_explore_optimize_refiner(
         accumulation_loss_time = 0.0
         accumulated_loss_terms: dict[str, float] = {}
         accumulated_metrics: dict[str, float] = {}
+        nonfinite_loss_skips = 0
         optimizer.zero_grad(set_to_none=True)
 
         def finalize_accumulation() -> None:
@@ -444,6 +445,7 @@ def train_explore_optimize_refiner(
             nonlocal accumulation_transfer_time, accumulation_batch_time
             nonlocal accumulation_rollout_time, accumulation_loss_time
             nonlocal accumulated_loss_terms, accumulated_metrics, examples_seen
+            nonlocal nonfinite_loss_skips
             if accumulation_counter == 0 or step >= train_config.num_steps:
                 return
             raw_grad_norm = float(
@@ -491,6 +493,11 @@ def train_explore_optimize_refiner(
             writer.add_scalar(
                 "train/gradients/skipped_update", float(skipped_update), step
             )
+            writer.add_scalar(
+                "train/gradients/nonfinite_loss_skips",
+                float(nonfinite_loss_skips),
+                step,
+            )
             examples_seen += accumulation_examples
             if (
                 step % train_config.log_every_steps == 0
@@ -520,6 +527,7 @@ def train_explore_optimize_refiner(
                     f"reward={averaged_metrics['reward']:.6f} "
                     f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
                     f"skipped_update={'yes' if skipped_update else 'no'} "
+                    f"nonfinite_loss_skips={nonfinite_loss_skips} "
                     f"clip_ratio={clip_ratio:.3f} "
                     f"t_transfer={accumulation_transfer_time:.3f}s "
                     f"t_batch={accumulation_batch_time:.3f}s "
@@ -540,6 +548,7 @@ def train_explore_optimize_refiner(
             accumulation_loss_time = 0.0
             accumulated_loss_terms = {}
             accumulated_metrics = {}
+            nonfinite_loss_skips = 0
 
         while step < train_config.num_steps:
             for batch_cases in iter_supervised_batches(
@@ -606,7 +615,7 @@ def train_explore_optimize_refiner(
                     accumulation_loss_time = 0.0
                     accumulated_loss_terms = {}
                     accumulated_metrics = {}
-                    step += 1
+                    nonfinite_loss_skips += 1
                     continue
                 scaled_total_loss = total_loss * train_config.loss_scale
                 (
