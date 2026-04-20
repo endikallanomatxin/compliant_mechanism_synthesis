@@ -28,6 +28,9 @@ from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
 )
+from compliant_mechanism_synthesis.models.refiner import (
+    load_refiner_state_dict_compatible,
+)
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.tensor_ops import enforce_role_adjacency_constraints
 from compliant_mechanism_synthesis.training.supervised import (
@@ -108,7 +111,7 @@ def _load_initial_model(
     if model_config is None:
         effective_config = SupervisedRefinerConfig(**checkpoint["model_config"])
         model = SupervisedRefiner(effective_config).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_refiner_state_dict_compatible(model, checkpoint["model_state_dict"])
     return model, effective_config
 
 

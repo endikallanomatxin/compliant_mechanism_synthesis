@@ -54,6 +54,7 @@ class SupervisedTrainingConfig:
     eval_fraction: float = 0.02
     use_style_token: bool = True
     style_token_count: int = 1
+    style_condition_dropout: float = 0.1
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.5
     stiffness_loss_weight: float = 0.0
@@ -805,6 +806,8 @@ def train_supervised_refiner(
         raise ValueError("style_kl_anneal_steps must be non-negative")
     if train_config.style_token_count <= 0:
         raise ValueError("style_token_count must be positive")
+    if not 0.0 <= train_config.style_condition_dropout <= 1.0:
+        raise ValueError("style_condition_dropout must be in [0.0, 1.0]")
     if not 0.0 <= train_config.eval_fraction < 1.0:
         raise ValueError("eval_fraction must be in [0.0, 1.0)")
 
@@ -845,6 +848,7 @@ def train_supervised_refiner(
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"use_style_token={'yes' if model.config.use_style_token else 'no'} "
         f"style_token_count={model.config.style_token_count} "
+        f"style_condition_dropout={train_config.style_condition_dropout:.3f} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
         f"min_learning_rate={train_config.min_learning_rate} "
         f"style_kl_loss_weight={train_config.style_kl_loss_weight} "
@@ -881,6 +885,9 @@ def train_supervised_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 batch_build_time = time.perf_counter()
+                use_style_condition = model.config.use_style_token and (
+                    random.random() >= train_config.style_condition_dropout
+                )
                 prediction = model.predict_flow(
                     structures=batch.flow_structures,
                     target_stiffness=batch.target_stiffness,
@@ -889,12 +896,10 @@ def train_supervised_refiner(
                     edge_von_mises=batch.current_analyses.edge_von_mises,
                     flow_times=batch.flow_times,
                     style_structures=(
-                        batch.oracle_structures
-                        if model.config.use_style_token
-                        else None
+                        batch.oracle_structures if use_style_condition else None
                     ),
                     style_analyses=(
-                        batch.oracle_analyses if model.config.use_style_token else None
+                        batch.oracle_analyses if use_style_condition else None
                     ),
                 )
                 _synchronize_device_if_needed(device)
@@ -935,6 +940,11 @@ def train_supervised_refiner(
                 writer.add_scalar(
                     "train/parameters/flow_time_mean",
                     float(batch.flow_times.mean().item()),
+                    step,
+                )
+                writer.add_scalar(
+                    "train/parameters/style_condition_available",
+                    float(use_style_condition),
                     step,
                 )
                 writer.add_scalar("train/parameters/learning_rate", learning_rate, step)

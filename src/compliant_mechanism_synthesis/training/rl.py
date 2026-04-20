@@ -23,6 +23,9 @@ from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
 )
+from compliant_mechanism_synthesis.models.refiner import (
+    load_refiner_state_dict_compatible,
+)
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.tensor_ops import (
     enforce_role_adjacency_constraints,
@@ -50,8 +53,8 @@ class RLTrainingConfig:
     log_every_steps: int = 10
     max_grad_norm: float = 1.0
     num_steps: int = 50_000
-    rollout_steps: int = 4
-    learning_rate: float = 5e-6
+    rollout_steps: int = 2
+    learning_rate: float = 1e-5
     warmup_steps: int = 1000
     min_learning_rate: float = 1e-8
     loss_scale: float = 1e-8
@@ -242,7 +245,7 @@ def _load_initial_model(
     if model_config is None:
         effective_config = SupervisedRefinerConfig(**checkpoint["model_config"])
         model = SupervisedRefiner(effective_config).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_refiner_state_dict_compatible(model, checkpoint["model_state_dict"])
     return model, effective_config
 
 

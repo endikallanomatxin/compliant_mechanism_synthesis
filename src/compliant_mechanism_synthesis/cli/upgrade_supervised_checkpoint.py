@@ -7,7 +7,13 @@ from pathlib import Path
 
 import torch
 
-from compliant_mechanism_synthesis.models import SupervisedRefiner, SupervisedRefinerConfig
+from compliant_mechanism_synthesis.models import (
+    SupervisedRefiner,
+    SupervisedRefinerConfig,
+)
+from compliant_mechanism_synthesis.models.refiner import (
+    load_refiner_state_dict_compatible,
+)
 from compliant_mechanism_synthesis.training import SupervisedTrainingConfig
 
 
@@ -43,20 +49,7 @@ def upgrade_supervised_checkpoint(checkpoint_path: str | Path) -> tuple[Path, Pa
     train_config = _merge_train_config(checkpoint["train_config"])
 
     model = SupervisedRefiner(SupervisedRefinerConfig(**model_config))
-    load_result = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-    missing_keys = set(load_result.missing_keys)
-    unexpected_keys = set(load_result.unexpected_keys)
-    allowed_missing = (
-        {"style_token_encoder.token_seed"} if model.config.use_style_token else set()
-    )
-    if missing_keys - allowed_missing:
-        raise RuntimeError(
-            f"checkpoint is missing unsupported parameters: {sorted(missing_keys)}"
-        )
-    if unexpected_keys:
-        raise RuntimeError(
-            f"checkpoint contains unexpected parameters: {sorted(unexpected_keys)}"
-        )
+    load_refiner_state_dict_compatible(model, checkpoint["model_state_dict"])
 
     shutil.copy2(resolved_path, backup_path)
     upgraded_checkpoint = dict(checkpoint)

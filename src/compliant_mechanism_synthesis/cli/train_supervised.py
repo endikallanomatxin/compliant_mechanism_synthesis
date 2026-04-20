@@ -31,6 +31,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--eval-fraction", type=float, default=defaults.eval_fraction)
     parser.add_argument(
+        "--style-condition-dropout",
+        type=float,
+        default=defaults.style_condition_dropout,
+    )
+    parser.add_argument(
         "--no-style-token",
         dest="use_style_token",
         action="store_false",
@@ -59,6 +64,7 @@ def train_supervised_main(argv: list[str] | None = None) -> None:
             min_learning_rate=args.min_learning_rate,
             eval_fraction=args.eval_fraction,
             use_style_token=args.use_style_token,
+            style_condition_dropout=args.style_condition_dropout,
             checkpoint_path=args.checkpoint_path,
             logdir=str(logdir_path),
         )

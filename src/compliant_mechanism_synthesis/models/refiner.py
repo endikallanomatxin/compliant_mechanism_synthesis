@@ -42,6 +42,9 @@ class FlowPrediction:
     adjacency_velocity: torch.Tensor
     predicted_adjacency: torch.Tensor
     connectivity_latents: torch.Tensor
+    style_context: torch.Tensor | None = None
+    style_residual: torch.Tensor | None = None
+    style_available: torch.Tensor | None = None
     style_mean: torch.Tensor | None = None
     style_logvar: torch.Tensor | None = None
     style_kl: torch.Tensor | None = None
@@ -614,6 +617,33 @@ class StyleTokenEncoder(nn.Module):
         return StyleTokenDistribution(token=token, mean=mean, logvar=logvar, kl=kl)
 
 
+def load_refiner_state_dict_compatible(
+    model: "SupervisedRefiner",
+    state_dict: dict[str, torch.Tensor],
+) -> None:
+    load_result = model.load_state_dict(state_dict, strict=False)
+    missing_keys = set(load_result.missing_keys)
+    unexpected_keys = set(load_result.unexpected_keys)
+    allowed_missing: set[str] = set()
+    allowed_unexpected: set[str] = set()
+    if model.config.use_style_token:
+        allowed_missing.update(
+            {
+                "style_token_encoder.token_seed",
+                "style_base_token",
+                "style_availability_embedding.weight",
+            }
+        )
+    if missing_keys - allowed_missing:
+        raise RuntimeError(
+            f"checkpoint is missing unsupported parameters: {sorted(missing_keys)}"
+        )
+    if unexpected_keys - allowed_unexpected:
+        raise RuntimeError(
+            f"checkpoint contains unexpected parameters: {sorted(unexpected_keys)}"
+        )
+
+
 class SupervisedRefiner(nn.Module):
     def __init__(self, config: SupervisedRefinerConfig | None = None) -> None:
         super().__init__()
@@ -673,6 +703,18 @@ class SupervisedRefiner(nn.Module):
             if self.config.use_style_token
             else None
         )
+        self.style_base_token = (
+            nn.Parameter(
+                torch.zeros(1, self.config.style_token_count, self.config.hidden_dim)
+            )
+            if self.config.use_style_token
+            else None
+        )
+        self.style_availability_embedding = (
+            nn.Embedding(2, self.config.hidden_dim)
+            if self.config.use_style_token
+            else None
+        )
         self.input_norm = nn.LayerNorm(self.config.hidden_dim)
         self.layers = nn.ModuleList(
             [
@@ -712,8 +754,82 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.pair_edge_hidden_dim, 1),
         )
+        if self.style_base_token is not None:
+            nn.init.normal_(self.style_base_token, mean=0.0, std=0.02)
+        if self.style_availability_embedding is not None:
+            nn.init.normal_(
+                self.style_availability_embedding.weight, mean=0.0, std=0.02
+            )
         nn.init.normal_(self.position_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.position_head[-1].bias)
+
+    def _style_conditioning(
+        self,
+        *,
+        structures: Structures,
+        target_stiffness: torch.Tensor,
+        style_structures: Structures | None,
+        style_analyses: Analyses | None,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        if not self.config.use_style_token:
+            return None, None, None, None, None, None
+        if self.style_base_token is None or self.style_availability_embedding is None:
+            raise RuntimeError("style conditioning parameters are not initialized")
+
+        batch_size = structures.batch_size
+        style_context = self.style_base_token.expand(batch_size, -1, -1)
+        availability_index = torch.zeros(
+            batch_size,
+            dtype=torch.long,
+            device=structures.positions.device,
+        )
+        if style_structures is not None:
+            availability_index.fill_(1)
+        availability_embedding = self.style_availability_embedding(availability_index)
+        availability_context = availability_embedding[:, None, :].expand(
+            -1,
+            self.config.style_token_count,
+            -1,
+        )
+        style_available = availability_index.to(dtype=structures.positions.dtype)[
+            :, None, None
+        ]
+        style_available = style_available.expand(-1, self.config.style_token_count, 1)
+        style_context = style_context + availability_context
+        style_residual = style_context.new_zeros(style_context.shape)
+        style_mean = style_context.new_zeros(style_context.shape)
+        style_logvar = style_context.new_zeros(style_context.shape)
+        style_kl = style_context.new_zeros((batch_size,))
+        if style_structures is not None:
+            if self.style_token_encoder is None:
+                raise RuntimeError("style token encoder is not initialized")
+            if style_analyses is None:
+                raise RuntimeError("style analyses are required for style conditioning")
+            style_distribution = self.style_token_encoder(
+                structures=style_structures,
+                analyses=style_analyses,
+                target_stiffness=target_stiffness,
+            )
+            style_residual = style_distribution.token
+            style_mean = style_distribution.mean
+            style_logvar = style_distribution.logvar
+            style_kl = style_distribution.kl
+            style_context = style_context + style_available * style_residual
+        return (
+            style_context,
+            style_residual,
+            style_available,
+            style_mean,
+            style_logvar,
+            style_kl,
+        )
 
     def predict_flow(
         self,
@@ -754,6 +870,12 @@ class SupervisedRefiner(nn.Module):
             and style_analyses is None
         ):
             raise ValueError("style_analyses must be provided with style_structures")
+        if (
+            self.config.use_style_token
+            and style_structures is None
+            and style_analyses is not None
+        ):
+            raise ValueError("style_structures must be provided with style_analyses")
         if (
             self.config.use_style_token
             and style_structures is not None
@@ -815,24 +937,19 @@ class SupervisedRefiner(nn.Module):
                 :, None, :
             ]
         )
-        style_context = None
-        style_mean = None
-        style_logvar = None
-        style_kl = None
-        if self.config.use_style_token and style_structures is not None:
-            if self.style_token_encoder is None:
-                raise RuntimeError("style token encoder is not initialized")
-            if style_analyses is None:
-                raise RuntimeError("style analyses are required for style conditioning")
-            style_distribution = self.style_token_encoder(
-                structures=style_structures,
-                analyses=style_analyses,
-                target_stiffness=target_stiffness,
-            )
-            style_context = style_distribution.token
-            style_mean = style_distribution.mean
-            style_logvar = style_distribution.logvar
-            style_kl = style_distribution.kl
+        (
+            style_context,
+            style_residual,
+            style_available,
+            style_mean,
+            style_logvar,
+            style_kl,
+        ) = self._style_conditioning(
+            structures=structures,
+            target_stiffness=target_stiffness,
+            style_structures=style_structures,
+            style_analyses=style_analyses,
+        )
 
         for layer in self.layers:
             hidden = layer(
@@ -877,6 +994,9 @@ class SupervisedRefiner(nn.Module):
             adjacency_velocity=adjacency_velocity,
             predicted_adjacency=predicted_adjacency,
             connectivity_latents=connectivity_latents,
+            style_context=style_context,
+            style_residual=style_residual,
+            style_available=style_available,
             style_mean=style_mean,
             style_logvar=style_logvar,
             style_kl=style_kl,
@@ -905,6 +1025,12 @@ class SupervisedRefiner(nn.Module):
             and style_analyses is None
         ):
             style_analyses = analysis_fn(style_structures)
+        if (
+            self.config.use_style_token
+            and style_structures is None
+            and style_analyses is not None
+        ):
+            raise ValueError("style_structures must be provided with style_analyses")
         if (
             self.config.use_style_token
             and style_structures is not None

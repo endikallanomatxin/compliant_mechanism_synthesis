@@ -77,6 +77,27 @@ def test_supervised_refiner_preserves_structure_shapes(tmp_path: Path) -> None:
     assert prediction.adjacency.shape == cases.optimized_structures.adjacency.shape
 
 
+def test_supervised_refiner_forward_supports_missing_style(tmp_path: Path) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        )
+    )
+    prediction = model(
+        cases.optimized_structures,
+        cases.target_stiffness,
+        analysis_fn=analyze_structures,
+        num_steps=2,
+    )
+
+    assert prediction.positions.shape == cases.optimized_structures.positions.shape
+    assert prediction.adjacency.shape == cases.optimized_structures.adjacency.shape
+
+
 def test_scheduled_learning_rate_warms_up_then_cosine_decays() -> None:
     config = SupervisedTrainingConfig(
         dataset_path="dataset.pt",
@@ -169,6 +190,39 @@ def test_train_supervised_refiner_writes_checkpoint_and_reduces_training_loss(
     first_window = sum(summary.history["total_loss"][:4]) / 4.0
     best_observed = min(summary.history["total_loss"])
     assert best_observed <= first_window
+
+
+def test_train_supervised_refiner_supports_style_condition_dropout(
+    tmp_path: Path,
+) -> None:
+    cases = _build_cases(tmp_path)
+    _, summary = train_supervised_refiner(
+        optimized_cases=cases,
+        model_config=SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        ),
+        train_config=SupervisedTrainingConfig(
+            dataset_path=str(tmp_path / "dataset.pt"),
+            device="cpu",
+            batch_size=2,
+            num_steps=4,
+            eval_every_steps=2,
+            eval_fraction=0.25,
+            style_condition_dropout=1.0,
+            checkpoint_path=str(tmp_path / "refiner_dropout.pt"),
+            logdir=str(tmp_path / "runs_dropout"),
+            seed=31,
+        ),
+    )
+
+    assert summary.checkpoint_path.exists()
+    assert all(
+        value == pytest.approx(0.0)
+        for value in summary.history["style_kl_loss_contribution"]
+    )
 
 
 def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) -> None:
@@ -270,9 +324,68 @@ def test_predict_flow_ignores_style_inputs_when_style_token_disabled(
 
     assert prediction.position_velocity.shape == batch.target_position_velocity.shape
     assert prediction.adjacency_velocity.shape == batch.target_adjacency_velocity.shape
+    assert prediction.style_context is None
+    assert prediction.style_residual is None
+    assert prediction.style_available is None
     assert prediction.style_mean is None
     assert prediction.style_logvar is None
     assert prediction.style_kl is None
+
+
+def test_predict_flow_without_style_uses_base_context_and_zero_kl(
+    tmp_path: Path,
+) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        seed=14,
+    )
+
+    prediction = model.predict_flow(
+        structures=batch.flow_structures,
+        target_stiffness=batch.target_stiffness,
+        current_stiffness=batch.current_analyses.generalized_stiffness,
+        nodal_displacements=batch.current_analyses.nodal_displacements,
+        edge_von_mises=batch.current_analyses.edge_von_mises,
+        flow_times=batch.flow_times,
+    )
+
+    assert prediction.style_context is not None
+    assert prediction.style_residual is not None
+    assert prediction.style_available is not None
+    assert prediction.style_mean is not None
+    assert prediction.style_logvar is not None
+    assert prediction.style_kl is not None
+    assert prediction.style_context.shape == (
+        cases.optimized_structures.batch_size,
+        1,
+        64,
+    )
+    assert prediction.style_residual.shape == prediction.style_context.shape
+    assert prediction.style_available.shape == (
+        cases.optimized_structures.batch_size,
+        1,
+        1,
+    )
+    assert torch.all(prediction.style_available == 0.0)
+    assert torch.allclose(
+        prediction.style_residual,
+        torch.zeros_like(prediction.style_residual),
+    )
+    assert torch.allclose(prediction.style_kl, torch.zeros_like(prediction.style_kl))
+    assert torch.isfinite(prediction.style_context).all()
+    assert not torch.allclose(
+        prediction.style_context,
+        torch.zeros_like(prediction.style_context),
+    )
 
 
 def test_predict_flow_returns_variational_style_statistics(tmp_path: Path) -> None:
@@ -304,9 +417,20 @@ def test_predict_flow_returns_variational_style_statistics(tmp_path: Path) -> No
     assert prediction.style_mean is not None
     assert prediction.style_logvar is not None
     assert prediction.style_kl is not None
+    assert prediction.style_context is not None
+    assert prediction.style_residual is not None
+    assert prediction.style_available is not None
     assert prediction.style_mean.shape == (cases.optimized_structures.batch_size, 1, 64)
     assert prediction.style_logvar.shape == prediction.style_mean.shape
     assert prediction.style_kl.shape == (cases.optimized_structures.batch_size,)
+    assert prediction.style_context.shape == prediction.style_mean.shape
+    assert prediction.style_residual.shape == prediction.style_mean.shape
+    assert prediction.style_available.shape == (
+        cases.optimized_structures.batch_size,
+        1,
+        1,
+    )
+    assert torch.all(prediction.style_available == 1.0)
     assert torch.isfinite(prediction.style_mean).all()
     assert torch.isfinite(prediction.style_logvar).all()
     assert torch.isfinite(prediction.style_kl).all()
@@ -342,8 +466,10 @@ def test_predict_flow_uses_configured_style_token_count(tmp_path: Path) -> None:
 
     assert prediction.style_mean is not None
     assert prediction.style_logvar is not None
+    assert prediction.style_context is not None
     assert prediction.style_mean.shape == (cases.optimized_structures.batch_size, 3, 64)
     assert prediction.style_logvar.shape == prediction.style_mean.shape
+    assert prediction.style_context.shape == prediction.style_mean.shape
 
 
 def test_predict_flow_stabilizes_large_mechanics_inputs(tmp_path: Path) -> None:
@@ -440,4 +566,33 @@ def test_predict_flow_requires_style_analyses_with_style_structures(
             edge_von_mises=batch.current_analyses.edge_von_mises,
             flow_times=batch.flow_times,
             style_structures=batch.oracle_structures,
+        )
+
+
+def test_predict_flow_requires_style_structures_with_style_analyses(
+    tmp_path: Path,
+) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        seed=21,
+    )
+
+    with pytest.raises(ValueError, match="style_structures"):
+        model.predict_flow(
+            structures=batch.flow_structures,
+            target_stiffness=batch.target_stiffness,
+            current_stiffness=batch.current_analyses.generalized_stiffness,
+            nodal_displacements=batch.current_analyses.nodal_displacements,
+            edge_von_mises=batch.current_analyses.edge_von_mises,
+            flow_times=batch.flow_times,
+            style_analyses=batch.oracle_analyses,
         )
