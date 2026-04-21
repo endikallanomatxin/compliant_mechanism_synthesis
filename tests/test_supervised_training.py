@@ -437,6 +437,56 @@ def test_predict_flow_returns_variational_style_statistics(tmp_path: Path) -> No
     assert (prediction.style_kl >= 0.0).all()
 
 
+def test_predict_flow_supports_mixed_style_availability_within_batch(
+    tmp_path: Path,
+) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        seed=16,
+    )
+    style_available_mask = torch.zeros(
+        batch.flow_structures.batch_size,
+        dtype=torch.long,
+    )
+    style_available_mask[0] = 1
+
+    prediction = model.predict_flow(
+        structures=batch.flow_structures,
+        target_stiffness=batch.target_stiffness,
+        current_stiffness=batch.current_analyses.generalized_stiffness,
+        nodal_displacements=batch.current_analyses.nodal_displacements,
+        edge_von_mises=batch.current_analyses.edge_von_mises,
+        flow_times=batch.flow_times,
+        style_structures=batch.oracle_structures,
+        style_analyses=batch.oracle_analyses,
+        style_available_mask=style_available_mask,
+    )
+
+    assert prediction.style_available is not None
+    assert torch.equal(
+        prediction.style_available[:, 0, 0].to(dtype=torch.long),
+        style_available_mask,
+    )
+    assert prediction.style_residual is not None
+    assert prediction.style_kl is not None
+    assert torch.allclose(
+        prediction.style_residual[1],
+        torch.zeros_like(prediction.style_residual[1]),
+    )
+    assert float(prediction.style_kl[1].detach().item()) == pytest.approx(0.0)
+    assert torch.isfinite(prediction.style_residual[0]).all()
+    assert prediction.style_kl[0] >= 0.0
+
+
 def test_predict_flow_uses_configured_style_token_count(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
     model = SupervisedRefiner(
@@ -595,4 +645,33 @@ def test_predict_flow_requires_style_structures_with_style_analyses(
             edge_von_mises=batch.current_analyses.edge_von_mises,
             flow_times=batch.flow_times,
             style_analyses=batch.oracle_analyses,
+        )
+
+
+def test_predict_flow_requires_style_inputs_when_mask_enables_style(
+    tmp_path: Path,
+) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        )
+    )
+    batch = make_supervised_batch(
+        optimized_cases=cases,
+        seed=25,
+    )
+
+    with pytest.raises(ValueError, match="style_structures"):
+        model.predict_flow(
+            structures=batch.flow_structures,
+            target_stiffness=batch.target_stiffness,
+            current_stiffness=batch.current_analyses.generalized_stiffness,
+            nodal_displacements=batch.current_analyses.nodal_displacements,
+            edge_von_mises=batch.current_analyses.edge_von_mises,
+            flow_times=batch.flow_times,
+            style_available_mask=torch.ones(batch.flow_structures.batch_size),
         )

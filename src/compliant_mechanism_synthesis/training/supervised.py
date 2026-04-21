@@ -885,9 +885,15 @@ def train_supervised_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 batch_build_time = time.perf_counter()
-                use_style_condition = model.config.use_style_token and (
-                    random.random() >= train_config.style_condition_dropout
-                )
+                style_available_mask = None
+                if model.config.use_style_token:
+                    style_available_mask = (
+                        torch.rand(
+                            batch.flow_structures.batch_size,
+                            device=device,
+                        )
+                        >= train_config.style_condition_dropout
+                    )
                 prediction = model.predict_flow(
                     structures=batch.flow_structures,
                     target_stiffness=batch.target_stiffness,
@@ -896,11 +902,14 @@ def train_supervised_refiner(
                     edge_von_mises=batch.current_analyses.edge_von_mises,
                     flow_times=batch.flow_times,
                     style_structures=(
-                        batch.oracle_structures if use_style_condition else None
+                        batch.oracle_structures
+                        if model.config.use_style_token
+                        else None
                     ),
                     style_analyses=(
-                        batch.oracle_analyses if use_style_condition else None
+                        batch.oracle_analyses if model.config.use_style_token else None
                     ),
+                    style_available_mask=style_available_mask,
                 )
                 _synchronize_device_if_needed(device)
                 forward_time = time.perf_counter()
@@ -944,7 +953,11 @@ def train_supervised_refiner(
                 )
                 writer.add_scalar(
                     "train/parameters/style_condition_available",
-                    float(use_style_condition),
+                    (
+                        0.0
+                        if style_available_mask is None
+                        else float(style_available_mask.float().mean().item())
+                    ),
                     step,
                 )
                 writer.add_scalar("train/parameters/learning_rate", learning_rate, step)

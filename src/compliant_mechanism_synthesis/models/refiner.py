@@ -770,6 +770,7 @@ class SupervisedRefiner(nn.Module):
         target_stiffness: torch.Tensor,
         style_structures: Structures | None,
         style_analyses: Analyses | None,
+        style_available_mask: torch.Tensor | None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -785,13 +786,19 @@ class SupervisedRefiner(nn.Module):
 
         batch_size = structures.batch_size
         style_context = self.style_base_token.expand(batch_size, -1, -1)
-        availability_index = torch.zeros(
-            batch_size,
-            dtype=torch.long,
-            device=structures.positions.device,
-        )
-        if style_structures is not None:
-            availability_index.fill_(1)
+        if style_available_mask is None:
+            availability_index = torch.zeros(
+                batch_size,
+                dtype=torch.long,
+                device=structures.positions.device,
+            )
+            if style_structures is not None:
+                availability_index.fill_(1)
+        else:
+            availability_index = style_available_mask.to(
+                device=structures.positions.device,
+                dtype=torch.long,
+            )
         availability_embedding = self.style_availability_embedding(availability_index)
         availability_context = availability_embedding[:, None, :].expand(
             -1,
@@ -817,10 +824,10 @@ class SupervisedRefiner(nn.Module):
                 analyses=style_analyses,
                 target_stiffness=target_stiffness,
             )
-            style_residual = style_distribution.token
-            style_mean = style_distribution.mean
-            style_logvar = style_distribution.logvar
-            style_kl = style_distribution.kl
+            style_residual = style_distribution.token * style_available
+            style_mean = style_distribution.mean * style_available
+            style_logvar = style_distribution.logvar * style_available
+            style_kl = style_distribution.kl * style_available[:, 0, 0]
             style_context = style_context + style_available * style_residual
         return (
             style_context,
@@ -841,6 +848,7 @@ class SupervisedRefiner(nn.Module):
         flow_times: torch.Tensor,
         style_structures: Structures | None = None,
         style_analyses: Analyses | None = None,
+        style_available_mask: torch.Tensor | None = None,
     ) -> FlowPrediction:
         structures.validate()
         if self.config.use_style_token and style_structures is not None:
@@ -895,6 +903,24 @@ class SupervisedRefiner(nn.Module):
             raise ValueError("style_structures must use the same node roles")
         if flow_times.shape != (structures.batch_size,):
             raise ValueError("flow_times must have shape [batch]")
+        if style_available_mask is not None and style_available_mask.shape != (
+            structures.batch_size,
+        ):
+            raise ValueError("style_available_mask must have shape [batch]")
+        if style_available_mask is not None:
+            if style_available_mask.dtype == torch.bool:
+                style_available_mask = style_available_mask.to(dtype=torch.long)
+            if not torch.all((style_available_mask == 0) | (style_available_mask == 1)):
+                raise ValueError("style_available_mask must contain only 0/1 values")
+        if (
+            self.config.use_style_token
+            and style_structures is None
+            and style_available_mask is not None
+            and bool(style_available_mask.any().item())
+        ):
+            raise ValueError(
+                "style_structures must be provided when style_available_mask enables style"
+            )
 
         positions = structures.positions
         roles = structures.roles
@@ -949,6 +975,7 @@ class SupervisedRefiner(nn.Module):
             target_stiffness=target_stiffness,
             style_structures=style_structures,
             style_analyses=style_analyses,
+            style_available_mask=style_available_mask,
         )
 
         for layer in self.layers:
