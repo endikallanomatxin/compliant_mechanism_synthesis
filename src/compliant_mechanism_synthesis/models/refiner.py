@@ -631,9 +631,9 @@ def load_refiner_state_dict_compatible(
             {
                 "style_token_encoder.token_seed",
                 "style_base_token",
-                "style_availability_embedding.weight",
             }
         )
+        allowed_unexpected.add("style_availability_embedding.weight")
     if missing_keys - allowed_missing:
         raise RuntimeError(
             f"checkpoint is missing unsupported parameters: {sorted(missing_keys)}"
@@ -710,11 +710,6 @@ class SupervisedRefiner(nn.Module):
             if self.config.use_style_token
             else None
         )
-        self.style_availability_embedding = (
-            nn.Embedding(2, self.config.hidden_dim)
-            if self.config.use_style_token
-            else None
-        )
         self.input_norm = nn.LayerNorm(self.config.hidden_dim)
         self.layers = nn.ModuleList(
             [
@@ -756,10 +751,6 @@ class SupervisedRefiner(nn.Module):
         )
         if self.style_base_token is not None:
             nn.init.normal_(self.style_base_token, mean=0.0, std=0.02)
-        if self.style_availability_embedding is not None:
-            nn.init.normal_(
-                self.style_availability_embedding.weight, mean=0.0, std=0.02
-            )
         nn.init.normal_(self.position_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.position_head[-1].bias)
 
@@ -781,7 +772,7 @@ class SupervisedRefiner(nn.Module):
     ]:
         if not self.config.use_style_token:
             return None, None, None, None, None, None
-        if self.style_base_token is None or self.style_availability_embedding is None:
+        if self.style_base_token is None:
             raise RuntimeError("style conditioning parameters are not initialized")
 
         batch_size = structures.batch_size
@@ -799,17 +790,10 @@ class SupervisedRefiner(nn.Module):
                 device=structures.positions.device,
                 dtype=torch.long,
             )
-        availability_embedding = self.style_availability_embedding(availability_index)
-        availability_context = availability_embedding[:, None, :].expand(
-            -1,
-            self.config.style_token_count,
-            -1,
-        )
         style_available = availability_index.to(dtype=structures.positions.dtype)[
             :, None, None
         ]
         style_available = style_available.expand(-1, self.config.style_token_count, 1)
-        style_context = style_context + availability_context
         style_residual = style_context.new_zeros(style_context.shape)
         style_mean = style_context.new_zeros(style_context.shape)
         style_logvar = style_context.new_zeros(style_context.shape)
