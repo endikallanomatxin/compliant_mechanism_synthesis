@@ -16,9 +16,6 @@ from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
 )
-from compliant_mechanism_synthesis.models.refiner import (
-    load_refiner_state_dict_compatible,
-)
 from compliant_mechanism_synthesis.roles import NodeRole, role_masks
 from compliant_mechanism_synthesis.tensor_ops import upper_triangle_edge_index
 from compliant_mechanism_synthesis.training import (
@@ -37,13 +34,8 @@ def load_supervised_refiner_checkpoint(
 ) -> SupervisedRefiner:
     resolved_device = resolve_torch_device(device)
     checkpoint = torch.load(checkpoint_path, map_location=resolved_device)
-    merged_model_config = checkpoint["model_config"].copy()
-    merged_model_config = {
-        **SupervisedRefinerConfig().__dict__,
-        **merged_model_config,
-    }
-    model = SupervisedRefiner(SupervisedRefinerConfig(**merged_model_config))
-    load_refiner_state_dict_compatible(model, checkpoint["model_state_dict"])
+    model = SupervisedRefiner(SupervisedRefinerConfig(**checkpoint["model_config"]))
+    model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(resolved_device)
     model.eval()
     return model

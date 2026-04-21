@@ -28,9 +28,6 @@ from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
 )
-from compliant_mechanism_synthesis.models.refiner import (
-    load_refiner_state_dict_compatible,
-)
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.tensor_ops import enforce_role_adjacency_constraints
 from compliant_mechanism_synthesis.training.supervised import (
@@ -63,7 +60,6 @@ class ExploreOptimizeTrainingConfig:
     min_learning_rate: float = 1e-6
     loss_scale: float = 1e-9
     use_style_token: bool = True
-    style_token_count: int = 1
     stiffness_loss_weight: float = 1.0
     stress_loss_weight: float = 0.1
     allowable_von_mises: float = 250e6
@@ -101,7 +97,6 @@ def _load_initial_model(
 ) -> tuple[SupervisedRefiner, SupervisedRefinerConfig]:
     effective_config = model_config or SupervisedRefinerConfig(
         use_style_token=train_config.use_style_token,
-        style_token_count=train_config.style_token_count,
     )
     model = SupervisedRefiner(effective_config).to(device)
     if train_config.init_checkpoint_path is None:
@@ -111,7 +106,7 @@ def _load_initial_model(
     if model_config is None:
         effective_config = SupervisedRefinerConfig(**checkpoint["model_config"])
         model = SupervisedRefiner(effective_config).to(device)
-    load_refiner_state_dict_compatible(model, checkpoint["model_state_dict"])
+    model.load_state_dict(checkpoint["model_state_dict"])
     return model, effective_config
 
 
@@ -367,8 +362,6 @@ def train_explore_optimize_refiner(
         raise ValueError("optimize_learning_rate must be positive")
     if train_config.loss_scale <= 0.0:
         raise ValueError("loss_scale must be positive")
-    if train_config.style_token_count <= 0:
-        raise ValueError("style_token_count must be positive")
     if train_config.stress_loss_weight < 0.0:
         raise ValueError("stress_loss_weight must be non-negative")
     if train_config.allowable_von_mises <= 0.0:
@@ -416,7 +409,7 @@ def train_explore_optimize_refiner(
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"init_checkpoint={train_config.init_checkpoint_path or 'none'} "
         f"use_style_token={'yes' if effective_model_config.use_style_token else 'no'} "
-        f"style_token_count={effective_model_config.style_token_count} "
+        f"style_local_latent_dim={effective_model_config.style_local_latent_dim} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
         f"min_learning_rate={train_config.min_learning_rate} "
         f"loss_scale={train_config.loss_scale:.3e} "

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import shutil
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -11,29 +10,12 @@ from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
 )
-from compliant_mechanism_synthesis.models.refiner import (
-    load_refiner_state_dict_compatible,
-)
-from compliant_mechanism_synthesis.training import SupervisedTrainingConfig
 
 
 def _backup_path(checkpoint_path: Path) -> Path:
     return checkpoint_path.with_name(
         f"{checkpoint_path.stem}-original{checkpoint_path.suffix}"
     )
-
-
-def _merge_model_config(existing: dict[str, object]) -> dict[str, object]:
-    merged = asdict(SupervisedRefinerConfig())
-    merged.update(existing)
-    return merged
-
-
-def _merge_train_config(existing: dict[str, object]) -> dict[str, object]:
-    dataset_path = str(existing.get("dataset_path", ""))
-    merged = asdict(SupervisedTrainingConfig(dataset_path=dataset_path))
-    merged.update(existing)
-    return merged
 
 
 def upgrade_supervised_checkpoint(checkpoint_path: str | Path) -> tuple[Path, Path]:
@@ -45,11 +27,11 @@ def upgrade_supervised_checkpoint(checkpoint_path: str | Path) -> tuple[Path, Pa
         raise FileExistsError(f"backup checkpoint already exists: {backup_path}")
 
     checkpoint = torch.load(resolved_path, map_location="cpu")
-    model_config = _merge_model_config(checkpoint["model_config"])
-    train_config = _merge_train_config(checkpoint["train_config"])
+    model_config = checkpoint["model_config"]
+    train_config = checkpoint["train_config"]
 
     model = SupervisedRefiner(SupervisedRefinerConfig(**model_config))
-    load_refiner_state_dict_compatible(model, checkpoint["model_state_dict"])
+    model.load_state_dict(checkpoint["model_state_dict"])
 
     shutil.copy2(resolved_path, backup_path)
     upgraded_checkpoint = dict(checkpoint)

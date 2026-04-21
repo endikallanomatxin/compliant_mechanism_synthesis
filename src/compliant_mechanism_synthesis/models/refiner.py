@@ -42,17 +42,19 @@ class FlowPrediction:
     adjacency_velocity: torch.Tensor
     predicted_adjacency: torch.Tensor
     connectivity_latents: torch.Tensor
-    style_context: torch.Tensor | None = None
+    style_latent: torch.Tensor | None = None
     style_residual: torch.Tensor | None = None
-    style_available: torch.Tensor | None = None
+    style_token_mask: torch.Tensor | None = None
     style_mean: torch.Tensor | None = None
     style_logvar: torch.Tensor | None = None
     style_kl: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
-class StyleTokenDistribution:
-    token: torch.Tensor
+class StyleLocalDistribution:
+    latent: torch.Tensor
+    residual: torch.Tensor
+    token_mask: torch.Tensor
     mean: torch.Tensor
     logvar: torch.Tensor
     kl: torch.Tensor
@@ -80,12 +82,12 @@ class SupervisedRefinerConfig:
     # Units
     max_distance: float = 0.24
     transition_width: float = 0.08
-    # Style token
+    # Local style VAE
     use_style_token: bool = True
-    style_token_count: int = 1
-    style_token_dropout: float = 0.1
-    style_token_logvar_min: float = -6.0
-    style_token_logvar_max: float = 2.0
+    style_local_latent_dim: int = 16
+    style_local_scale: float = 0.05
+    style_local_logvar_min: float = -6.0
+    style_local_logvar_max: float = 2.0
 
 
 class GraphAttentionBlock(nn.Module):
@@ -130,60 +132,11 @@ class GraphAttentionBlock(nn.Module):
             return None
         return distance_affinity(positions, length_scale=0.22)
 
-    def _extend_nodal_conditioning(
-        self,
-        conditioning: torch.Tensor,
-        context_tokens: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if context_tokens is None:
-            return conditioning
-        batch, num_nodes, _ = conditioning.shape
-        context_count = context_tokens.shape[1]
-        return torch.cat(
-            [
-                conditioning,
-                torch.zeros(
-                    batch,
-                    num_nodes,
-                    context_count,
-                    device=conditioning.device,
-                    dtype=conditioning.dtype,
-                ),
-            ],
-            dim=-1,
-        )
-
-    def _extend_edge_conditioning(
-        self,
-        edge_head_conditioning: torch.Tensor,
-        num_nodes: int,
-        context_tokens: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if context_tokens is None:
-            return edge_head_conditioning
-        batch, num_heads, _, _ = edge_head_conditioning.shape
-        context_count = context_tokens.shape[1]
-        return torch.cat(
-            [
-                edge_head_conditioning,
-                torch.zeros(
-                    batch,
-                    num_heads,
-                    num_nodes,
-                    context_count,
-                    device=edge_head_conditioning.device,
-                    dtype=edge_head_conditioning.dtype,
-                ),
-            ],
-            dim=-1,
-        )
-
     def _hybrid_attention(
         self,
         logits: torch.Tensor,
         adjacency: torch.Tensor,
         positions: torch.Tensor,
-        context_tokens: torch.Tensor | None,
         edge_head_conditioning: torch.Tensor | None,
     ) -> torch.Tensor:
         logits_bias = torch.zeros_like(logits)
@@ -191,25 +144,12 @@ class GraphAttentionBlock(nn.Module):
         for mode, head_slice in self.hybrid_head_slices:
             conditioning = self._conditioning_matrix(mode, adjacency, positions)
             if conditioning is not None:
-                extended_conditioning = self._extend_nodal_conditioning(
-                    conditioning,
-                    context_tokens,
-                )
-                logits_bias[:, head_slice] = (
-                    2.0 * extended_conditioning[:, None, :, :] - 1.0
-                )
-                weight_scale[:, head_slice] = (
-                    0.25 + 0.75 * extended_conditioning[:, None]
-                )
+                logits_bias[:, head_slice] = 2.0 * conditioning[:, None, :, :] - 1.0
+                weight_scale[:, head_slice] = 0.25 + 0.75 * conditioning[:, None]
         if edge_head_conditioning is not None:
             if edge_head_conditioning.shape[1] != 4:
                 raise ValueError("hybrid stress conditioning must have 4 head channels")
-            extended_edge_conditioning = self._extend_edge_conditioning(
-                edge_head_conditioning,
-                logits.shape[2],
-                context_tokens,
-            )
-            logits_bias[:, 8:12] = logits_bias[:, 8:12] + extended_edge_conditioning
+            logits_bias[:, 8:12] = logits_bias[:, 8:12] + edge_head_conditioning
         weights = torch.softmax(logits + logits_bias, dim=-1)
         weights = weights * weight_scale
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -220,7 +160,6 @@ class GraphAttentionBlock(nn.Module):
         hidden: torch.Tensor,
         adjacency: torch.Tensor,
         positions: torch.Tensor,
-        context_tokens: torch.Tensor | None = None,
         edge_head_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, num_nodes, _ = hidden.shape
@@ -231,9 +170,6 @@ class GraphAttentionBlock(nn.Module):
             .transpose(1, 2)
         )
         key_source = normalized
-        if context_tokens is not None:
-            normalized_context = self.norm1(context_tokens)
-            key_source = torch.cat([normalized, normalized_context], dim=1)
         key = (
             self.k_proj(key_source)
             .view(batch, key_source.shape[1], self.num_heads, self.head_dim)
@@ -249,7 +185,6 @@ class GraphAttentionBlock(nn.Module):
             logits,
             adjacency,
             positions,
-            context_tokens,
             edge_head_conditioning,
         )
 
@@ -478,7 +413,7 @@ def _symmetric_pair_edge_features(
     )
 
 
-class StyleTokenEncoder(nn.Module):
+class StyleLocalEncoder(nn.Module):
     def __init__(
         self,
         config: SupervisedRefinerConfig,
@@ -496,7 +431,6 @@ class StyleTokenEncoder(nn.Module):
                 1, style_hidden_dim // config.num_heads
             )
         self.hidden_dim = style_hidden_dim
-        self.shared_hidden_dim = config.hidden_dim
         self.position_mlp = position_mlp
         self.nodal_displacement_mlp = nodal_displacement_mlp
         self.edge_von_mises_mlp = edge_von_mises_mlp
@@ -508,7 +442,6 @@ class StyleTokenEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(style_hidden_dim, style_hidden_dim),
         )
-        self.style_token_count = config.style_token_count
         self.input_norm = nn.LayerNorm(style_hidden_dim)
         self.layers = nn.ModuleList(
             [
@@ -520,38 +453,43 @@ class StyleTokenEncoder(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(style_hidden_dim)
-        self.token_proj = nn.Sequential(
-            nn.Linear(style_hidden_dim, config.hidden_dim),
+        self.mean_proj = nn.Sequential(
+            nn.Linear(style_hidden_dim, style_hidden_dim),
             nn.GELU(),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
             nn.GELU(),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.Linear(style_hidden_dim, config.style_local_latent_dim),
         )
-        self.token_logvar_proj = nn.Sequential(
-            nn.Linear(style_hidden_dim, config.hidden_dim),
+        self.logvar_proj = nn.Sequential(
+            nn.Linear(style_hidden_dim, style_hidden_dim),
             nn.GELU(),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.Linear(style_hidden_dim, style_hidden_dim),
             nn.GELU(),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.Linear(style_hidden_dim, config.style_local_latent_dim),
         )
-        self.token_seed = nn.Parameter(
-            torch.zeros(1, config.style_token_count, style_hidden_dim)
+        self.residual_proj = nn.Linear(
+            config.style_local_latent_dim,
+            config.hidden_dim,
         )
-        self.dropout = nn.Dropout(config.style_token_dropout)
-        self.logvar_min = config.style_token_logvar_min
-        self.logvar_max = config.style_token_logvar_max
-        nn.init.normal_(self.token_seed, mean=0.0, std=0.02)
+        self.local_scale = config.style_local_scale
+        self.logvar_min = config.style_local_logvar_min
+        self.logvar_max = config.style_local_logvar_max
+        nn.init.normal_(self.residual_proj.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.residual_proj.bias)
 
     def forward(
         self,
         structures: Structures,
         analyses: Analyses,
         target_stiffness: torch.Tensor,
-    ) -> StyleTokenDistribution:
+        token_mask: torch.Tensor,
+    ) -> StyleLocalDistribution:
         if analyses.nodal_displacements is None:
             raise ValueError("style analyses must provide nodal_displacements")
         if analyses.edge_von_mises is None:
             raise ValueError("style analyses must provide edge_von_mises")
+        if token_mask.shape != structures.roles.shape:
+            raise ValueError("token_mask must match [batch, nodes]")
         shared_hidden = self.position_mlp(
             structures.positions
         ) + self.nodal_displacement_mlp(
@@ -599,48 +537,35 @@ class StyleTokenEncoder(nn.Module):
                 edge_head_conditioning=edge_stress_conditioning,
             )
         hidden = self.final_norm(hidden)
-        pooled_hidden = hidden.mean(dim=1, keepdim=True).expand(
-            -1, self.style_token_count, -1
-        )
-        pooled_hidden = pooled_hidden + self.token_seed
-        mean = self.dropout(self.token_proj(pooled_hidden))
-        logvar = self.token_logvar_proj(pooled_hidden).clamp(
+        mean = self.mean_proj(hidden)
+        logvar = self.logvar_proj(hidden).clamp(
             min=self.logvar_min,
             max=self.logvar_max,
         )
         if self.training:
             std = torch.exp(0.5 * logvar)
-            token = mean + std * torch.randn_like(std)
+            latent = mean + std * torch.randn_like(std)
         else:
-            token = mean
-        kl = -0.5 * (1.0 + logvar - mean.square() - torch.exp(logvar)).mean(dim=(1, 2))
-        return StyleTokenDistribution(token=token, mean=mean, logvar=logvar, kl=kl)
-
-
-def load_refiner_state_dict_compatible(
-    model: "SupervisedRefiner",
-    state_dict: dict[str, torch.Tensor],
-) -> None:
-    load_result = model.load_state_dict(state_dict, strict=False)
-    missing_keys = set(load_result.missing_keys)
-    unexpected_keys = set(load_result.unexpected_keys)
-    allowed_missing: set[str] = set()
-    allowed_unexpected: set[str] = set()
-    if model.config.use_style_token:
-        allowed_missing.update(
-            {
-                "style_token_encoder.token_seed",
-                "style_base_token",
-            }
+            latent = mean
+        token_weight = token_mask.to(dtype=hidden.dtype).unsqueeze(-1)
+        latent = latent * token_weight
+        mean = mean * token_weight
+        logvar = logvar * token_weight
+        residual = self.local_scale * self.residual_proj(latent) * token_weight
+        kl_per_token = -0.5 * (1.0 + logvar - mean.square() - torch.exp(logvar)).mean(
+            dim=-1
         )
-        allowed_unexpected.add("style_availability_embedding.weight")
-    if missing_keys - allowed_missing:
-        raise RuntimeError(
-            f"checkpoint is missing unsupported parameters: {sorted(missing_keys)}"
-        )
-    if unexpected_keys - allowed_unexpected:
-        raise RuntimeError(
-            f"checkpoint contains unexpected parameters: {sorted(unexpected_keys)}"
+        active_tokens = token_mask.to(dtype=hidden.dtype)
+        kl = (kl_per_token * active_tokens).sum(dim=1) / active_tokens.sum(
+            dim=1
+        ).clamp_min(1.0)
+        return StyleLocalDistribution(
+            latent=latent,
+            residual=residual,
+            token_mask=token_mask,
+            mean=mean,
+            logvar=logvar,
+            kl=kl,
         )
 
 
@@ -650,8 +575,10 @@ class SupervisedRefiner(nn.Module):
         self.config = config or SupervisedRefinerConfig()
         if not (0.0 < self.config.pair_edge_logit_eps < 0.5):
             raise ValueError("pair_edge_logit_eps must be in (0, 0.5)")
-        if self.config.style_token_count <= 0:
-            raise ValueError("style_token_count must be positive")
+        if self.config.style_local_latent_dim <= 0:
+            raise ValueError("style_local_latent_dim must be positive")
+        if self.config.style_local_scale < 0.0:
+            raise ValueError("style_local_scale must be non-negative")
         self.position_mlp = nn.Sequential(
             nn.Linear(3, self.config.hidden_dim),
             nn.GELU(),
@@ -690,8 +617,8 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
         )
-        self.style_token_encoder = (
-            StyleTokenEncoder(
+        self.style_local_encoder = (
+            StyleLocalEncoder(
                 self.config,
                 position_mlp=self.position_mlp,
                 nodal_displacement_mlp=self.nodal_displacement_mlp,
@@ -699,13 +626,6 @@ class SupervisedRefiner(nn.Module):
                 role_embedding=self.role_embedding,
                 mechanics_condition_mlp=self.mechanics_condition_mlp,
                 local_geometry_encoder=self.style_local_geometry_encoder,
-            )
-            if self.config.use_style_token
-            else None
-        )
-        self.style_base_token = (
-            nn.Parameter(
-                torch.zeros(1, self.config.style_token_count, self.config.hidden_dim)
             )
             if self.config.use_style_token
             else None
@@ -749,8 +669,6 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.pair_edge_hidden_dim, 1),
         )
-        if self.style_base_token is not None:
-            nn.init.normal_(self.style_base_token, mean=0.0, std=0.02)
         nn.init.normal_(self.position_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.position_head[-1].bias)
 
@@ -761,7 +679,7 @@ class SupervisedRefiner(nn.Module):
         target_stiffness: torch.Tensor,
         style_structures: Structures | None,
         style_analyses: Analyses | None,
-        style_available_mask: torch.Tensor | None,
+        style_token_mask: torch.Tensor | None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -772,51 +690,58 @@ class SupervisedRefiner(nn.Module):
     ]:
         if not self.config.use_style_token:
             return None, None, None, None, None, None
-        if self.style_base_token is None:
-            raise RuntimeError("style conditioning parameters are not initialized")
-
-        batch_size = structures.batch_size
-        style_context = self.style_base_token.expand(batch_size, -1, -1)
-        if style_available_mask is None:
-            availability_index = torch.zeros(
-                batch_size,
-                dtype=torch.long,
-                device=structures.positions.device,
-            )
-            if style_structures is not None:
-                availability_index.fill_(1)
+        batch_size, num_nodes, _ = structures.positions.shape
+        if style_token_mask is None:
+            if style_structures is None:
+                token_mask = torch.zeros(
+                    batch_size,
+                    num_nodes,
+                    dtype=torch.bool,
+                    device=structures.positions.device,
+                )
+            else:
+                token_mask = torch.ones(
+                    batch_size,
+                    num_nodes,
+                    dtype=torch.bool,
+                    device=structures.positions.device,
+                )
         else:
-            availability_index = style_available_mask.to(
-                device=structures.positions.device,
-                dtype=torch.long,
-            )
-        style_available = availability_index.to(dtype=structures.positions.dtype)[
-            :, None, None
-        ]
-        style_available = style_available.expand(-1, self.config.style_token_count, 1)
-        style_residual = style_context.new_zeros(style_context.shape)
-        style_mean = style_context.new_zeros(style_context.shape)
-        style_logvar = style_context.new_zeros(style_context.shape)
-        style_kl = style_context.new_zeros((batch_size,))
-        if style_structures is not None:
-            if self.style_token_encoder is None:
-                raise RuntimeError("style token encoder is not initialized")
-            if style_analyses is None:
-                raise RuntimeError("style analyses are required for style conditioning")
-            style_distribution = self.style_token_encoder(
+            token_mask = style_token_mask.to(device=structures.positions.device)
+
+        style_latent = structures.positions.new_zeros(
+            batch_size,
+            num_nodes,
+            self.config.style_local_latent_dim,
+        )
+        style_residual = structures.positions.new_zeros(
+            batch_size,
+            num_nodes,
+            self.config.hidden_dim,
+        )
+        style_mean = torch.zeros_like(style_latent)
+        style_logvar = torch.zeros_like(style_latent)
+        style_kl = structures.positions.new_zeros((batch_size,))
+        if token_mask.any():
+            if self.style_local_encoder is None:
+                raise RuntimeError("style local encoder is not initialized")
+            if style_structures is None or style_analyses is None:
+                raise RuntimeError("style inputs are required for active style tokens")
+            style_distribution = self.style_local_encoder(
                 structures=style_structures,
                 analyses=style_analyses,
                 target_stiffness=target_stiffness,
+                token_mask=token_mask,
             )
-            style_residual = style_distribution.token * style_available
-            style_mean = style_distribution.mean * style_available
-            style_logvar = style_distribution.logvar * style_available
-            style_kl = style_distribution.kl * style_available[:, 0, 0]
-            style_context = style_context + style_available * style_residual
+            style_latent = style_distribution.latent
+            style_residual = style_distribution.residual
+            style_mean = style_distribution.mean
+            style_logvar = style_distribution.logvar
+            style_kl = style_distribution.kl
         return (
-            style_context,
+            style_latent,
             style_residual,
-            style_available,
+            token_mask,
             style_mean,
             style_logvar,
             style_kl,
@@ -832,7 +757,7 @@ class SupervisedRefiner(nn.Module):
         flow_times: torch.Tensor,
         style_structures: Structures | None = None,
         style_analyses: Analyses | None = None,
-        style_available_mask: torch.Tensor | None = None,
+        style_token_mask: torch.Tensor | None = None,
     ) -> FlowPrediction:
         structures.validate()
         if self.config.use_style_token and style_structures is not None:
@@ -887,23 +812,23 @@ class SupervisedRefiner(nn.Module):
             raise ValueError("style_structures must use the same node roles")
         if flow_times.shape != (structures.batch_size,):
             raise ValueError("flow_times must have shape [batch]")
-        if style_available_mask is not None and style_available_mask.shape != (
-            structures.batch_size,
+        if (
+            style_token_mask is not None
+            and style_token_mask.shape != structures.roles.shape
         ):
-            raise ValueError("style_available_mask must have shape [batch]")
-        if style_available_mask is not None:
-            if style_available_mask.dtype == torch.bool:
-                style_available_mask = style_available_mask.to(dtype=torch.long)
-            if not torch.all((style_available_mask == 0) | (style_available_mask == 1)):
-                raise ValueError("style_available_mask must contain only 0/1 values")
+            raise ValueError("style_token_mask must have shape [batch, nodes]")
+        if style_token_mask is not None and style_token_mask.dtype != torch.bool:
+            if not torch.all((style_token_mask == 0) | (style_token_mask == 1)):
+                raise ValueError("style_token_mask must contain only 0/1 values")
+            style_token_mask = style_token_mask.to(dtype=torch.bool)
         if (
             self.config.use_style_token
             and style_structures is None
-            and style_available_mask is not None
-            and bool(style_available_mask.any().item())
+            and style_token_mask is not None
+            and bool(style_token_mask.any().item())
         ):
             raise ValueError(
-                "style_structures must be provided when style_available_mask enables style"
+                "style_structures must be provided when style_token_mask enables style"
             )
 
         positions = structures.positions
@@ -948,9 +873,9 @@ class SupervisedRefiner(nn.Module):
             ]
         )
         (
-            style_context,
+            style_latent,
             style_residual,
-            style_available,
+            style_token_mask,
             style_mean,
             style_logvar,
             style_kl,
@@ -959,15 +884,16 @@ class SupervisedRefiner(nn.Module):
             target_stiffness=target_stiffness,
             style_structures=style_structures,
             style_analyses=style_analyses,
-            style_available_mask=style_available_mask,
+            style_token_mask=style_token_mask,
         )
+        if style_residual is not None:
+            hidden = hidden + style_residual
 
         for layer in self.layers:
             hidden = layer(
                 hidden,
                 current_adjacency,
                 positions,
-                style_context,
                 edge_stress_conditioning,
             )
 
@@ -1005,9 +931,9 @@ class SupervisedRefiner(nn.Module):
             adjacency_velocity=adjacency_velocity,
             predicted_adjacency=predicted_adjacency,
             connectivity_latents=connectivity_latents,
-            style_context=style_context,
+            style_latent=style_latent,
             style_residual=style_residual,
-            style_available=style_available,
+            style_token_mask=style_token_mask,
             style_mean=style_mean,
             style_logvar=style_logvar,
             style_kl=style_kl,

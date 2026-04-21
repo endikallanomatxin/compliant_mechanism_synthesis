@@ -31,9 +31,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--eval-fraction", type=float, default=defaults.eval_fraction)
     parser.add_argument(
-        "--style-condition-dropout",
+        "--stiffness-loss-weight",
         type=float,
-        default=defaults.style_condition_dropout,
+        default=defaults.stiffness_loss_weight,
+    )
+    parser.add_argument(
+        "--stiffness-loss-delay-steps",
+        type=int,
+        default=defaults.stiffness_loss_delay_steps,
+    )
+    parser.add_argument(
+        "--stiffness-loss-warmup-steps",
+        type=int,
+        default=defaults.stiffness_loss_warmup_steps,
+    )
+    parser.add_argument(
+        "--style-sample-dropout",
+        type=float,
+        default=defaults.style_sample_dropout,
+    )
+    parser.add_argument(
+        "--style-token-dropout",
+        type=float,
+        default=defaults.style_token_dropout,
     )
     parser.add_argument(
         "--no-style-token",
@@ -63,8 +83,12 @@ def train_supervised_main(argv: list[str] | None = None) -> None:
             warmup_steps=args.warmup_steps,
             min_learning_rate=args.min_learning_rate,
             eval_fraction=args.eval_fraction,
+            stiffness_loss_weight=args.stiffness_loss_weight,
+            stiffness_loss_delay_steps=args.stiffness_loss_delay_steps,
+            stiffness_loss_warmup_steps=args.stiffness_loss_warmup_steps,
             use_style_token=args.use_style_token,
-            style_condition_dropout=args.style_condition_dropout,
+            style_sample_dropout=args.style_sample_dropout,
+            style_token_dropout=args.style_token_dropout,
             checkpoint_path=args.checkpoint_path,
             logdir=str(logdir_path),
         )

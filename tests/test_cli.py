@@ -12,7 +12,10 @@ from compliant_mechanism_synthesis.cli import (
     visualize_dataset_main,
 )
 from compliant_mechanism_synthesis.dataset import load_offline_dataset
-from compliant_mechanism_synthesis.models import SupervisedRefiner, SupervisedRefinerConfig
+from compliant_mechanism_synthesis.models import (
+    SupervisedRefiner,
+    SupervisedRefinerConfig,
+)
 import pytest
 import torch
 
@@ -330,7 +333,7 @@ def test_train_supervised_main_can_disable_style_token(tmp_path: Path) -> None:
     assert checkpoint["train_config"]["use_style_token"] is False
 
 
-def test_train_supervised_main_uses_default_style_token_count(tmp_path: Path) -> None:
+def test_train_supervised_main_uses_default_local_style_config(tmp_path: Path) -> None:
     output_path = tmp_path / "dataset.pt"
     dataset_generate_main(
         [
@@ -368,8 +371,62 @@ def test_train_supervised_main_uses_default_style_token_count(tmp_path: Path) ->
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    assert checkpoint["model_config"]["style_token_count"] == 1
-    assert checkpoint["train_config"]["style_token_count"] == 1
+    assert checkpoint["model_config"]["style_local_latent_dim"] == 16
+    assert checkpoint["model_config"]["style_local_scale"] == 0.05
+    assert checkpoint["train_config"]["style_sample_dropout"] == 0.15
+    assert checkpoint["train_config"]["style_token_dropout"] == 0.10
+    assert checkpoint["train_config"]["stiffness_loss_weight"] == 0.0025
+    assert checkpoint["train_config"]["stiffness_loss_delay_steps"] == 1000
+    assert checkpoint["train_config"]["stiffness_loss_warmup_steps"] == 2000
+
+
+def test_train_supervised_main_accepts_stiffness_schedule_flags(tmp_path: Path) -> None:
+    output_path = tmp_path / "dataset.pt"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_dataset"),
+        ]
+    )
+
+    checkpoint_path = tmp_path / "refiner_stiffness_flags.pt"
+    train_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--num-steps",
+            "2",
+            "--stiffness-loss-weight",
+            "0.2",
+            "--stiffness-loss-delay-steps",
+            "7",
+            "--stiffness-loss-warmup-steps",
+            "11",
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--logdir",
+            str(tmp_path / "runs_supervised_stiffness_flags"),
+        ]
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    assert checkpoint["train_config"]["stiffness_loss_weight"] == 0.2
+    assert checkpoint["train_config"]["stiffness_loss_delay_steps"] == 7
+    assert checkpoint["train_config"]["stiffness_loss_warmup_steps"] == 11
 
 
 def test_train_rl_main_writes_checkpoint_and_supports_warm_start(
@@ -515,7 +572,7 @@ def test_train_rl_optimizer_supported_main_writes_checkpoint_and_supports_warm_s
     )
 
 
-def test_upgrade_supervised_checkpoint_main_rewrites_old_checkpoint_format(
+def test_upgrade_supervised_checkpoint_main_rewrites_current_checkpoint(
     tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "dataset.pt"
@@ -554,21 +611,23 @@ def test_upgrade_supervised_checkpoint_main_rewrites_old_checkpoint_format(
         ]
     )
 
-    old_checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    old_checkpoint["model_state_dict"].pop("style_token_encoder.token_seed")
-    old_checkpoint["model_config"].pop("style_token_count")
-    old_checkpoint["train_config"].pop("style_token_count")
-    torch.save(old_checkpoint, checkpoint_path)
-
     upgrade_supervised_checkpoint_main(["--checkpoint-path", str(checkpoint_path)])
 
     backup_path = tmp_path / "refiner-original.pt"
     upgraded_checkpoint = torch.load(checkpoint_path, map_location="cpu")
     assert backup_path.exists()
-    assert upgraded_checkpoint["model_config"]["style_token_count"] == 1
-    assert upgraded_checkpoint["train_config"]["style_token_count"] == 1
+    assert (
+        upgraded_checkpoint["model_config"]
+        == torch.load(backup_path, map_location="cpu")["model_config"]
+    )
+    assert (
+        upgraded_checkpoint["train_config"]
+        == torch.load(backup_path, map_location="cpu")["train_config"]
+    )
 
-    model = SupervisedRefiner(SupervisedRefinerConfig(**upgraded_checkpoint["model_config"]))
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(**upgraded_checkpoint["model_config"])
+    )
     model.load_state_dict(upgraded_checkpoint["model_state_dict"])
 
 

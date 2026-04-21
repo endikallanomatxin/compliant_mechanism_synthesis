@@ -47,19 +47,35 @@ class SupervisedTrainingConfig:
     log_every_steps: int = 10
     eval_every_steps: int = 100
     max_grad_norm: float = 1.0
-    num_steps: int = 150_000  # 16h
+    num_steps: int = 120_000
     learning_rate: float = 4e-5
     warmup_steps: int = 1000
     min_learning_rate: float = 4e-6
     eval_fraction: float = 0.02
     use_style_token: bool = True
-    style_token_count: int = 1
-    style_condition_dropout: float = 0.1
+    style_sample_dropout: float = 0.15
+    style_token_dropout: float = 0.10
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.5
-    stiffness_loss_weight: float = 0.0
-    style_kl_loss_weight: float = 5e-4
-    style_kl_anneal_steps: int = 1_024
+
+    # KL DIVERGENCE LOSS FOR STYLE TOKEN
+    # It helps the development of the latent representation by limiting its
+    # deviation from a standard Gaussian distribution
+    style_kl_loss_weight: float = 6e-4
+    style_kl_anneal_steps: int = 1_000
+
+    # STIFFNESS LOSS
+    # It deviates from the pure supervised learning setup, but it
+    # - helps guide the model towards more realistic solutions
+    # - reduces over-reliance on the style token
+    stiffness_loss_weight: float = 0.000001
+    # Delaying the start of the stiffness loss:
+    # - avoids the messy gradients overwhelming an inmature model
+    # - reduces de computational cost because it avoids simulating the
+    #   resulting structure.
+    stiffness_loss_delay_steps: int = 2_000
+    stiffness_loss_warmup_steps: int = 18_000
+
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
     seed: int = 7
@@ -151,6 +167,29 @@ def _style_kl_weight(step: int, config: SupervisedTrainingConfig) -> float:
         return config.style_kl_loss_weight
     progress = min(max((step + 1) / config.style_kl_anneal_steps, 0.0), 1.0)
     return config.style_kl_loss_weight * progress
+
+
+def _stiffness_loss_weight_effective(
+    step: int,
+    config: SupervisedTrainingConfig,
+) -> float:
+    if config.stiffness_loss_weight < 0.0:
+        raise ValueError("stiffness_loss_weight must be non-negative")
+    if config.stiffness_loss_delay_steps < 0:
+        raise ValueError("stiffness_loss_delay_steps must be non-negative")
+    if config.stiffness_loss_warmup_steps < 0:
+        raise ValueError("stiffness_loss_warmup_steps must be non-negative")
+    if config.stiffness_loss_weight == 0.0:
+        return 0.0
+    if step < config.stiffness_loss_delay_steps:
+        return 0.0
+    if config.stiffness_loss_warmup_steps == 0:
+        return config.stiffness_loss_weight
+    warmup_progress = (
+        step - config.stiffness_loss_delay_steps + 1
+    ) / config.stiffness_loss_warmup_steps
+    warmup_progress = min(max(warmup_progress, 0.0), 1.0)
+    return config.stiffness_loss_weight * warmup_progress
 
 
 def load_supervised_cases(dataset_path: str) -> OptimizedCases:
@@ -623,7 +662,8 @@ def _training_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     position_error = _position_velocity_loss(prediction, batch)
     adjacency_error = _adjacency_velocity_loss(prediction, batch)
-    if config.stiffness_loss_weight > 0.0:
+    stiffness_weight_effective = _stiffness_loss_weight_effective(step, config)
+    if stiffness_weight_effective > 0.0:
         _, _, free_mask = role_masks(batch.flow_structures.roles)
         free_mask = free_mask.unsqueeze(-1).to(dtype=prediction.position_velocity.dtype)
         remaining = (1.0 - batch.flow_times)[:, None, None]
@@ -660,7 +700,7 @@ def _training_losses(
         * position_error,
         "adjacency_error_loss_contribution": config.adjacency_loss_weight
         * adjacency_error,
-        "stiffness_error_loss_contribution": config.stiffness_loss_weight
+        "stiffness_error_loss_contribution": stiffness_weight_effective
         * stiffness_error,
         "style_kl_loss_contribution": kl_weight * style_kl,
     }
@@ -674,6 +714,9 @@ def _training_losses(
         "position_error": position_error.mean(),
         "adjacency_error": adjacency_error.mean(),
         "stiffness_error": stiffness_error.mean(),
+        "stiffness_loss_weight_effective": position_error.new_tensor(
+            stiffness_weight_effective
+        ),
         "style_kl": style_kl.mean(),
         "style_kl_weight": position_error.new_tensor(kl_weight),
     }
@@ -781,7 +824,6 @@ def train_supervised_refiner(
     train_config = train_config or SupervisedTrainingConfig(dataset_path="")
     model_config = model_config or SupervisedRefinerConfig(
         use_style_token=train_config.use_style_token,
-        style_token_count=train_config.style_token_count,
     )
     device = resolve_torch_device(train_config.device)
 
@@ -804,10 +846,16 @@ def train_supervised_refiner(
         raise ValueError("style_kl_loss_weight must be non-negative")
     if train_config.style_kl_anneal_steps < 0:
         raise ValueError("style_kl_anneal_steps must be non-negative")
-    if train_config.style_token_count <= 0:
-        raise ValueError("style_token_count must be positive")
-    if not 0.0 <= train_config.style_condition_dropout <= 1.0:
-        raise ValueError("style_condition_dropout must be in [0.0, 1.0]")
+    if train_config.stiffness_loss_weight < 0.0:
+        raise ValueError("stiffness_loss_weight must be non-negative")
+    if train_config.stiffness_loss_delay_steps < 0:
+        raise ValueError("stiffness_loss_delay_steps must be non-negative")
+    if train_config.stiffness_loss_warmup_steps < 0:
+        raise ValueError("stiffness_loss_warmup_steps must be non-negative")
+    if not 0.0 <= train_config.style_sample_dropout <= 1.0:
+        raise ValueError("style_sample_dropout must be in [0.0, 1.0]")
+    if not 0.0 <= train_config.style_token_dropout <= 1.0:
+        raise ValueError("style_token_dropout must be in [0.0, 1.0]")
     if not 0.0 <= train_config.eval_fraction < 1.0:
         raise ValueError("eval_fraction must be in [0.0, 1.0)")
 
@@ -847,10 +895,15 @@ def train_supervised_refiner(
         f"eval_fraction={train_config.eval_fraction:.4f} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"use_style_token={'yes' if model.config.use_style_token else 'no'} "
-        f"style_token_count={model.config.style_token_count} "
-        f"style_condition_dropout={train_config.style_condition_dropout:.3f} "
+        f"style_local_latent_dim={model.config.style_local_latent_dim} "
+        f"style_local_scale={model.config.style_local_scale:.4f} "
+        f"style_sample_dropout={train_config.style_sample_dropout:.3f} "
+        f"style_token_dropout={train_config.style_token_dropout:.3f} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
         f"min_learning_rate={train_config.min_learning_rate} "
+        f"stiffness_loss_weight={train_config.stiffness_loss_weight} "
+        f"stiffness_loss_delay_steps={train_config.stiffness_loss_delay_steps} "
+        f"stiffness_loss_warmup_steps={train_config.stiffness_loss_warmup_steps} "
         f"style_kl_loss_weight={train_config.style_kl_loss_weight} "
         f"style_kl_anneal_steps={train_config.style_kl_anneal_steps}",
         flush=True,
@@ -885,15 +938,24 @@ def train_supervised_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 batch_build_time = time.perf_counter()
-                style_available_mask = None
+                style_token_mask = None
                 if model.config.use_style_token:
-                    style_available_mask = (
+                    style_sample_mask = (
                         torch.rand(
                             batch.flow_structures.batch_size,
                             device=device,
                         )
-                        >= train_config.style_condition_dropout
+                        >= train_config.style_sample_dropout
                     )
+                    style_token_mask = (
+                        torch.rand(
+                            batch.flow_structures.batch_size,
+                            batch.flow_structures.num_nodes,
+                            device=device,
+                        )
+                        >= train_config.style_token_dropout
+                    )
+                    style_token_mask = style_token_mask & style_sample_mask[:, None]
                 prediction = model.predict_flow(
                     structures=batch.flow_structures,
                     target_stiffness=batch.target_stiffness,
@@ -909,7 +971,7 @@ def train_supervised_refiner(
                     style_analyses=(
                         batch.oracle_analyses if model.config.use_style_token else None
                     ),
-                    style_available_mask=style_available_mask,
+                    style_token_mask=style_token_mask,
                 )
                 _synchronize_device_if_needed(device)
                 forward_time = time.perf_counter()
@@ -952,12 +1014,26 @@ def train_supervised_refiner(
                     step,
                 )
                 writer.add_scalar(
-                    "train/parameters/style_condition_available",
+                    "train/parameters/style_sample_available",
                     (
                         0.0
-                        if style_available_mask is None
-                        else float(style_available_mask.float().mean().item())
+                        if style_token_mask is None
+                        else float(style_token_mask.any(dim=1).float().mean().item())
                     ),
+                    step,
+                )
+                writer.add_scalar(
+                    "train/parameters/style_token_available",
+                    (
+                        0.0
+                        if style_token_mask is None
+                        else float(style_token_mask.float().mean().item())
+                    ),
+                    step,
+                )
+                writer.add_scalar(
+                    "train/parameters/stiffness_loss_weight_effective",
+                    float(metrics["stiffness_loss_weight_effective"].detach().item()),
                     step,
                 )
                 writer.add_scalar("train/parameters/learning_rate", learning_rate, step)
