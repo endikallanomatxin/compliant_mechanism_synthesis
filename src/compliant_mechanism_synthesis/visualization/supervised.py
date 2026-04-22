@@ -423,7 +423,7 @@ def write_supervised_sampling_visualizations(
         f"rendered_cases={len(selected_case_indices)}",
         f"case_indices={','.join(str(index) for index in selected_case_indices)}",
         f"checkpoint={Path(checkpoint_path)}",
-        f"use_style_token={model.config.use_style_token}",
+        f"use_style_conditioning={model.config.use_style_conditioning}",
         f"seed={seed}",
         f"num_steps={num_steps if num_steps is not None else model.config.num_integration_steps}",
     ]
@@ -452,7 +452,7 @@ def write_supervised_sampling_visualizations(
             )
             with_style_trajectory = (
                 None
-                if not model.config.use_style_token
+                if not model.config.use_style_conditioning
                 else model.rollout_trajectory(
                     source_structures=source_structures,
                     target_stiffness=case.target_stiffness,

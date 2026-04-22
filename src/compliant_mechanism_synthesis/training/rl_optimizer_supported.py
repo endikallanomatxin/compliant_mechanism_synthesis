@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import torch
@@ -59,7 +59,6 @@ class ExploreOptimizeTrainingConfig:
     warmup_steps: int = 500
     min_learning_rate: float = 1e-6
     loss_scale: float = 1e-9
-    use_style_token: bool = True
     stiffness_loss_weight: float = 1.0
     stress_loss_weight: float = 0.1
     allowable_von_mises: float = 250e6
@@ -95,8 +94,9 @@ def _load_initial_model(
     train_config: ExploreOptimizeTrainingConfig,
     model_config: SupervisedRefinerConfig | None,
 ) -> tuple[SupervisedRefiner, SupervisedRefinerConfig]:
-    effective_config = model_config or SupervisedRefinerConfig(
-        use_style_token=train_config.use_style_token,
+    effective_config = replace(
+        model_config or SupervisedRefinerConfig(),
+        use_style_conditioning=False,
     )
     model = SupervisedRefiner(effective_config).to(device)
     if train_config.init_checkpoint_path is None:
@@ -104,9 +104,30 @@ def _load_initial_model(
 
     checkpoint = torch.load(train_config.init_checkpoint_path, map_location=device)
     if model_config is None:
-        effective_config = SupervisedRefinerConfig(**checkpoint["model_config"])
+        effective_config = replace(
+            SupervisedRefinerConfig(**checkpoint["model_config"]),
+            use_style_conditioning=False,
+        )
         model = SupervisedRefiner(effective_config).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    incompatible = model.load_state_dict(
+        checkpoint["model_state_dict"],
+        strict=False,
+    )
+    if incompatible.missing_keys:
+        raise RuntimeError(
+            "Explore-optimize initialization left missing model weights after disabling style conditioning: "
+            + ", ".join(incompatible.missing_keys)
+        )
+    unexpected_keys = [
+        key
+        for key in incompatible.unexpected_keys
+        if not key.startswith("style_local_encoder.")
+    ]
+    if unexpected_keys:
+        raise RuntimeError(
+            "Explore-optimize initialization found unexpected non-style weights: "
+            + ", ".join(unexpected_keys)
+        )
     return model, effective_config
 
 
@@ -408,7 +429,7 @@ def train_explore_optimize_refiner(
         f"optimize_steps={train_config.optimize_steps} optimize_learning_rate={train_config.optimize_learning_rate} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
         f"init_checkpoint={train_config.init_checkpoint_path or 'none'} "
-        f"use_style_token={'yes' if effective_model_config.use_style_token else 'no'} "
+        f"use_style_conditioning={'yes' if effective_model_config.use_style_conditioning else 'no'} "
         f"style_local_latent_dim={effective_model_config.style_local_latent_dim} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
         f"min_learning_rate={train_config.min_learning_rate} "

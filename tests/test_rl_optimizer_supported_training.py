@@ -66,6 +66,8 @@ def test_train_explore_optimize_refiner_writes_checkpoint_and_history(
     assert "total_loss" in summary.history
     assert "stiffness_loss_contribution" in summary.history
     assert "stress_loss_contribution" in summary.history
+    checkpoint = torch.load(summary.checkpoint_path, map_location="cpu")
+    assert checkpoint["model_config"]["use_style_conditioning"] is False
 
 
 def test_train_explore_optimize_refiner_can_initialize_from_supervised_checkpoint(
@@ -116,3 +118,38 @@ def test_train_explore_optimize_refiner_can_initialize_from_supervised_checkpoin
     assert checkpoint["train_config"]["init_checkpoint_path"] == str(
         supervised_summary.checkpoint_path
     )
+    assert checkpoint["model_config"]["use_style_conditioning"] is False
+
+
+def test_train_explore_optimize_refiner_disables_style_conditioning_from_explicit_model_config(
+    tmp_path: Path,
+) -> None:
+    dataset_path, cases = _build_cases(tmp_path)
+
+    _, summary = train_explore_optimize_refiner(
+        optimized_cases=cases,
+        model_config=SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+            use_style_conditioning=True,
+        ),
+        train_config=ExploreOptimizeTrainingConfig(
+            dataset_path=str(dataset_path),
+            device="cpu",
+            batch_size=2,
+            gradient_accumulation_steps=1,
+            num_steps=2,
+            explore_steps=2,
+            optimize_steps=2,
+            checkpoint_path=str(
+                tmp_path / "refiner_explore_optimize_forces_no_style.pt"
+            ),
+            logdir=str(tmp_path / "runs_explore_optimize_forces_no_style"),
+            seed=29,
+        ),
+    )
+
+    checkpoint = torch.load(summary.checkpoint_path, map_location="cpu")
+    assert checkpoint["model_config"]["use_style_conditioning"] is False

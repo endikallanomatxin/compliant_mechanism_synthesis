@@ -63,6 +63,8 @@ def test_train_rl_refiner_writes_checkpoint_and_history(tmp_path: Path) -> None:
     assert "stiffness_loss_contribution" in summary.history
     assert "stress_loss_contribution" in summary.history
     assert "rollout_monotonicity_loss_contribution" in summary.history
+    checkpoint = torch.load(summary.checkpoint_path, map_location="cpu")
+    assert checkpoint["model_config"]["use_style_conditioning"] is False
 
 
 def test_train_rl_refiner_supports_gradient_accumulation(
@@ -94,6 +96,7 @@ def test_train_rl_refiner_supports_gradient_accumulation(
     checkpoint = torch.load(summary.checkpoint_path, map_location="cpu")
     assert summary.checkpoint_path.exists()
     assert checkpoint["train_config"]["gradient_accumulation_steps"] == 2
+    assert checkpoint["model_config"]["use_style_conditioning"] is False
     assert len(summary.history["total_loss"]) == 2
 
 
@@ -121,7 +124,10 @@ def test_train_rl_refiner_can_initialize_from_supervised_checkpoint(
         ),
     )
     checkpoint = torch.load(supervised_summary.checkpoint_path, map_location="cpu")
-    expected_model_config = checkpoint["model_config"]
+    expected_model_config = {
+        **checkpoint["model_config"],
+        "use_style_conditioning": False,
+    }
 
     _, rl_summary = train_rl_refiner(
         optimized_cases=cases,
@@ -144,3 +150,33 @@ def test_train_rl_refiner_can_initialize_from_supervised_checkpoint(
         supervised_summary.checkpoint_path
     )
     assert rl_checkpoint["model_config"] == expected_model_config
+
+
+def test_train_rl_refiner_disables_style_conditioning_from_explicit_model_config(
+    tmp_path: Path,
+) -> None:
+    dataset_path, cases = _build_cases(tmp_path)
+
+    _, summary = train_rl_refiner(
+        optimized_cases=cases,
+        model_config=SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+            use_style_conditioning=True,
+        ),
+        train_config=RLTrainingConfig(
+            dataset_path=str(dataset_path),
+            device="cpu",
+            batch_size=2,
+            num_steps=2,
+            rollout_steps=2,
+            checkpoint_path=str(tmp_path / "refiner_rl_forces_no_style.pt"),
+            logdir=str(tmp_path / "runs_rl_forces_no_style"),
+            seed=23,
+        ),
+    )
+
+    checkpoint = torch.load(summary.checkpoint_path, map_location="cpu")
+    assert checkpoint["model_config"]["use_style_conditioning"] is False

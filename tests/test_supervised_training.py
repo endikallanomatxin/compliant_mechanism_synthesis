@@ -620,7 +620,7 @@ def test_predict_flow_rejects_mismatched_style_roles(tmp_path: Path) -> None:
         )
 
 
-def test_predict_flow_ignores_style_inputs_when_style_token_disabled(
+def test_predict_flow_ignores_style_inputs_when_style_conditioning_disabled(
     tmp_path: Path,
 ) -> None:
     cases = _build_cases(tmp_path)
@@ -630,7 +630,7 @@ def test_predict_flow_ignores_style_inputs_when_style_token_disabled(
             connectivity_latent_dim=32,
             num_attention_layers=3,
             num_heads=16,
-            use_style_token=False,
+            use_style_conditioning=False,
         )
     )
     batch = make_supervised_batch(

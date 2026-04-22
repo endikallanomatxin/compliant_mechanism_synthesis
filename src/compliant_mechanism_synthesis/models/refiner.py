@@ -83,7 +83,7 @@ class SupervisedRefinerConfig:
     max_distance: float = 0.24
     transition_width: float = 0.08
     # Local style VAE
-    use_style_token: bool = True
+    use_style_conditioning: bool = True
     style_local_latent_dim: int = 16
     style_local_scale: float = 0.05
     style_local_logvar_min: float = -6.0
@@ -627,7 +627,7 @@ class SupervisedRefiner(nn.Module):
                 mechanics_condition_mlp=self.mechanics_condition_mlp,
                 local_geometry_encoder=self.style_local_geometry_encoder,
             )
-            if self.config.use_style_token
+            if self.config.use_style_conditioning
             else None
         )
         self.input_norm = nn.LayerNorm(self.config.hidden_dim)
@@ -688,7 +688,7 @@ class SupervisedRefiner(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        if not self.config.use_style_token:
+        if not self.config.use_style_conditioning:
             return None, None, None, None, None, None
         batch_size, num_nodes, _ = structures.positions.shape
         if style_token_mask is None:
@@ -760,9 +760,9 @@ class SupervisedRefiner(nn.Module):
         style_token_mask: torch.Tensor | None = None,
     ) -> FlowPrediction:
         structures.validate()
-        if self.config.use_style_token and style_structures is not None:
+        if self.config.use_style_conditioning and style_structures is not None:
             style_structures.validate()
-        if self.config.use_style_token and style_analyses is not None:
+        if self.config.use_style_conditioning and style_analyses is not None:
             style_analyses.validate(structures.batch_size)
         if target_stiffness.shape != (structures.batch_size, 6, 6):
             raise ValueError("target_stiffness must have shape [batch, 6, 6]")
@@ -782,19 +782,19 @@ class SupervisedRefiner(nn.Module):
         ):
             raise ValueError("edge_von_mises must have shape [batch, nodes, nodes, 6]")
         if (
-            self.config.use_style_token
+            self.config.use_style_conditioning
             and style_structures is not None
             and style_analyses is None
         ):
             raise ValueError("style_analyses must be provided with style_structures")
         if (
-            self.config.use_style_token
+            self.config.use_style_conditioning
             and style_structures is None
             and style_analyses is not None
         ):
             raise ValueError("style_structures must be provided with style_analyses")
         if (
-            self.config.use_style_token
+            self.config.use_style_conditioning
             and style_structures is not None
             and (
                 style_structures.positions.shape != structures.positions.shape
@@ -805,7 +805,7 @@ class SupervisedRefiner(nn.Module):
                 "style_structures must match structures batch and node dimensions"
             )
         if (
-            self.config.use_style_token
+            self.config.use_style_conditioning
             and style_structures is not None
             and not torch.equal(style_structures.roles, structures.roles)
         ):
@@ -822,7 +822,7 @@ class SupervisedRefiner(nn.Module):
                 raise ValueError("style_token_mask must contain only 0/1 values")
             style_token_mask = style_token_mask.to(dtype=torch.bool)
         if (
-            self.config.use_style_token
+            self.config.use_style_conditioning
             and style_structures is None
             and style_token_mask is not None
             and bool(style_token_mask.any().item())
@@ -949,27 +949,27 @@ class SupervisedRefiner(nn.Module):
         style_analyses: Analyses | None = None,
     ) -> list[Structures]:
         source_structures.validate()
-        if self.config.use_style_token and style_structures is not None:
+        if self.config.use_style_conditioning and style_structures is not None:
             style_structures.validate()
-        if self.config.use_style_token and style_analyses is not None:
+        if self.config.use_style_conditioning and style_analyses is not None:
             style_analyses.validate(source_structures.batch_size)
         num_steps = num_steps or self.config.num_integration_steps
         if num_steps <= 0:
             raise ValueError("num_steps must be positive")
         if (
-            self.config.use_style_token
+            self.config.use_style_conditioning
             and style_structures is not None
             and style_analyses is None
         ):
             style_analyses = analysis_fn(style_structures)
         if (
-            self.config.use_style_token
+            self.config.use_style_conditioning
             and style_structures is None
             and style_analyses is not None
         ):
             raise ValueError("style_structures must be provided with style_analyses")
         if (
-            self.config.use_style_token
+            self.config.use_style_conditioning
             and style_structures is not None
             and (
                 style_structures.positions.shape != source_structures.positions.shape
@@ -980,7 +980,7 @@ class SupervisedRefiner(nn.Module):
                 "style_structures must match source_structures batch and node dimensions"
             )
         if (
-            self.config.use_style_token
+            self.config.use_style_conditioning
             and style_structures is not None
             and not torch.equal(style_structures.roles, source_structures.roles)
         ):

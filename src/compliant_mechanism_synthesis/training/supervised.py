@@ -53,13 +53,13 @@ class SupervisedTrainingConfig:
     warmup_steps: int = 1000
     min_learning_rate: float = 4e-6
     eval_fraction: float = 0.02
-    use_style_token: bool = True
+    use_style_conditioning: bool = True
     style_sample_dropout: float = 0.15
     style_token_dropout: float = 0.10
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.5
 
-    # KL DIVERGENCE LOSS FOR STYLE TOKEN
+    # KL divergence loss for local style conditioning.
     # It helps the development of the latent representation by limiting its
     # deviation from a standard Gaussian distribution
     style_kl_loss_weight: float = 6e-4
@@ -68,7 +68,7 @@ class SupervisedTrainingConfig:
     # STIFFNESS LOSS
     # It deviates from the pure supervised learning setup, but it
     # - helps guide the model towards more realistic solutions
-    # - reduces over-reliance on the style token
+    # - reduces over-reliance on style conditioning
     stiffness_loss_weight: float = 0.000001
     # Delaying the start of the stiffness loss:
     # - avoids the messy gradients overwhelming an inmature model
@@ -76,7 +76,7 @@ class SupervisedTrainingConfig:
     #   resulting structure.
     stiffness_loss_delay_steps: int = 2_000
     stiffness_loss_warmup_steps: int = 18_000
-    
+
     # STRESS LOSS
     stress_loss_weight: float = 0.001
     allowable_von_mises: float = 250e6
@@ -746,7 +746,7 @@ def _training_losses(
         stress_violation = position_error.new_zeros(position_error.shape)
         mean_stress_ratio = position_error.new_zeros(position_error.shape)
         max_stress_ratio = position_error.new_zeros(position_error.shape)
-    if prediction.style_kl is None or not config.use_style_token:
+    if prediction.style_kl is None or not config.use_style_conditioning:
         style_kl = position_error.new_zeros(position_error.shape)
     else:
         style_kl = prediction.style_kl
@@ -886,7 +886,7 @@ def train_supervised_refiner(
     optimized_cases.validate()
     train_config = train_config or SupervisedTrainingConfig(dataset_path="")
     model_config = model_config or SupervisedRefinerConfig(
-        use_style_token=train_config.use_style_token,
+        use_style_conditioning=train_config.use_style_conditioning,
     )
     device = resolve_torch_device(train_config.device)
 
@@ -968,7 +968,7 @@ def train_supervised_refiner(
         f"eval_cases={eval_case_count} eval_every_steps={train_config.eval_every_steps} "
         f"eval_fraction={train_config.eval_fraction:.4f} "
         f"steps_per_epoch={steps_per_epoch} device={device} "
-        f"use_style_token={'yes' if model.config.use_style_token else 'no'} "
+        f"use_style_conditioning={'yes' if model.config.use_style_conditioning else 'no'} "
         f"style_local_latent_dim={model.config.style_local_latent_dim} "
         f"style_local_scale={model.config.style_local_scale:.4f} "
         f"style_sample_dropout={train_config.style_sample_dropout:.3f} "
@@ -1018,7 +1018,7 @@ def train_supervised_refiner(
                 _synchronize_device_if_needed(device)
                 batch_build_time = time.perf_counter()
                 style_token_mask = None
-                if model.config.use_style_token:
+                if model.config.use_style_conditioning:
                     style_sample_mask = (
                         torch.rand(
                             batch.flow_structures.batch_size,
@@ -1044,11 +1044,13 @@ def train_supervised_refiner(
                     flow_times=batch.flow_times,
                     style_structures=(
                         batch.oracle_structures
-                        if model.config.use_style_token
+                        if model.config.use_style_conditioning
                         else None
                     ),
                     style_analyses=(
-                        batch.oracle_analyses if model.config.use_style_token else None
+                        batch.oracle_analyses
+                        if model.config.use_style_conditioning
+                        else None
                     ),
                     style_token_mask=style_token_mask,
                 )
@@ -1185,7 +1187,7 @@ def train_supervised_refiner(
                             use_style=False,
                         )
                     }
-                    if model.config.use_style_token:
+                    if model.config.use_style_conditioning:
                         eval_runs["with_style"] = _evaluate_supervised_batches(
                             model=model,
                             optimized_cases=eval_cases,

@@ -290,7 +290,7 @@ def test_train_supervised_main_writes_default_checkpoint_inside_run_dir(
     assert (run_dirs[0] / "refiner.pt").exists()
 
 
-def test_train_supervised_main_can_disable_style_token(tmp_path: Path) -> None:
+def test_train_supervised_main_can_disable_style_conditioning(tmp_path: Path) -> None:
     output_path = tmp_path / "dataset.pt"
     dataset_generate_main(
         [
@@ -320,7 +320,7 @@ def test_train_supervised_main_can_disable_style_token(tmp_path: Path) -> None:
             "2",
             "--num-steps",
             "4",
-            "--no-style-token",
+            "--no-style-conditioning",
             "--checkpoint-path",
             str(checkpoint_path),
             "--logdir",
@@ -329,8 +329,8 @@ def test_train_supervised_main_can_disable_style_token(tmp_path: Path) -> None:
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    assert checkpoint["model_config"]["use_style_token"] is False
-    assert checkpoint["train_config"]["use_style_token"] is False
+    assert checkpoint["model_config"]["use_style_conditioning"] is False
+    assert checkpoint["train_config"]["use_style_conditioning"] is False
 
 
 def test_train_supervised_main_uses_default_local_style_config(tmp_path: Path) -> None:
@@ -378,11 +378,11 @@ def test_train_supervised_main_uses_default_local_style_config(tmp_path: Path) -
     assert checkpoint["train_config"]["stiffness_loss_weight"] == 1e-6
     assert checkpoint["train_config"]["stiffness_loss_delay_steps"] == 2000
     assert checkpoint["train_config"]["stiffness_loss_warmup_steps"] == 18000
-    assert checkpoint["train_config"]["stress_loss_weight"] == 0.01
+    assert checkpoint["train_config"]["stress_loss_weight"] == 0.001
     assert checkpoint["train_config"]["allowable_von_mises"] == 250e6
     assert checkpoint["train_config"]["stress_activation_threshold"] == 0.15
-    assert checkpoint["train_config"]["stress_loss_delay_steps"] == 10000
-    assert checkpoint["train_config"]["stress_loss_warmup_steps"] == 10000
+    assert checkpoint["train_config"]["stress_loss_delay_steps"] == 2000
+    assert checkpoint["train_config"]["stress_loss_warmup_steps"] == 18000
 
 
 def test_train_supervised_main_accepts_stiffness_schedule_flags(tmp_path: Path) -> None:
@@ -684,6 +684,68 @@ def test_upgrade_supervised_checkpoint_main_rewrites_current_checkpoint(
         upgraded_checkpoint["train_config"]
         == torch.load(backup_path, map_location="cpu")["train_config"]
     )
+
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(**upgraded_checkpoint["model_config"])
+    )
+    model.load_state_dict(upgraded_checkpoint["model_state_dict"])
+
+
+def test_upgrade_supervised_checkpoint_main_renames_legacy_style_field(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "dataset.pt"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_dataset"),
+        ]
+    )
+
+    checkpoint_path = tmp_path / "legacy_refiner.pt"
+    train_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--num-steps",
+            "2",
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--logdir",
+            str(tmp_path / "runs_supervised"),
+        ]
+    )
+
+    legacy_checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    legacy_checkpoint["model_config"]["use_style_token"] = legacy_checkpoint[
+        "model_config"
+    ].pop("use_style_conditioning")
+    legacy_checkpoint["train_config"]["use_style_token"] = legacy_checkpoint[
+        "train_config"
+    ].pop("use_style_conditioning")
+    torch.save(legacy_checkpoint, checkpoint_path)
+
+    upgrade_supervised_checkpoint_main(["--checkpoint-path", str(checkpoint_path)])
+
+    upgraded_checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    assert "use_style_token" not in upgraded_checkpoint["model_config"]
+    assert "use_style_token" not in upgraded_checkpoint["train_config"]
+    assert "use_style_conditioning" in upgraded_checkpoint["model_config"]
+    assert "use_style_conditioning" in upgraded_checkpoint["train_config"]
 
     model = SupervisedRefiner(
         SupervisedRefinerConfig(**upgraded_checkpoint["model_config"])

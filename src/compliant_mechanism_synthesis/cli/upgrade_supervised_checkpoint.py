@@ -12,6 +12,13 @@ from compliant_mechanism_synthesis.models import (
 )
 
 
+def _normalize_checkpoint_config(config: dict[str, object]) -> dict[str, object]:
+    normalized = dict(config)
+    if "use_style_token" in normalized:
+        normalized["use_style_conditioning"] = normalized.pop("use_style_token")
+    return normalized
+
+
 def _backup_path(checkpoint_path: Path) -> Path:
     return checkpoint_path.with_name(
         f"{checkpoint_path.stem}-original{checkpoint_path.suffix}"
@@ -27,8 +34,8 @@ def upgrade_supervised_checkpoint(checkpoint_path: str | Path) -> tuple[Path, Pa
         raise FileExistsError(f"backup checkpoint already exists: {backup_path}")
 
     checkpoint = torch.load(resolved_path, map_location="cpu")
-    model_config = checkpoint["model_config"]
-    train_config = checkpoint["train_config"]
+    model_config = _normalize_checkpoint_config(checkpoint["model_config"])
+    train_config = _normalize_checkpoint_config(checkpoint["train_config"])
 
     model = SupervisedRefiner(SupervisedRefinerConfig(**model_config))
     model.load_state_dict(checkpoint["model_state_dict"])

@@ -15,7 +15,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="cms-train-supervised",
         description="Train the supervised refinement model with flow matching over the offline dataset.",
     )
-    parser.set_defaults(use_style_token=defaults.use_style_token)
+    parser.set_defaults(use_style_conditioning=defaults.use_style_conditioning)
     parser.add_argument("--dataset-path", required=True)
     parser.add_argument("--device", default=defaults.device)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
@@ -81,10 +81,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=defaults.style_token_dropout,
     )
     parser.add_argument(
-        "--no-style-token",
-        dest="use_style_token",
+        "--no-style-conditioning",
+        dest="use_style_conditioning",
         action="store_false",
-        help="Disable oracle style-token conditioning during supervised training.",
+        help="Disable oracle style conditioning during supervised training.",
     )
     parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
     parser.add_argument("--logdir", default=defaults.logdir)
@@ -116,7 +116,7 @@ def train_supervised_main(argv: list[str] | None = None) -> None:
             stress_activation_threshold=args.stress_activation_threshold,
             stress_loss_delay_steps=args.stress_loss_delay_steps,
             stress_loss_warmup_steps=args.stress_loss_warmup_steps,
-            use_style_token=args.use_style_token,
+            use_style_conditioning=args.use_style_conditioning,
             style_sample_dropout=args.style_sample_dropout,
             style_token_dropout=args.style_token_dropout,
             checkpoint_path=args.checkpoint_path,
