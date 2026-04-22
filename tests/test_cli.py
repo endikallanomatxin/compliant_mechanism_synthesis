@@ -375,9 +375,14 @@ def test_train_supervised_main_uses_default_local_style_config(tmp_path: Path) -
     assert checkpoint["model_config"]["style_local_scale"] == 0.05
     assert checkpoint["train_config"]["style_sample_dropout"] == 0.15
     assert checkpoint["train_config"]["style_token_dropout"] == 0.10
-    assert checkpoint["train_config"]["stiffness_loss_weight"] == 0.0025
-    assert checkpoint["train_config"]["stiffness_loss_delay_steps"] == 1000
-    assert checkpoint["train_config"]["stiffness_loss_warmup_steps"] == 2000
+    assert checkpoint["train_config"]["stiffness_loss_weight"] == 1e-6
+    assert checkpoint["train_config"]["stiffness_loss_delay_steps"] == 2000
+    assert checkpoint["train_config"]["stiffness_loss_warmup_steps"] == 18000
+    assert checkpoint["train_config"]["stress_loss_weight"] == 0.01
+    assert checkpoint["train_config"]["allowable_von_mises"] == 250e6
+    assert checkpoint["train_config"]["stress_activation_threshold"] == 0.15
+    assert checkpoint["train_config"]["stress_loss_delay_steps"] == 10000
+    assert checkpoint["train_config"]["stress_loss_warmup_steps"] == 10000
 
 
 def test_train_supervised_main_accepts_stiffness_schedule_flags(tmp_path: Path) -> None:
@@ -427,6 +432,61 @@ def test_train_supervised_main_accepts_stiffness_schedule_flags(tmp_path: Path) 
     assert checkpoint["train_config"]["stiffness_loss_weight"] == 0.2
     assert checkpoint["train_config"]["stiffness_loss_delay_steps"] == 7
     assert checkpoint["train_config"]["stiffness_loss_warmup_steps"] == 11
+
+
+def test_train_supervised_main_accepts_stress_schedule_flags(tmp_path: Path) -> None:
+    output_path = tmp_path / "dataset.pt"
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / "runs_dataset_stress"),
+        ]
+    )
+
+    checkpoint_path = tmp_path / "refiner_stress_flags.pt"
+    train_supervised_main(
+        [
+            "--dataset-path",
+            str(output_path),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--num-steps",
+            "2",
+            "--stress-loss-weight",
+            "0.03",
+            "--allowable-von-mises",
+            "300000000",
+            "--stress-activation-threshold",
+            "0.2",
+            "--stress-loss-delay-steps",
+            "13",
+            "--stress-loss-warmup-steps",
+            "17",
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--logdir",
+            str(tmp_path / "runs_supervised_stress_flags"),
+        ]
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    assert checkpoint["train_config"]["stress_loss_weight"] == 0.03
+    assert checkpoint["train_config"]["allowable_von_mises"] == 300000000.0
+    assert checkpoint["train_config"]["stress_activation_threshold"] == 0.2
+    assert checkpoint["train_config"]["stress_loss_delay_steps"] == 13
+    assert checkpoint["train_config"]["stress_loss_warmup_steps"] == 17
 
 
 def test_train_rl_main_writes_checkpoint_and_supports_warm_start(

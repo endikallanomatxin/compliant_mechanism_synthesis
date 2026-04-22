@@ -20,6 +20,7 @@ from compliant_mechanism_synthesis.dataset.types import (
 from compliant_mechanism_synthesis.losses import (
     generalized_stiffness_error,
     log_generalized_stiffness_error,
+    stress_violation_terms,
 )
 from compliant_mechanism_synthesis.mechanics import (
     Frame3DConfig,
@@ -75,6 +76,13 @@ class SupervisedTrainingConfig:
     #   resulting structure.
     stiffness_loss_delay_steps: int = 2_000
     stiffness_loss_warmup_steps: int = 18_000
+    
+    # STRESS LOSS
+    stress_loss_weight: float = 0.001
+    allowable_von_mises: float = 250e6
+    stress_activation_threshold: float = 0.15
+    stress_loss_delay_steps: int = 2_000
+    stress_loss_warmup_steps: int = 18_000
 
     checkpoint_path: str | None = None
     logdir: str = "runs/supervised"
@@ -173,23 +181,55 @@ def _stiffness_loss_weight_effective(
     step: int,
     config: SupervisedTrainingConfig,
 ) -> float:
-    if config.stiffness_loss_weight < 0.0:
-        raise ValueError("stiffness_loss_weight must be non-negative")
-    if config.stiffness_loss_delay_steps < 0:
-        raise ValueError("stiffness_loss_delay_steps must be non-negative")
-    if config.stiffness_loss_warmup_steps < 0:
-        raise ValueError("stiffness_loss_warmup_steps must be non-negative")
-    if config.stiffness_loss_weight == 0.0:
+    return _delayed_warmup_weight(
+        step=step,
+        final_weight=config.stiffness_loss_weight,
+        delay_steps=config.stiffness_loss_delay_steps,
+        warmup_steps=config.stiffness_loss_warmup_steps,
+        weight_name="stiffness_loss_weight",
+    )
+
+
+def _stress_loss_weight_effective(
+    step: int,
+    config: SupervisedTrainingConfig,
+) -> float:
+    return _delayed_warmup_weight(
+        step=step,
+        final_weight=config.stress_loss_weight,
+        delay_steps=config.stress_loss_delay_steps,
+        warmup_steps=config.stress_loss_warmup_steps,
+        weight_name="stress_loss_weight",
+    )
+
+
+def _delayed_warmup_weight(
+    *,
+    step: int,
+    final_weight: float,
+    delay_steps: int,
+    warmup_steps: int,
+    weight_name: str,
+) -> float:
+    if final_weight < 0.0:
+        raise ValueError(f"{weight_name} must be non-negative")
+    if delay_steps < 0:
+        raise ValueError(
+            f"{weight_name.replace('weight', 'delay_steps')} must be non-negative"
+        )
+    if warmup_steps < 0:
+        raise ValueError(
+            f"{weight_name.replace('weight', 'warmup_steps')} must be non-negative"
+        )
+    if final_weight == 0.0:
         return 0.0
-    if step < config.stiffness_loss_delay_steps:
+    if step < delay_steps:
         return 0.0
-    if config.stiffness_loss_warmup_steps == 0:
-        return config.stiffness_loss_weight
-    warmup_progress = (
-        step - config.stiffness_loss_delay_steps + 1
-    ) / config.stiffness_loss_warmup_steps
+    if warmup_steps == 0:
+        return final_weight
+    warmup_progress = (step - delay_steps + 1) / warmup_steps
     warmup_progress = min(max(warmup_progress, 0.0), 1.0)
-    return config.stiffness_loss_weight * warmup_progress
+    return final_weight * warmup_progress
 
 
 def load_supervised_cases(dataset_path: str) -> OptimizedCases:
@@ -663,7 +703,9 @@ def _training_losses(
     position_error = _position_velocity_loss(prediction, batch)
     adjacency_error = _adjacency_velocity_loss(prediction, batch)
     stiffness_weight_effective = _stiffness_loss_weight_effective(step, config)
-    if stiffness_weight_effective > 0.0:
+    stress_weight_effective = _stress_loss_weight_effective(step, config)
+    endpoint_analyses = None
+    if stiffness_weight_effective > 0.0 or stress_weight_effective > 0.0:
         _, _, free_mask = role_masks(batch.flow_structures.roles)
         free_mask = free_mask.unsqueeze(-1).to(dtype=prediction.position_velocity.dtype)
         remaining = (1.0 - batch.flow_times)[:, None, None]
@@ -684,12 +726,26 @@ def _training_losses(
             adjacency=estimated_adjacency,
         )
         endpoint_analyses = analyze_structures(estimated, profile=profile)
+    if stiffness_weight_effective > 0.0:
         stiffness_error = log_generalized_stiffness_error(
             endpoint_analyses.generalized_stiffness,
             batch.target_stiffness,
         )
     else:
         stiffness_error = position_error.new_zeros(position_error.shape)
+    if stress_weight_effective > 0.0:
+        if endpoint_analyses is None or endpoint_analyses.edge_von_mises is None:
+            raise ValueError("endpoint analyses must provide edge_von_mises")
+        stress_violation, mean_stress_ratio, max_stress_ratio = stress_violation_terms(
+            edge_von_mises=endpoint_analyses.edge_von_mises,
+            adjacency=estimated_adjacency,
+            allowable_von_mises=config.allowable_von_mises,
+            stress_activation_threshold=config.stress_activation_threshold,
+        )
+    else:
+        stress_violation = position_error.new_zeros(position_error.shape)
+        mean_stress_ratio = position_error.new_zeros(position_error.shape)
+        max_stress_ratio = position_error.new_zeros(position_error.shape)
     if prediction.style_kl is None or not config.use_style_token:
         style_kl = position_error.new_zeros(position_error.shape)
     else:
@@ -702,6 +758,7 @@ def _training_losses(
         * adjacency_error,
         "stiffness_error_loss_contribution": stiffness_weight_effective
         * stiffness_error,
+        "stress_loss_contribution": stress_weight_effective * stress_violation,
         "style_kl_loss_contribution": kl_weight * style_kl,
     }
     total_loss = (
@@ -716,6 +773,12 @@ def _training_losses(
         "stiffness_error": stiffness_error.mean(),
         "stiffness_loss_weight_effective": position_error.new_tensor(
             stiffness_weight_effective
+        ),
+        "stress_violation": stress_violation.mean(),
+        "mean_stress_ratio": mean_stress_ratio.mean(),
+        "max_stress_ratio": max_stress_ratio.mean(),
+        "stress_loss_weight_effective": position_error.new_tensor(
+            stress_weight_effective
         ),
         "style_kl": style_kl.mean(),
         "style_kl_weight": position_error.new_tensor(kl_weight),
@@ -852,6 +915,16 @@ def train_supervised_refiner(
         raise ValueError("stiffness_loss_delay_steps must be non-negative")
     if train_config.stiffness_loss_warmup_steps < 0:
         raise ValueError("stiffness_loss_warmup_steps must be non-negative")
+    if train_config.stress_loss_weight < 0.0:
+        raise ValueError("stress_loss_weight must be non-negative")
+    if train_config.allowable_von_mises <= 0.0:
+        raise ValueError("allowable_von_mises must be positive")
+    if not 0.0 <= train_config.stress_activation_threshold <= 1.0:
+        raise ValueError("stress_activation_threshold must be in [0.0, 1.0]")
+    if train_config.stress_loss_delay_steps < 0:
+        raise ValueError("stress_loss_delay_steps must be non-negative")
+    if train_config.stress_loss_warmup_steps < 0:
+        raise ValueError("stress_loss_warmup_steps must be non-negative")
     if not 0.0 <= train_config.style_sample_dropout <= 1.0:
         raise ValueError("style_sample_dropout must be in [0.0, 1.0]")
     if not 0.0 <= train_config.style_token_dropout <= 1.0:
@@ -880,6 +953,7 @@ def train_supervised_refiner(
         "position_error_loss_contribution": [],
         "adjacency_error_loss_contribution": [],
         "stiffness_error_loss_contribution": [],
+        "stress_loss_contribution": [],
         "style_kl_loss_contribution": [],
     }
     checkpoint_path = (
@@ -904,6 +978,11 @@ def train_supervised_refiner(
         f"stiffness_loss_weight={train_config.stiffness_loss_weight} "
         f"stiffness_loss_delay_steps={train_config.stiffness_loss_delay_steps} "
         f"stiffness_loss_warmup_steps={train_config.stiffness_loss_warmup_steps} "
+        f"stress_loss_weight={train_config.stress_loss_weight} "
+        f"allowable_von_mises={train_config.allowable_von_mises:.3e} "
+        f"stress_activation_threshold={train_config.stress_activation_threshold:.3f} "
+        f"stress_loss_delay_steps={train_config.stress_loss_delay_steps} "
+        f"stress_loss_warmup_steps={train_config.stress_loss_warmup_steps} "
         f"style_kl_loss_weight={train_config.style_kl_loss_weight} "
         f"style_kl_anneal_steps={train_config.style_kl_anneal_steps}",
         flush=True,
@@ -1034,6 +1113,11 @@ def train_supervised_refiner(
                 writer.add_scalar(
                     "train/parameters/stiffness_loss_weight_effective",
                     float(metrics["stiffness_loss_weight_effective"].detach().item()),
+                    step,
+                )
+                writer.add_scalar(
+                    "train/parameters/stress_loss_weight_effective",
+                    float(metrics["stress_loss_weight_effective"].detach().item()),
                     step,
                 )
                 writer.add_scalar("train/parameters/learning_rate", learning_rate, step)

@@ -26,6 +26,7 @@ from compliant_mechanism_synthesis.training import (
 from compliant_mechanism_synthesis.training.supervised import (
     _scheduled_learning_rate,
     _stiffness_loss_weight_effective,
+    _stress_loss_weight_effective,
     _style_kl_weight,
     _training_losses,
     split_train_eval_cases,
@@ -182,6 +183,54 @@ def test_stiffness_loss_weight_effective_jumps_after_delay_when_no_warmup() -> N
     assert _stiffness_loss_weight_effective(2, config) == pytest.approx(0.05)
 
 
+def test_stress_loss_weight_effective_is_zero_before_delay() -> None:
+    config = SupervisedTrainingConfig(
+        dataset_path="dataset.pt",
+        stress_loss_weight=0.01,
+        stress_loss_delay_steps=3,
+        stress_loss_warmup_steps=4,
+    )
+
+    assert _stress_loss_weight_effective(0, config) == pytest.approx(0.0)
+    assert _stress_loss_weight_effective(1, config) == pytest.approx(0.0)
+    assert _stress_loss_weight_effective(2, config) == pytest.approx(0.0)
+
+
+def test_stress_loss_weight_effective_warms_up_linearly() -> None:
+    config = SupervisedTrainingConfig(
+        dataset_path="dataset.pt",
+        stress_loss_weight=0.01,
+        stress_loss_delay_steps=2,
+        stress_loss_warmup_steps=4,
+    )
+
+    assert _stress_loss_weight_effective(3, config) == pytest.approx(0.005)
+
+
+def test_stress_loss_weight_effective_reaches_plateau() -> None:
+    config = SupervisedTrainingConfig(
+        dataset_path="dataset.pt",
+        stress_loss_weight=0.01,
+        stress_loss_delay_steps=2,
+        stress_loss_warmup_steps=4,
+    )
+
+    assert _stress_loss_weight_effective(6, config) == pytest.approx(0.01)
+    assert _stress_loss_weight_effective(20, config) == pytest.approx(0.01)
+
+
+def test_stress_loss_weight_effective_jumps_after_delay_when_no_warmup() -> None:
+    config = SupervisedTrainingConfig(
+        dataset_path="dataset.pt",
+        stress_loss_weight=0.01,
+        stress_loss_delay_steps=2,
+        stress_loss_warmup_steps=0,
+    )
+
+    assert _stress_loss_weight_effective(1, config) == pytest.approx(0.0)
+    assert _stress_loss_weight_effective(2, config) == pytest.approx(0.01)
+
+
 def test_split_train_eval_cases_uses_deterministic_tail_subset(tmp_path: Path) -> None:
     cases = _build_cases(tmp_path)
 
@@ -325,6 +374,117 @@ def test_training_losses_skip_endpoint_analysis_when_stiffness_weight_effective_
     ) == pytest.approx(0.0)
 
 
+def test_training_losses_skip_endpoint_analysis_when_stiffness_and_stress_weights_effective_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        )
+    )
+    batch = make_supervised_batch(optimized_cases=cases, seed=34)
+    prediction = model.predict_flow(
+        structures=batch.flow_structures,
+        target_stiffness=batch.target_stiffness,
+        current_stiffness=batch.current_analyses.generalized_stiffness,
+        nodal_displacements=batch.current_analyses.nodal_displacements,
+        edge_von_mises=batch.current_analyses.edge_von_mises,
+        flow_times=batch.flow_times,
+    )
+
+    def _fail_analyze(*args, **kwargs):
+        raise AssertionError("endpoint analysis should not run")
+
+    monkeypatch.setattr(supervised_training_module, "analyze_structures", _fail_analyze)
+    total_loss, metrics, loss_terms = _training_losses(
+        prediction,
+        batch,
+        SupervisedTrainingConfig(
+            dataset_path=str(tmp_path / "dataset.pt"),
+            stiffness_loss_weight=0.05,
+            stiffness_loss_delay_steps=10,
+            stiffness_loss_warmup_steps=5,
+            stress_loss_weight=0.01,
+            stress_loss_delay_steps=10,
+            stress_loss_warmup_steps=5,
+        ),
+        step=0,
+    )
+
+    assert torch.isfinite(total_loss)
+    assert float(metrics["stiffness_loss_weight_effective"].item()) == pytest.approx(
+        0.0
+    )
+    assert float(metrics["stress_loss_weight_effective"].item()) == pytest.approx(0.0)
+    assert float(
+        loss_terms["stiffness_error_loss_contribution"].item()
+    ) == pytest.approx(0.0)
+    assert float(loss_terms["stress_loss_contribution"].item()) == pytest.approx(0.0)
+
+
+def test_training_losses_reuse_single_endpoint_analysis_for_stiffness_and_stress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases = _build_cases(tmp_path)
+    model = SupervisedRefiner(
+        SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        )
+    )
+    batch = make_supervised_batch(optimized_cases=cases, seed=35)
+    prediction = model.predict_flow(
+        structures=batch.flow_structures,
+        target_stiffness=batch.target_stiffness,
+        current_stiffness=batch.current_analyses.generalized_stiffness,
+        nodal_displacements=batch.current_analyses.nodal_displacements,
+        edge_von_mises=batch.current_analyses.edge_von_mises,
+        flow_times=batch.flow_times,
+    )
+
+    analyze_calls = 0
+    original_analyze = supervised_training_module.analyze_structures
+
+    def _counting_analyze(*args, **kwargs):
+        nonlocal analyze_calls
+        analyze_calls += 1
+        return original_analyze(*args, **kwargs)
+
+    monkeypatch.setattr(
+        supervised_training_module, "analyze_structures", _counting_analyze
+    )
+    total_loss, metrics, loss_terms = _training_losses(
+        prediction,
+        batch,
+        SupervisedTrainingConfig(
+            dataset_path=str(tmp_path / "dataset.pt"),
+            stiffness_loss_weight=0.05,
+            stiffness_loss_delay_steps=0,
+            stiffness_loss_warmup_steps=0,
+            stress_loss_weight=0.01,
+            stress_loss_delay_steps=0,
+            stress_loss_warmup_steps=0,
+        ),
+        step=0,
+    )
+
+    assert torch.isfinite(total_loss)
+    assert analyze_calls == 1
+    assert float(metrics["stress_loss_weight_effective"].item()) == pytest.approx(0.01)
+    assert "stress_loss_contribution" in loss_terms
+    assert "stress_violation" in metrics
+    assert "mean_stress_ratio" in metrics
+    assert "max_stress_ratio" in metrics
+
+
 def test_train_supervised_refiner_supports_stiffness_delay_and_warmup(
     tmp_path: Path,
 ) -> None:
@@ -360,6 +520,41 @@ def test_train_supervised_refiner_supports_stiffness_delay_and_warmup(
         value > 0.0
         for value in summary.history["stiffness_error_loss_contribution"][2:]
     )
+
+
+def test_train_supervised_refiner_supports_stress_delay_and_warmup(
+    tmp_path: Path,
+) -> None:
+    cases = _build_cases(tmp_path)
+    _, summary = train_supervised_refiner(
+        optimized_cases=cases,
+        model_config=SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        ),
+        train_config=SupervisedTrainingConfig(
+            dataset_path=str(tmp_path / "dataset.pt"),
+            device="cpu",
+            batch_size=2,
+            num_steps=5,
+            eval_every_steps=5,
+            eval_fraction=0.25,
+            stress_loss_weight=0.02,
+            stress_loss_delay_steps=2,
+            stress_loss_warmup_steps=2,
+            checkpoint_path=str(tmp_path / "refiner_stress_schedule.pt"),
+            logdir=str(tmp_path / "runs_stress_schedule"),
+            seed=39,
+        ),
+    )
+
+    assert summary.checkpoint_path.exists()
+    assert "stress_loss_contribution" in summary.history
+    assert summary.history["stress_loss_contribution"][0] == pytest.approx(0.0)
+    assert summary.history["stress_loss_contribution"][1] == pytest.approx(0.0)
+    assert any(value > 0.0 for value in summary.history["stress_loss_contribution"][2:])
 
 
 def test_trained_refiner_beats_untrained_baseline_on_seen_batch(tmp_path: Path) -> None:

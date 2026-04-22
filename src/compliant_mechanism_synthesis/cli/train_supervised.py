@@ -46,6 +46,31 @@ def _build_parser() -> argparse.ArgumentParser:
         default=defaults.stiffness_loss_warmup_steps,
     )
     parser.add_argument(
+        "--stress-loss-weight",
+        type=float,
+        default=defaults.stress_loss_weight,
+    )
+    parser.add_argument(
+        "--allowable-von-mises",
+        type=float,
+        default=defaults.allowable_von_mises,
+    )
+    parser.add_argument(
+        "--stress-activation-threshold",
+        type=float,
+        default=defaults.stress_activation_threshold,
+    )
+    parser.add_argument(
+        "--stress-loss-delay-steps",
+        type=int,
+        default=defaults.stress_loss_delay_steps,
+    )
+    parser.add_argument(
+        "--stress-loss-warmup-steps",
+        type=int,
+        default=defaults.stress_loss_warmup_steps,
+    )
+    parser.add_argument(
         "--style-sample-dropout",
         type=float,
         default=defaults.style_sample_dropout,
@@ -86,6 +111,11 @@ def train_supervised_main(argv: list[str] | None = None) -> None:
             stiffness_loss_weight=args.stiffness_loss_weight,
             stiffness_loss_delay_steps=args.stiffness_loss_delay_steps,
             stiffness_loss_warmup_steps=args.stiffness_loss_warmup_steps,
+            stress_loss_weight=args.stress_loss_weight,
+            allowable_von_mises=args.allowable_von_mises,
+            stress_activation_threshold=args.stress_activation_threshold,
+            stress_loss_delay_steps=args.stress_loss_delay_steps,
+            stress_loss_warmup_steps=args.stress_loss_warmup_steps,
             use_style_token=args.use_style_token,
             style_sample_dropout=args.style_sample_dropout,
             style_token_dropout=args.style_token_dropout,
