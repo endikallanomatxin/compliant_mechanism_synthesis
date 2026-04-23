@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from compliant_mechanism_synthesis.training import load_supervised_cases
+from compliant_mechanism_synthesis.training import load_training_cases
 from compliant_mechanism_synthesis.visualization.supervised import (
     write_supervised_sampling_visualizations,
 )
@@ -49,7 +49,7 @@ def sample_supervised_main(argv: list[str] | None = None) -> None:
         else checkpoint_path.parent
         / f"{checkpoint_path.stem}_{dataset_path.stem}_samples"
     )
-    optimized_cases = load_supervised_cases(str(dataset_path))
+    optimized_cases = load_training_cases(str(dataset_path))
     write_supervised_sampling_visualizations(
         optimized_cases=optimized_cases,
         checkpoint_path=checkpoint_path,

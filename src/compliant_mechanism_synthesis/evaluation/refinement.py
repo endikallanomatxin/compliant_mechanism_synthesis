@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from compliant_mechanism_synthesis.dataset.types import OptimizedCases, Structures
 from compliant_mechanism_synthesis.losses import generalized_stiffness_error
 from compliant_mechanism_synthesis.models import SupervisedRefiner
-from compliant_mechanism_synthesis.training.supervised import (
+from compliant_mechanism_synthesis.training import (
     analyze_structures,
-    make_supervised_batch,
+    make_training_batch,
 )
 
 
@@ -24,7 +24,7 @@ def evaluate_refinement_step(
     optimized_cases: OptimizedCases,
     seed: int | None = None,
 ) -> RefinementMetrics:
-    batch = make_supervised_batch(
+    batch = make_training_batch(
         optimized_cases=optimized_cases,
         seed=seed,
     )

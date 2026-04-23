@@ -16,10 +16,7 @@ dependencies = [
 [project.scripts]
 cms-dataset-generate = "compliant_mechanism_synthesis.cli:dataset_generate_main"
 cms-sample = "compliant_mechanism_synthesis.cli:sample_supervised_main"
-cms-train-rl = "compliant_mechanism_synthesis.cli:train_rl_main"
-cms-train-rl-optimizer-supported = "compliant_mechanism_synthesis.cli:train_rl_optimizer_supported_main"
-cms-train-supervised = "compliant_mechanism_synthesis.cli:train_supervised_main"
-cms-upgrade-supervised-checkpoint = "compliant_mechanism_synthesis.cli:upgrade_supervised_checkpoint_main"
+cms-train = "compliant_mechanism_synthesis.cli:train_main"
 cms-dataset-visualize = "compliant_mechanism_synthesis.cli:visualize_dataset_main"
 
 [build-system]

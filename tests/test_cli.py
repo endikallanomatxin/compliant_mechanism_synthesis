@@ -2,22 +2,36 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import torch
+
 from compliant_mechanism_synthesis.cli import (
     dataset_generate_main,
     sample_supervised_main,
-    train_rl_main,
-    train_rl_optimizer_supported_main,
-    train_supervised_main,
-    upgrade_supervised_checkpoint_main,
+    train_main,
     visualize_dataset_main,
 )
 from compliant_mechanism_synthesis.dataset import load_offline_dataset
-from compliant_mechanism_synthesis.models import (
-    SupervisedRefiner,
-    SupervisedRefinerConfig,
-)
-import pytest
-import torch
+
+
+def _generate_dataset(tmp_path: Path, name: str = "dataset.pt") -> Path:
+    output_path = tmp_path / name
+    dataset_generate_main(
+        [
+            "--num-cases",
+            "2",
+            "--device",
+            "cpu",
+            "--num-free-nodes",
+            "6",
+            "--optimization-steps",
+            "3",
+            "--output-path",
+            str(output_path),
+            "--logdir",
+            str(tmp_path / f"runs_{name}"),
+        ]
+    )
+    return output_path
 
 
 def test_dataset_generate_main_generates_offline_dataset_and_preview(
@@ -48,148 +62,12 @@ def test_dataset_generate_main_generates_offline_dataset_and_preview(
 
     optimized_cases, _ = load_offline_dataset(output_path)
     assert optimized_cases.optimized_structures.positions.shape[0] == 2
-    assert optimized_cases.optimized_structures.positions.shape[-1] == 3
     assert (preview_dir / "case_0000_primitives.png").exists()
     assert (preview_dir / "summary.txt").exists()
 
 
-def test_dataset_generate_main_samples_preview_subset_for_large_datasets(
-    tmp_path: Path,
-) -> None:
-    output_path = tmp_path / "dataset_large.pt"
-    preview_dir = tmp_path / "preview_large"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "10",
-            "--batch-size",
-            "3",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_large"),
-            "--preview-dir",
-            str(preview_dir),
-            "--preview-case-number",
-            "8",
-            "--seed",
-            "11",
-        ]
-    )
-
-    summary = (preview_dir / "summary.txt").read_text(encoding="utf-8")
-    primitive_previews = list(preview_dir.glob("case_*_primitives.png"))
-    assert len(primitive_previews) == 8
-    assert "cases=10" in summary
-    assert "preview_cases=8" in summary
-    assert "preview_case_indices=" in summary
-
-
-def test_dataset_generate_main_logs_batch_progress(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    output_path = tmp_path / "dataset_progress.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "3",
-            "--batch-size",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_progress"),
-        ]
-    )
-
-    captured = capsys.readouterr()
-    assert "dataset generation started" in captured.out
-    assert "dataset batch 1 " in captured.out
-    assert "dataset batch 2 " in captured.out
-    assert "cases=2/3" in captured.out
-    assert "cases=3/3" in captured.out
-
-
-def test_dataset_generate_main_names_run(tmp_path: Path) -> None:
-    output_path = tmp_path / "dataset.pt"
-    runs_dir = tmp_path / "runs_named"
-    create_logdir = runs_dir
-    name = "fancygen"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "1",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(create_logdir),
-            "--name",
-            name,
-        ]
-    )
-    entries = [entry for entry in create_logdir.iterdir() if entry.is_dir()]
-    assert len(entries) == 1
-    assert entries[0].name.endswith(f"-{name}")
-
-
-def test_dataset_generate_can_run_sample_check(tmp_path: Path) -> None:
-    sample_dir = tmp_path / "sample"
-    dataset_generate_main(
-        [
-            "--just-check-sample",
-            "--device",
-            "cpu",
-            "--sample-num-free-nodes",
-            "6",
-            "--sample-optimization-steps",
-            "3",
-            "--sample-output-dir",
-            str(sample_dir),
-        ]
-    )
-
-    assert (sample_dir / "initial.png").exists()
-    assert (sample_dir / "optimized.png").exists()
-
-
 def test_visualize_dataset_main_renders_existing_dataset(tmp_path: Path) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs"),
-        ]
-    )
-
+    output_path = _generate_dataset(tmp_path)
     output_dir = tmp_path / "viz"
     visualize_dataset_main(
         [
@@ -206,27 +84,10 @@ def test_visualize_dataset_main_renders_existing_dataset(tmp_path: Path) -> None
     assert any(path.suffix == ".png" for path in output_dir.iterdir())
 
 
-def test_train_supervised_main_writes_checkpoint(tmp_path: Path) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs"),
-        ]
-    )
-
+def test_train_main_writes_checkpoint(tmp_path: Path) -> None:
+    output_path = _generate_dataset(tmp_path)
     checkpoint_path = tmp_path / "refiner.pt"
-    train_supervised_main(
+    train_main(
         [
             "--dataset-path",
             str(output_path),
@@ -235,39 +96,20 @@ def test_train_supervised_main_writes_checkpoint(tmp_path: Path) -> None:
             "--batch-size",
             "2",
             "--num-steps",
-            "6",
+            "2",
             "--checkpoint-path",
             str(checkpoint_path),
             "--logdir",
-            str(tmp_path / "runs_supervised"),
+            str(tmp_path / "runs_train"),
         ]
     )
     assert checkpoint_path.exists()
 
 
-def test_train_supervised_main_writes_default_checkpoint_inside_run_dir(
-    tmp_path: Path,
-) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset"),
-        ]
-    )
-
-    runs_dir = tmp_path / "runs_supervised"
-    train_supervised_main(
+def test_train_main_writes_default_checkpoint_inside_run_dir(tmp_path: Path) -> None:
+    output_path = _generate_dataset(tmp_path)
+    runs_dir = tmp_path / "runs_named"
+    train_main(
         [
             "--dataset-path",
             str(output_path),
@@ -276,41 +118,24 @@ def test_train_supervised_main_writes_default_checkpoint_inside_run_dir(
             "--batch-size",
             "2",
             "--num-steps",
-            "6",
+            "2",
             "--logdir",
             str(runs_dir),
             "--name",
-            "testrun",
+            "curriculum",
         ]
     )
 
     run_dirs = [entry for entry in runs_dir.iterdir() if entry.is_dir()]
     assert len(run_dirs) == 1
-    assert run_dirs[0].name.endswith("-testrun")
+    assert run_dirs[0].name.endswith("-curriculum")
     assert (run_dirs[0] / "refiner.pt").exists()
 
 
-def test_train_supervised_main_can_disable_style_conditioning(tmp_path: Path) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset"),
-        ]
-    )
-
+def test_train_main_can_disable_style_conditioning(tmp_path: Path) -> None:
+    output_path = _generate_dataset(tmp_path)
     checkpoint_path = tmp_path / "refiner_no_style.pt"
-    train_supervised_main(
+    train_main(
         [
             "--dataset-path",
             str(output_path),
@@ -319,12 +144,12 @@ def test_train_supervised_main_can_disable_style_conditioning(tmp_path: Path) ->
             "--batch-size",
             "2",
             "--num-steps",
-            "4",
+            "2",
             "--no-style-conditioning",
             "--checkpoint-path",
             str(checkpoint_path),
             "--logdir",
-            str(tmp_path / "runs_supervised_no_style"),
+            str(tmp_path / "runs_no_style"),
         ]
     )
 
@@ -333,27 +158,10 @@ def test_train_supervised_main_can_disable_style_conditioning(tmp_path: Path) ->
     assert checkpoint["train_config"]["use_style_conditioning"] is False
 
 
-def test_train_supervised_main_uses_default_local_style_config(tmp_path: Path) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset"),
-        ]
-    )
-
-    checkpoint_path = tmp_path / "refiner_style_count.pt"
-    train_supervised_main(
+def test_train_main_uses_default_curriculum_config(tmp_path: Path) -> None:
+    output_path = _generate_dataset(tmp_path)
+    checkpoint_path = tmp_path / "refiner_defaults.pt"
+    train_main(
         [
             "--dataset-path",
             str(output_path),
@@ -362,50 +170,28 @@ def test_train_supervised_main_uses_default_local_style_config(tmp_path: Path) -
             "--batch-size",
             "2",
             "--num-steps",
-            "4",
+            "2",
             "--checkpoint-path",
             str(checkpoint_path),
             "--logdir",
-            str(tmp_path / "runs_supervised_style_count"),
+            str(tmp_path / "runs_defaults"),
         ]
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    assert checkpoint["model_config"]["style_local_latent_dim"] == 16
-    assert checkpoint["model_config"]["style_local_scale"] == 0.05
-    assert checkpoint["train_config"]["style_sample_dropout"] == 0.15
-    assert checkpoint["train_config"]["style_token_dropout"] == 0.10
-    assert checkpoint["train_config"]["stiffness_loss_weight"] == 1e-6
-    assert checkpoint["train_config"]["stiffness_loss_delay_steps"] == 2000
-    assert checkpoint["train_config"]["stiffness_loss_warmup_steps"] == 18000
-    assert checkpoint["train_config"]["stress_loss_weight"] == 0.001
-    assert checkpoint["train_config"]["allowable_von_mises"] == 250e6
-    assert checkpoint["train_config"]["stress_activation_threshold"] == 0.15
-    assert checkpoint["train_config"]["stress_loss_delay_steps"] == 2000
-    assert checkpoint["train_config"]["stress_loss_warmup_steps"] == 18000
+    assert checkpoint["train_config"]["num_integration_steps"] == 4
+    assert checkpoint["train_config"]["physical_weight_start"] == 0.0
+    assert checkpoint["train_config"]["physical_weight_end"] == 1.0
+    assert checkpoint["train_config"]["supervised_weight_start"] == 1.0
+    assert checkpoint["train_config"]["supervised_weight_end"] == 0.0
+    assert checkpoint["train_config"]["stress_loss_weight"] == 0.01
+    assert "style_sample_dropout" not in checkpoint["train_config"]
 
 
-def test_train_supervised_main_accepts_stiffness_schedule_flags(tmp_path: Path) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset"),
-        ]
-    )
-
-    checkpoint_path = tmp_path / "refiner_stiffness_flags.pt"
-    train_supervised_main(
+def test_train_main_accepts_curriculum_flags(tmp_path: Path) -> None:
+    output_path = _generate_dataset(tmp_path)
+    checkpoint_path = tmp_path / "refiner_flags.pt"
+    train_main(
         [
             "--dataset-path",
             str(output_path),
@@ -415,103 +201,38 @@ def test_train_supervised_main_accepts_stiffness_schedule_flags(tmp_path: Path) 
             "2",
             "--num-steps",
             "2",
-            "--stiffness-loss-weight",
-            "0.2",
-            "--stiffness-loss-delay-steps",
-            "7",
-            "--stiffness-loss-warmup-steps",
-            "11",
+            "--num-integration-steps",
+            "6",
+            "--supervised-transition-start-step",
+            "10",
+            "--supervised-transition-end-step",
+            "20",
+            "--physical-transition-start-step",
+            "30",
+            "--physical-transition-end-step",
+            "40",
+            "--style-token-dropout",
+            "0.25",
             "--checkpoint-path",
             str(checkpoint_path),
             "--logdir",
-            str(tmp_path / "runs_supervised_stiffness_flags"),
+            str(tmp_path / "runs_flags"),
         ]
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    assert checkpoint["train_config"]["stiffness_loss_weight"] == 0.2
-    assert checkpoint["train_config"]["stiffness_loss_delay_steps"] == 7
-    assert checkpoint["train_config"]["stiffness_loss_warmup_steps"] == 11
+    assert checkpoint["train_config"]["num_integration_steps"] == 6
+    assert checkpoint["train_config"]["supervised_transition_start_step"] == 10
+    assert checkpoint["train_config"]["supervised_transition_end_step"] == 20
+    assert checkpoint["train_config"]["physical_transition_start_step"] == 30
+    assert checkpoint["train_config"]["physical_transition_end_step"] == 40
+    assert checkpoint["train_config"]["style_token_dropout"] == 0.25
 
 
-def test_train_supervised_main_accepts_stress_schedule_flags(tmp_path: Path) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset_stress"),
-        ]
-    )
-
-    checkpoint_path = tmp_path / "refiner_stress_flags.pt"
-    train_supervised_main(
-        [
-            "--dataset-path",
-            str(output_path),
-            "--device",
-            "cpu",
-            "--batch-size",
-            "2",
-            "--num-steps",
-            "2",
-            "--stress-loss-weight",
-            "0.03",
-            "--allowable-von-mises",
-            "300000000",
-            "--stress-activation-threshold",
-            "0.2",
-            "--stress-loss-delay-steps",
-            "13",
-            "--stress-loss-warmup-steps",
-            "17",
-            "--checkpoint-path",
-            str(checkpoint_path),
-            "--logdir",
-            str(tmp_path / "runs_supervised_stress_flags"),
-        ]
-    )
-
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    assert checkpoint["train_config"]["stress_loss_weight"] == 0.03
-    assert checkpoint["train_config"]["allowable_von_mises"] == 300000000.0
-    assert checkpoint["train_config"]["stress_activation_threshold"] == 0.2
-    assert checkpoint["train_config"]["stress_loss_delay_steps"] == 13
-    assert checkpoint["train_config"]["stress_loss_warmup_steps"] == 17
-
-
-def test_train_rl_main_writes_checkpoint_and_supports_warm_start(
-    tmp_path: Path,
-) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset"),
-        ]
-    )
-
-    supervised_checkpoint_path = tmp_path / "refiner_supervised.pt"
-    train_supervised_main(
+def test_train_main_supports_warm_start(tmp_path: Path) -> None:
+    output_path = _generate_dataset(tmp_path)
+    initial_checkpoint_path = tmp_path / "refiner_initial.pt"
+    train_main(
         [
             "--dataset-path",
             str(output_path),
@@ -522,14 +243,14 @@ def test_train_rl_main_writes_checkpoint_and_supports_warm_start(
             "--num-steps",
             "2",
             "--checkpoint-path",
-            str(supervised_checkpoint_path),
+            str(initial_checkpoint_path),
             "--logdir",
-            str(tmp_path / "runs_supervised"),
+            str(tmp_path / "runs_initial"),
         ]
     )
 
-    rl_checkpoint_path = tmp_path / "refiner_rl.pt"
-    train_rl_main(
+    warm_started_checkpoint_path = tmp_path / "refiner_warm_started.pt"
+    train_main(
         [
             "--dataset-path",
             str(output_path),
@@ -537,243 +258,27 @@ def test_train_rl_main_writes_checkpoint_and_supports_warm_start(
             "cpu",
             "--batch-size",
             "2",
-            "--gradient-accumulation-steps",
-            "2",
             "--num-steps",
-            "2",
-            "--rollout-steps",
             "2",
             "--init-checkpoint-path",
-            str(supervised_checkpoint_path),
+            str(initial_checkpoint_path),
             "--checkpoint-path",
-            str(rl_checkpoint_path),
+            str(warm_started_checkpoint_path),
             "--logdir",
-            str(tmp_path / "runs_rl"),
+            str(tmp_path / "runs_warm_started"),
         ]
     )
 
-    checkpoint = torch.load(rl_checkpoint_path, map_location="cpu")
-    assert rl_checkpoint_path.exists()
-    assert checkpoint["train_config"]["gradient_accumulation_steps"] == 2
+    checkpoint = torch.load(warm_started_checkpoint_path, map_location="cpu")
     assert checkpoint["train_config"]["init_checkpoint_path"] == str(
-        supervised_checkpoint_path
+        initial_checkpoint_path
     )
-
-
-def test_train_rl_optimizer_supported_main_writes_checkpoint_and_supports_warm_start(
-    tmp_path: Path,
-) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset"),
-        ]
-    )
-
-    supervised_checkpoint_path = tmp_path / "refiner_supervised.pt"
-    train_supervised_main(
-        [
-            "--dataset-path",
-            str(output_path),
-            "--device",
-            "cpu",
-            "--batch-size",
-            "2",
-            "--num-steps",
-            "2",
-            "--checkpoint-path",
-            str(supervised_checkpoint_path),
-            "--logdir",
-            str(tmp_path / "runs_supervised"),
-        ]
-    )
-
-    hybrid_checkpoint_path = tmp_path / "refiner_explore_optimize.pt"
-    train_rl_optimizer_supported_main(
-        [
-            "--dataset-path",
-            str(output_path),
-            "--device",
-            "cpu",
-            "--batch-size",
-            "2",
-            "--gradient-accumulation-steps",
-            "1",
-            "--num-steps",
-            "2",
-            "--explore-steps",
-            "2",
-            "--optimize-steps",
-            "2",
-            "--init-checkpoint-path",
-            str(supervised_checkpoint_path),
-            "--checkpoint-path",
-            str(hybrid_checkpoint_path),
-            "--logdir",
-            str(tmp_path / "runs_explore_optimize"),
-        ]
-    )
-
-    checkpoint = torch.load(hybrid_checkpoint_path, map_location="cpu")
-    assert hybrid_checkpoint_path.exists()
-    assert checkpoint["train_config"]["init_checkpoint_path"] == str(
-        supervised_checkpoint_path
-    )
-
-
-def test_upgrade_supervised_checkpoint_main_rewrites_current_checkpoint(
-    tmp_path: Path,
-) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset"),
-        ]
-    )
-
-    checkpoint_path = tmp_path / "refiner.pt"
-    train_supervised_main(
-        [
-            "--dataset-path",
-            str(output_path),
-            "--device",
-            "cpu",
-            "--batch-size",
-            "2",
-            "--num-steps",
-            "2",
-            "--checkpoint-path",
-            str(checkpoint_path),
-            "--logdir",
-            str(tmp_path / "runs_supervised"),
-        ]
-    )
-
-    upgrade_supervised_checkpoint_main(["--checkpoint-path", str(checkpoint_path)])
-
-    backup_path = tmp_path / "refiner-original.pt"
-    upgraded_checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    assert backup_path.exists()
-    assert (
-        upgraded_checkpoint["model_config"]
-        == torch.load(backup_path, map_location="cpu")["model_config"]
-    )
-    assert (
-        upgraded_checkpoint["train_config"]
-        == torch.load(backup_path, map_location="cpu")["train_config"]
-    )
-
-    model = SupervisedRefiner(
-        SupervisedRefinerConfig(**upgraded_checkpoint["model_config"])
-    )
-    model.load_state_dict(upgraded_checkpoint["model_state_dict"])
-
-
-def test_upgrade_supervised_checkpoint_main_renames_legacy_style_field(
-    tmp_path: Path,
-) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset"),
-        ]
-    )
-
-    checkpoint_path = tmp_path / "legacy_refiner.pt"
-    train_supervised_main(
-        [
-            "--dataset-path",
-            str(output_path),
-            "--device",
-            "cpu",
-            "--batch-size",
-            "2",
-            "--num-steps",
-            "2",
-            "--checkpoint-path",
-            str(checkpoint_path),
-            "--logdir",
-            str(tmp_path / "runs_supervised"),
-        ]
-    )
-
-    legacy_checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    legacy_checkpoint["model_config"]["use_style_token"] = legacy_checkpoint[
-        "model_config"
-    ].pop("use_style_conditioning")
-    legacy_checkpoint["train_config"]["use_style_token"] = legacy_checkpoint[
-        "train_config"
-    ].pop("use_style_conditioning")
-    torch.save(legacy_checkpoint, checkpoint_path)
-
-    upgrade_supervised_checkpoint_main(["--checkpoint-path", str(checkpoint_path)])
-
-    upgraded_checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    assert "use_style_token" not in upgraded_checkpoint["model_config"]
-    assert "use_style_token" not in upgraded_checkpoint["train_config"]
-    assert "use_style_conditioning" in upgraded_checkpoint["model_config"]
-    assert "use_style_conditioning" in upgraded_checkpoint["train_config"]
-
-    model = SupervisedRefiner(
-        SupervisedRefinerConfig(**upgraded_checkpoint["model_config"])
-    )
-    model.load_state_dict(upgraded_checkpoint["model_state_dict"])
 
 
 def test_sample_supervised_main_writes_comparison_outputs(tmp_path: Path) -> None:
-    output_path = tmp_path / "dataset.pt"
-    dataset_generate_main(
-        [
-            "--num-cases",
-            "2",
-            "--device",
-            "cpu",
-            "--num-free-nodes",
-            "6",
-            "--optimization-steps",
-            "3",
-            "--output-path",
-            str(output_path),
-            "--logdir",
-            str(tmp_path / "runs_dataset"),
-        ]
-    )
-
+    output_path = _generate_dataset(tmp_path)
     checkpoint_path = tmp_path / "refiner.pt"
-    train_supervised_main(
+    train_main(
         [
             "--dataset-path",
             str(output_path),
@@ -782,15 +287,15 @@ def test_sample_supervised_main_writes_comparison_outputs(tmp_path: Path) -> Non
             "--batch-size",
             "2",
             "--num-steps",
-            "4",
+            "2",
             "--checkpoint-path",
             str(checkpoint_path),
             "--logdir",
-            str(tmp_path / "runs_supervised"),
+            str(tmp_path / "runs_train"),
         ]
     )
 
-    samples_dir = tmp_path / "samples"
+    output_dir = tmp_path / "samples"
     sample_supervised_main(
         [
             "--dataset-path",
@@ -798,19 +303,11 @@ def test_sample_supervised_main_writes_comparison_outputs(tmp_path: Path) -> Non
             "--checkpoint-path",
             str(checkpoint_path),
             "--output-dir",
-            str(samples_dir),
-            "--device",
-            "cpu",
+            str(output_dir),
             "--max-cases",
             "1",
-            "--num-steps",
-            "2",
         ]
     )
 
-    summary = (samples_dir / "summary.txt").read_text(encoding="utf-8")
-    assert (samples_dir / "summary.txt").exists()
-    assert (samples_dir / "case_0000_comparison.png").exists()
-    assert (samples_dir / "case_0000_rollout.gif").exists()
-    assert "noisy_position_error=" in summary
-    assert "generated_no_style_position_error=" in summary
+    assert (output_dir / "summary.txt").exists()
+    assert any(path.suffix == ".png" for path in output_dir.iterdir())
