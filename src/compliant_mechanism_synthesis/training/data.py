@@ -349,6 +349,7 @@ def make_training_batch(
     adjacency_mean: torch.Tensor | None = None,
     adjacency_std: torch.Tensor | None = None,
     seed: int | None = None,
+    max_initial_time: float | None = None,
 ) -> TrainingBatch:
     source_structures = sample_noisy_structures(
         optimized_cases=optimized_cases,
@@ -374,6 +375,10 @@ def make_training_batch(
         device=source_structures.positions.device,
         dtype=source_structures.positions.dtype,
     )
+    if max_initial_time is not None:
+        if not 0.0 <= max_initial_time < 1.0:
+            raise ValueError("max_initial_time must be in [0.0, 1.0)")
+        initial_times = initial_times * max_initial_time
     interpolation = initial_times[:, None, None]
     initial_positions = torch.lerp(
         source_structures.positions,

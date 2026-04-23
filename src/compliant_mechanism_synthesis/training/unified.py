@@ -37,14 +37,14 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class FlowCurriculumTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 32
+    batch_size: int = 24
     log_every_steps: int = 10
     eval_every_steps: int = 100
     max_grad_norm: float = 1.0
     num_steps: int = 120_000
-    learning_rate: float = 1e-5
+    learning_rate: float = 1e-6
     warmup_steps: int = 1000
-    min_learning_rate: float = 4e-6
+    min_learning_rate: float = 1e-7
     eval_fraction: float = 0.02
     init_checkpoint_path: str | None = None
     checkpoint_path: str | None = None
@@ -52,7 +52,7 @@ class FlowCurriculumTrainingConfig:
     seed: int = 7
 
     num_integration_steps: int = 4
-    flow_target_epsilon: float = 1e-4
+    flow_target_epsilon: float = 0.02
 
     use_style_conditioning: bool = True
     style_token_dropout: float = 0.10
@@ -140,6 +140,13 @@ def local_flow_targets(
         oracle_structures.adjacency - current_structures.adjacency
     ) / remaining
     return target_position_velocity, target_adjacency_velocity
+
+
+def _max_initial_time(config: FlowCurriculumTrainingConfig) -> float:
+    max_initial_time = 1.0 - config.num_integration_steps * config.flow_target_epsilon
+    if max_initial_time <= 0.0:
+        raise ValueError("num_integration_steps * flow_target_epsilon must be < 1.0")
+    return max_initial_time
 
 
 def _scheduled_learning_rate(
@@ -296,6 +303,19 @@ def _euler_step(
     )
 
 
+def _safe_velocity(velocity: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(
+        velocity,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+
+def _all_finite_tensors(values: list[torch.Tensor]) -> bool:
+    return all(bool(torch.isfinite(value).all().item()) for value in values)
+
+
 def _aggregate_rollout_losses(
     *,
     supervised_step_losses: list[torch.Tensor],
@@ -401,7 +421,15 @@ def _trajectory_loss_terms(
             style_token_mask=style_token_mask,
         )
         if integration_index == 0 and prediction.style_kl is not None:
-            style_kl = prediction.style_kl
+            style_kl = torch.nan_to_num(
+                prediction.style_kl,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+        safe_position_velocity = _safe_velocity(prediction.position_velocity)
+        safe_adjacency_velocity = _safe_velocity(prediction.adjacency_velocity)
 
         target_position_velocity, target_adjacency_velocity = local_flow_targets(
             current,
@@ -410,12 +438,12 @@ def _trajectory_loss_terms(
             epsilon=config.flow_target_epsilon,
         )
         position_loss = _position_velocity_loss(
-            prediction.position_velocity,
+            safe_position_velocity,
             target_position_velocity,
             current.roles,
         )
         adjacency_loss = _adjacency_velocity_loss(
-            prediction.adjacency_velocity,
+            safe_adjacency_velocity,
             target_adjacency_velocity,
         )
         supervised_loss = (
@@ -461,8 +489,8 @@ def _trajectory_loss_terms(
 
         current = _euler_step(
             current_structures=current,
-            position_velocity=prediction.position_velocity,
-            adjacency_velocity=prediction.adjacency_velocity,
+            position_velocity=safe_position_velocity,
+            adjacency_velocity=safe_adjacency_velocity,
             step_sizes=step_sizes,
         )
 
@@ -636,6 +664,7 @@ def train_flow_refiner(
         raise ValueError("allowable_von_mises must be positive")
     if not 0.0 <= train_config.stress_activation_threshold <= 1.0:
         raise ValueError("stress_activation_threshold must be in [0.0, 1.0]")
+    _max_initial_time(train_config)
 
     split = split_train_eval_cases(optimized_cases, train_config.eval_fraction)
     train_cases = split.train_cases
@@ -667,6 +696,7 @@ def train_flow_refiner(
         "stiffness_loss_contribution": [],
         "stress_loss_contribution": [],
         "style_kl_loss_contribution": [],
+        "nonfinite_step_skips": [],
     }
     checkpoint_path = (
         Path(train_config.checkpoint_path)
@@ -706,6 +736,7 @@ def train_flow_refiner(
     try:
         step = 0
         examples_seen = 0
+        nonfinite_step_skips = 0
         while step < train_config.num_steps:
             for batch_cases in iter_training_batches(
                 train_cases,
@@ -730,6 +761,7 @@ def train_flow_refiner(
                     adjacency_mean=global_adjacency_mean,
                     adjacency_std=global_adjacency_std,
                     seed=train_config.seed + step,
+                    max_initial_time=_max_initial_time(train_config),
                 )
                 _synchronize_device_if_needed(device)
                 batch_build_time = time.perf_counter()
@@ -756,6 +788,26 @@ def train_flow_refiner(
                 )
                 _synchronize_device_if_needed(device)
                 loss_time = time.perf_counter()
+                if not _all_finite_tensors(
+                    [total_loss, *metrics.values(), *loss_terms.values()]
+                ):
+                    optimizer.zero_grad(set_to_none=True)
+                    nonfinite_step_skips += 1
+                    history["nonfinite_step_skips"].append(float(nonfinite_step_skips))
+                    writer.add_scalar(
+                        "train/gradients/nonfinite_step_skips",
+                        float(nonfinite_step_skips),
+                        step,
+                    )
+                    print(
+                        f"train step={step + 1}/{train_config.num_steps} skipped_update=yes reason=nonfinite_loss "
+                        f"nonfinite_step_skips={nonfinite_step_skips}",
+                        flush=True,
+                    )
+                    step += 1
+                    if step >= train_config.num_steps:
+                        break
+                    continue
 
                 gradient_metrics: dict[str, float] = {}
                 if train_config.log_gradient_diagnostics:
@@ -782,6 +834,24 @@ def train_flow_refiner(
                         max_norm=train_config.max_grad_norm,
                     ).item()
                 )
+                if not math.isfinite(grad_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    nonfinite_step_skips += 1
+                    history["nonfinite_step_skips"].append(float(nonfinite_step_skips))
+                    writer.add_scalar(
+                        "train/gradients/nonfinite_step_skips",
+                        float(nonfinite_step_skips),
+                        step,
+                    )
+                    print(
+                        f"train step={step + 1}/{train_config.num_steps} skipped_update=yes reason=nonfinite_grad "
+                        f"nonfinite_step_skips={nonfinite_step_skips}",
+                        flush=True,
+                    )
+                    step += 1
+                    if step >= train_config.num_steps:
+                        break
+                    continue
                 clipped = grad_norm > train_config.max_grad_norm
                 clip_ratio = grad_norm / train_config.max_grad_norm
                 optimizer.step()
@@ -811,8 +881,14 @@ def train_flow_refiner(
                 writer.add_scalar("train/gradients/grad_norm", grad_norm, step)
                 writer.add_scalar("train/gradients/clip_ratio", clip_ratio, step)
                 writer.add_scalar("train/gradients/clipped", float(clipped), step)
+                writer.add_scalar(
+                    "train/gradients/nonfinite_step_skips",
+                    float(nonfinite_step_skips),
+                    step,
+                )
                 for name, value in gradient_metrics.items():
                     writer.add_scalar(f"train/gradients/{name}", value, step)
+                history["nonfinite_step_skips"].append(float(nonfinite_step_skips))
 
                 examples_seen += batch_cases.optimized_structures.batch_size
                 if (
@@ -835,6 +911,7 @@ def train_flow_refiner(
                         f"lambda_sup={float(metrics['lambda_sup'].detach().item()):.6f} "
                         f"lambda_phys={float(metrics['lambda_phys'].detach().item()):.6f} "
                         f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
+                        f"nonfinite_step_skips={nonfinite_step_skips} "
                         f"clip_ratio={clip_ratio:.3f} "
                         f"t_transfer={batch_transfer_time - step_start_time:.3f}s "
                         f"t_batch={batch_build_time - batch_transfer_time:.3f}s "

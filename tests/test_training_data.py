@@ -79,6 +79,17 @@ def test_make_training_batch_returns_noisy_initial_and_oracle_structures(
     )
 
 
+def test_make_training_batch_respects_max_initial_time(tmp_path: Path) -> None:
+    _, optimized_cases = _build_cases(tmp_path)
+    batch = make_training_batch(
+        optimized_cases=optimized_cases,
+        seed=9,
+        max_initial_time=0.5,
+    )
+
+    assert bool((batch.initial_times <= 0.5).all().item())
+
+
 def test_sample_noisy_structures_is_seeded_gaussian_from_dataset_stats(
     tmp_path: Path,
 ) -> None:
