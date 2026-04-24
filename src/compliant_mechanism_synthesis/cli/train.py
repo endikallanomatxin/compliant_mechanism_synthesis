@@ -51,6 +51,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--flow-target-epsilon", type=float, default=defaults.flow_target_epsilon
     )
     parser.add_argument(
+        "--max-position-step", type=float, default=defaults.max_position_step
+    )
+    parser.add_argument(
+        "--max-adjacency-logit-step",
+        type=float,
+        default=defaults.max_adjacency_logit_step,
+    )
+    parser.add_argument(
         "--style-token-dropout", type=float, default=defaults.style_token_dropout
     )
     parser.add_argument(
@@ -70,6 +78,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--adjacency-loss-weight", type=float, default=defaults.adjacency_loss_weight
+    )
+    parser.add_argument(
+        "--position-huber-beta", type=float, default=defaults.position_huber_beta
+    )
+    parser.add_argument(
+        "--adjacency-huber-beta", type=float, default=defaults.adjacency_huber_beta
     )
     parser.add_argument(
         "--supervised-weight-start",
@@ -147,6 +161,27 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=defaults.stress_activation_threshold,
     )
+    parser.add_argument("--weight-decay", type=float, default=defaults.weight_decay)
+    parser.add_argument(
+        "--simulation-position-grad-clip-norm",
+        type=float,
+        default=defaults.simulation_position_grad_clip_norm,
+    )
+    parser.add_argument(
+        "--simulation-adjacency-grad-clip-norm",
+        type=float,
+        default=defaults.simulation_adjacency_grad_clip_norm,
+    )
+    parser.add_argument(
+        "--absolute-physical-loss-weight",
+        type=float,
+        default=defaults.absolute_physical_loss_weight,
+    )
+    parser.add_argument(
+        "--relative-physical-loss-weight",
+        type=float,
+        default=defaults.relative_physical_loss_weight,
+    )
     parser.add_argument("--init-checkpoint-path", default=defaults.init_checkpoint_path)
     parser.add_argument("--checkpoint-path", default=defaults.checkpoint_path)
     parser.add_argument("--logdir", default=defaults.logdir)
@@ -185,12 +220,16 @@ def train_main(argv: list[str] | None = None) -> None:
             seed=args.seed,
             num_integration_steps=args.num_integration_steps,
             flow_target_epsilon=args.flow_target_epsilon,
+            max_position_step=args.max_position_step,
+            max_adjacency_logit_step=args.max_adjacency_logit_step,
             use_style_conditioning=args.use_style_conditioning,
             style_token_dropout=args.style_token_dropout,
             style_kl_loss_weight=args.style_kl_loss_weight,
             style_kl_anneal_steps=args.style_kl_anneal_steps,
             position_loss_weight=args.position_loss_weight,
             adjacency_loss_weight=args.adjacency_loss_weight,
+            position_huber_beta=args.position_huber_beta,
+            adjacency_huber_beta=args.adjacency_huber_beta,
             supervised_weight_start=args.supervised_weight_start,
             supervised_weight_end=args.supervised_weight_end,
             supervised_transition_start_step=args.supervised_transition_start_step,
@@ -209,6 +248,11 @@ def train_main(argv: list[str] | None = None) -> None:
             free_node_spacing_penalty_weight=args.free_node_spacing_penalty_weight,
             allowable_von_mises=args.allowable_von_mises,
             stress_activation_threshold=args.stress_activation_threshold,
+            weight_decay=args.weight_decay,
+            simulation_position_grad_clip_norm=args.simulation_position_grad_clip_norm,
+            simulation_adjacency_grad_clip_norm=args.simulation_adjacency_grad_clip_norm,
+            absolute_physical_loss_weight=args.absolute_physical_loss_weight,
+            relative_physical_loss_weight=args.relative_physical_loss_weight,
             log_gradient_diagnostics=args.log_gradient_diagnostics,
         )
     )

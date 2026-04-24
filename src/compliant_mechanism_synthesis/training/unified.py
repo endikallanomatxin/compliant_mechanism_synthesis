@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from compliant_mechanism_synthesis.adjacency import logits_from_adjacency
@@ -48,8 +50,9 @@ class FlowCurriculumTrainingConfig:
     max_grad_norm: float = 1.0
     main_grad_clip_norm: float = 1.0
     physical_grad_clip_norm: float = 0.1
+    weight_decay: float = 1e-4
     num_steps: int = 120_000
-    learning_rate: float = 2e-5
+    learning_rate: float = 4e-5
     warmup_steps: int = 1000
     min_learning_rate: float = 1e-7
     eval_fraction: float = 0.02
@@ -60,14 +63,18 @@ class FlowCurriculumTrainingConfig:
 
     num_integration_steps: int = 3
     flow_target_epsilon: float = 0.02
+    max_position_step: float = 0.05
+    max_adjacency_logit_step: float = 1.0
 
     use_style_conditioning: bool = True
     style_token_dropout: float = 0.50
-    style_kl_loss_weight: float = 4e-5
+    style_kl_loss_weight: float = 1e-4
     style_kl_anneal_steps: int = 20_000
 
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.001  # Loss occurs in logit space
+    position_huber_beta: float = 0.02
+    adjacency_huber_beta: float = 0.05
     supervised_weight_start: float = 1.0
     supervised_weight_end: float = 0.0
     supervised_transition_start_step: int = 20_000
@@ -88,6 +95,10 @@ class FlowCurriculumTrainingConfig:
     free_node_spacing_penalty_weight: float = 0.0
     allowable_von_mises: float = 250e6
     stress_activation_threshold: float = 0.15
+    simulation_position_grad_clip_norm: float = 1.0
+    simulation_adjacency_grad_clip_norm: float = 0.25
+    absolute_physical_loss_weight: float = 1.0
+    relative_physical_loss_weight: float = 0.0
 
     log_gradient_diagnostics: bool = False
 
@@ -152,20 +163,18 @@ def local_flow_targets(
 
 
 def flow_step_predictions(
-    position_velocity: torch.Tensor,
-    adjacency_logit_velocity: torch.Tensor,
-    step_sizes: torch.Tensor,
+    position_step: torch.Tensor,
+    adjacency_logit_step: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if position_velocity.ndim != 3:
-        raise ValueError("position_velocity must have shape [batch, nodes, dims]")
-    if adjacency_logit_velocity.ndim != 3:
+    if position_step.ndim != 3:
+        raise ValueError("position_step must have shape [batch, nodes, dims]")
+    if adjacency_logit_step.ndim != 3:
+        raise ValueError("adjacency_logit_step must have shape [batch, nodes, nodes]")
+    if position_step.shape[:2] != adjacency_logit_step.shape[:2]:
         raise ValueError(
-            "adjacency_logit_velocity must have shape [batch, nodes, nodes]"
+            "position_step and adjacency_logit_step batch/node dims must match"
         )
-    if step_sizes.shape != (position_velocity.shape[0],):
-        raise ValueError("step_sizes must have shape [batch]")
-    step_scale = step_sizes[:, None, None]
-    return step_scale * position_velocity, step_scale * adjacency_logit_velocity
+    return position_step, adjacency_logit_step
 
 
 def local_flow_step_targets(
@@ -181,10 +190,10 @@ def local_flow_step_targets(
         flow_times=flow_times,
         epsilon=epsilon,
     )
-    return flow_step_predictions(
-        position_velocity=target_position_velocity,
-        adjacency_logit_velocity=target_adjacency_logit_velocity,
-        step_sizes=step_sizes,
+    step_scale = step_sizes[:, None, None]
+    return (
+        step_scale * target_position_velocity,
+        step_scale * target_adjacency_logit_velocity,
     )
 
 
@@ -297,39 +306,54 @@ def _position_step_loss(
     predicted_step: torch.Tensor,
     target_step: torch.Tensor,
     roles: torch.Tensor,
+    beta: float,
 ) -> torch.Tensor:
+    if beta <= 0.0:
+        raise ValueError("position_huber_beta must be positive")
     _, _, free_mask = role_masks(roles)
     free_mask = free_mask.unsqueeze(-1).to(dtype=predicted_step.dtype)
-    error = ((predicted_step - target_step).square() * free_mask).sum(dim=(1, 2))
-    denom = free_mask.sum(dim=(1, 2)).clamp_min(1.0)
-    return error / denom
+    return (
+        F.smooth_l1_loss(
+            predicted_step,
+            target_step,
+            reduction="none",
+            beta=beta,
+        )
+        * free_mask
+    ).mean(dim=(1, 2))
 
 
 def _adjacency_step_loss(
     predicted_step: torch.Tensor,
     target_step: torch.Tensor,
+    beta: float,
 ) -> torch.Tensor:
-    return (predicted_step - target_step).square().mean(dim=(1, 2))
+    if beta <= 0.0:
+        raise ValueError("adjacency_huber_beta must be positive")
+    return F.smooth_l1_loss(
+        predicted_step,
+        target_step,
+        reduction="none",
+        beta=beta,
+    ).mean(dim=(1, 2))
 
 
 def _euler_step(
     current_structures: Structures,
-    position_velocity: torch.Tensor,
-    adjacency_logit_velocity: torch.Tensor,
-    step_sizes: torch.Tensor,
+    position_step: torch.Tensor,
+    adjacency_logit_step: torch.Tensor,
 ) -> Structures:
     _, _, free_mask = role_masks(current_structures.roles)
     free_mask = free_mask.unsqueeze(-1).to(dtype=current_structures.positions.dtype)
-    step_scale = step_sizes[:, None, None]
     next_positions = torch.nan_to_num(
-        current_structures.positions + step_scale * position_velocity * free_mask,
+        current_structures.positions + position_step * free_mask,
         nan=0.0,
         posinf=1.0,
         neginf=0.0,
-    ).clamp(0.0, 1.0)
+    )
     current_adjacency_logits = logits_from_adjacency(current_structures.adjacency)
     next_adjacency_logits = torch.nan_to_num(
-        current_adjacency_logits + step_scale * adjacency_logit_velocity,
+        current_adjacency_logits + adjacency_logit_step,
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
@@ -354,6 +378,100 @@ def _safe_velocity(velocity: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _range_violation(values: torch.Tensor) -> torch.Tensor:
+    below = torch.relu(-values)
+    above = torch.relu(values - 1.0)
+    return (below + above).mean(dim=tuple(range(1, values.ndim)))
+
+
+def _clip_grad_norm_per_sample(max_norm: float):
+    if max_norm <= 0.0:
+        raise ValueError("per-sample gradient clip norm must be positive")
+
+    def hook(grad: torch.Tensor) -> torch.Tensor:
+        flat = grad.flatten(start_dim=1)
+        norm = flat.norm(dim=1).clamp_min(1e-12)
+        scale = (max_norm / norm).clamp_max(1.0)
+        return grad * scale.view(-1, *([1] * (grad.ndim - 1)))
+
+    return hook
+
+
+def _register_simulation_gradient_hooks(
+    structures: Structures,
+    config: FlowCurriculumTrainingConfig,
+) -> None:
+    if structures.positions.requires_grad:
+        structures.positions.register_hook(
+            _clip_grad_norm_per_sample(config.simulation_position_grad_clip_norm)
+        )
+    if structures.adjacency.requires_grad:
+        structures.adjacency.register_hook(
+            _clip_grad_norm_per_sample(config.simulation_adjacency_grad_clip_norm)
+        )
+
+
+def _structural_terms_and_metrics(
+    analyses: Analyses,
+    adjacency: torch.Tensor,
+    target_stiffness: torch.Tensor,
+    config: FlowCurriculumTrainingConfig,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    return structural_objective_terms(
+        analyses=analyses,
+        adjacency=adjacency,
+        target_stiffness=target_stiffness,
+        weights=StructuralObjectiveWeights(
+            stiffness=config.stiffness_loss_weight,
+            stress=config.stress_loss_weight,
+            material=config.material_loss_weight,
+            short_beam=config.short_beam_penalty_weight,
+            long_beam=config.long_beam_penalty_weight,
+            thin_beam=config.thin_beam_penalty_weight,
+            thick_beam=config.thick_beam_penalty_weight,
+            free_node_spacing=config.free_node_spacing_penalty_weight,
+        ),
+        allowable_von_mises=config.allowable_von_mises,
+        stress_activation_threshold=config.stress_activation_threshold,
+    )
+
+
+def _optimizer_parameter_groups(
+    model: nn.Module,
+    weight_decay: float,
+) -> list[dict[str, object]]:
+    if weight_decay < 0.0:
+        raise ValueError("weight_decay must be non-negative")
+    parameter_lookup = dict(model.named_parameters())
+    no_decay_names: set[str] = set()
+    for module_name, module in model.named_modules():
+        for parameter_name, _parameter in module.named_parameters(recurse=False):
+            full_name = (
+                parameter_name if not module_name else f"{module_name}.{parameter_name}"
+            )
+            if parameter_name.endswith("bias"):
+                no_decay_names.add(full_name)
+            if isinstance(module, (nn.LayerNorm, nn.Embedding)):
+                no_decay_names.add(full_name)
+    for name in parameter_lookup:
+        if name.endswith("_raw_scale"):
+            no_decay_names.add(name)
+
+    decay_params: list[nn.Parameter] = []
+    no_decay_params: list[nn.Parameter] = []
+    for name, parameter in parameter_lookup.items():
+        if not parameter.requires_grad:
+            continue
+        if name in no_decay_names:
+            no_decay_params.append(parameter)
+        else:
+            decay_params.append(parameter)
+    return [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+
 def _all_finite_tensors(values: list[torch.Tensor]) -> bool:
     return all(bool(torch.isfinite(value).all().item()) for value in values)
 
@@ -363,6 +481,11 @@ def _physical_loss_enabled(
     lambda_phys: float,
 ) -> bool:
     if lambda_phys <= 0.0:
+        return False
+    if (
+        config.absolute_physical_loss_weight <= 0.0
+        and config.relative_physical_loss_weight <= 0.0
+    ):
         return False
     return any(
         weight > 0.0
@@ -649,6 +772,8 @@ def _trajectory_loss_terms(
     supervised_step_losses: list[torch.Tensor] = []
     position_step_losses: list[torch.Tensor] = []
     adjacency_step_losses: list[torch.Tensor] = []
+    position_range_violations: list[torch.Tensor] = []
+    adjacency_range_violations: list[torch.Tensor] = []
 
     for integration_index, flow_times in enumerate(step_times):
         current_stiffness, nodal_displacements, edge_von_mises = _conditioning_inputs(
@@ -679,15 +804,12 @@ def _trajectory_loss_terms(
                 neginf=0.0,
             )
 
-        safe_position_velocity = _safe_velocity(prediction.position_velocity)
-        safe_adjacency_logit_velocity = _safe_velocity(
-            prediction.adjacency_logit_velocity
-        )
+        safe_position_step = _safe_velocity(prediction.position_step)
+        safe_adjacency_logit_step = _safe_velocity(prediction.adjacency_logit_step)
 
         predicted_position_step, predicted_adjacency_step = flow_step_predictions(
-            position_velocity=safe_position_velocity,
-            adjacency_logit_velocity=safe_adjacency_logit_velocity,
-            step_sizes=step_sizes,
+            position_step=safe_position_step,
+            adjacency_logit_step=safe_adjacency_logit_step,
         )
         target_position_step, target_adjacency_step = local_flow_step_targets(
             current_structures=current,
@@ -700,10 +822,12 @@ def _trajectory_loss_terms(
             predicted_position_step,
             target_position_step,
             current.roles,
+            beta=config.position_huber_beta,
         )
         adjacency_loss = _adjacency_step_loss(
             predicted_adjacency_step,
             target_adjacency_step,
+            beta=config.adjacency_huber_beta,
         )
         supervised_loss = (
             config.position_loss_weight * position_loss
@@ -713,14 +837,36 @@ def _trajectory_loss_terms(
         supervised_step_losses.append(supervised_loss)
         position_step_losses.append(position_loss)
         adjacency_step_losses.append(adjacency_loss)
+        position_range_violations.append(
+            _range_violation(current.positions + predicted_position_step)
+        )
+        current_logits = logits_from_adjacency(current.adjacency)
+        adjacency_range_violations.append(
+            _range_violation(torch.sigmoid(current_logits + predicted_adjacency_step))
+        )
 
         current = _euler_step(
             current_structures=current,
-            position_velocity=safe_position_velocity,
-            adjacency_logit_velocity=safe_adjacency_logit_velocity,
-            step_sizes=step_sizes,
+            position_step=safe_position_step,
+            adjacency_logit_step=safe_adjacency_logit_step,
         )
 
+    initial_physical_loss = None
+    if physical_loss_enabled and config.relative_physical_loss_weight > 0.0:
+        with torch.no_grad():
+            initial_analyses = analyze_structures(
+                batch.initial_structures, profile=profile
+            )
+            initial_structural_terms, _ = _structural_terms_and_metrics(
+                analyses=initial_analyses,
+                adjacency=batch.initial_structures.adjacency,
+                target_stiffness=batch.target_stiffness,
+                config=config,
+            )
+            initial_physical_loss = sum(initial_structural_terms.values()).detach()
+
+    if physical_loss_enabled:
+        _register_simulation_gradient_hooks(current, config)
     endpoint_analyses = _endpoint_analyses(
         current,
         physical_loss_enabled=physical_loss_enabled,
@@ -734,26 +880,27 @@ def _trajectory_loss_terms(
             endpoint_metrics,
         ) = _zero_endpoint_physical_terms(batch.initial_times)
     else:
-        structural_terms, endpoint_metrics = structural_objective_terms(
+        structural_terms, endpoint_metrics = _structural_terms_and_metrics(
             analyses=endpoint_analyses,
             adjacency=current.adjacency,
             target_stiffness=batch.target_stiffness,
-            weights=StructuralObjectiveWeights(
-                stiffness=config.stiffness_loss_weight,
-                stress=config.stress_loss_weight,
-                material=config.material_loss_weight,
-                short_beam=config.short_beam_penalty_weight,
-                long_beam=config.long_beam_penalty_weight,
-                thin_beam=config.thin_beam_penalty_weight,
-                thick_beam=config.thick_beam_penalty_weight,
-                free_node_spacing=config.free_node_spacing_penalty_weight,
-            ),
-            allowable_von_mises=config.allowable_von_mises,
-            stress_activation_threshold=config.stress_activation_threshold,
+            config=config,
         )
         endpoint_stiffness_loss = structural_terms["stiffness_loss_contribution"]
         endpoint_stress_loss = structural_terms["stress_loss_contribution"]
-        endpoint_physical_loss = sum(structural_terms.values())
+        endpoint_absolute_physical_loss = sum(structural_terms.values())
+        endpoint_relative_physical_loss = (
+            endpoint_absolute_physical_loss.new_zeros(
+                endpoint_absolute_physical_loss.shape
+            )
+            if initial_physical_loss is None
+            else torch.log1p(endpoint_absolute_physical_loss)
+            - torch.log1p(initial_physical_loss)
+        )
+        endpoint_physical_loss = (
+            config.absolute_physical_loss_weight * endpoint_absolute_physical_loss
+            + config.relative_physical_loss_weight * endpoint_relative_physical_loss
+        )
 
     total_loss, loss_terms = _aggregate_rollout_losses(
         supervised_step_losses=supervised_step_losses,
@@ -774,6 +921,12 @@ def _trajectory_loss_terms(
         .mean(dim=0)
         .mean(),
         "adjacency_step_loss": torch.stack(adjacency_step_losses, dim=0)
+        .mean(dim=0)
+        .mean(),
+        "position_range_violation": torch.stack(position_range_violations, dim=0)
+        .mean(dim=0)
+        .mean(),
+        "adjacency_range_violation": torch.stack(adjacency_range_violations, dim=0)
         .mean(dim=0)
         .mean(),
         "stiffness_error": endpoint_metrics["stiffness_error"].mean(),
@@ -878,6 +1031,8 @@ def _load_initial_model(
     effective_config = model_config or SupervisedRefinerConfig(
         use_style_conditioning=train_config.use_style_conditioning,
         num_integration_steps=train_config.num_integration_steps,
+        max_position_step=train_config.max_position_step,
+        max_adjacency_logit_step=train_config.max_adjacency_logit_step,
     )
     model = SupervisedRefiner(effective_config).to(device)
     if train_config.init_checkpoint_path is None:
@@ -885,7 +1040,12 @@ def _load_initial_model(
 
     checkpoint = torch.load(train_config.init_checkpoint_path, map_location=device)
     if model_config is None:
-        effective_config = SupervisedRefinerConfig(**checkpoint["model_config"])
+        checkpoint_model_config = dict(checkpoint["model_config"])
+        checkpoint_model_config["max_position_step"] = train_config.max_position_step
+        checkpoint_model_config["max_adjacency_logit_step"] = (
+            train_config.max_adjacency_logit_step
+        )
+        effective_config = SupervisedRefinerConfig(**checkpoint_model_config)
         model = SupervisedRefiner(effective_config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     return model, effective_config
@@ -913,10 +1073,20 @@ def train_flow_refiner(
         raise ValueError("main_grad_clip_norm must be positive")
     if train_config.physical_grad_clip_norm <= 0.0:
         raise ValueError("physical_grad_clip_norm must be positive")
+    if train_config.weight_decay < 0.0:
+        raise ValueError("weight_decay must be non-negative")
     if train_config.num_integration_steps <= 0:
         raise ValueError("num_integration_steps must be positive")
     if train_config.flow_target_epsilon <= 0.0:
         raise ValueError("flow_target_epsilon must be positive")
+    if train_config.max_position_step <= 0.0:
+        raise ValueError("max_position_step must be positive")
+    if train_config.max_adjacency_logit_step <= 0.0:
+        raise ValueError("max_adjacency_logit_step must be positive")
+    if train_config.position_huber_beta <= 0.0:
+        raise ValueError("position_huber_beta must be positive")
+    if train_config.adjacency_huber_beta <= 0.0:
+        raise ValueError("adjacency_huber_beta must be positive")
     if not 0.0 <= train_config.style_token_dropout <= 1.0:
         raise ValueError("style_token_dropout must be in [0.0, 1.0]")
     if not 0.0 <= train_config.eval_fraction < 1.0:
@@ -925,6 +1095,14 @@ def train_flow_refiner(
         raise ValueError("allowable_von_mises must be positive")
     if not 0.0 <= train_config.stress_activation_threshold <= 1.0:
         raise ValueError("stress_activation_threshold must be in [0.0, 1.0]")
+    if train_config.simulation_position_grad_clip_norm <= 0.0:
+        raise ValueError("simulation_position_grad_clip_norm must be positive")
+    if train_config.simulation_adjacency_grad_clip_norm <= 0.0:
+        raise ValueError("simulation_adjacency_grad_clip_norm must be positive")
+    if train_config.absolute_physical_loss_weight < 0.0:
+        raise ValueError("absolute_physical_loss_weight must be non-negative")
+    if train_config.relative_physical_loss_weight < 0.0:
+        raise ValueError("relative_physical_loss_weight must be non-negative")
     _max_initial_time(train_config)
 
     split = split_train_eval_cases(optimized_cases, train_config.eval_fraction)
@@ -949,7 +1127,10 @@ def train_flow_refiner(
     model, effective_model_config = _load_initial_model(
         device, train_config, model_config
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
+    optimizer = torch.optim.AdamW(
+        _optimizer_parameter_groups(model, train_config.weight_decay),
+        lr=train_config.learning_rate,
+    )
     history: dict[str, list[float]] = {
         "total_loss": [],
         "supervised_loss_contribution": [],
@@ -973,10 +1154,13 @@ def train_flow_refiner(
         f"eval_fraction={train_config.eval_fraction:.4f} steps_per_epoch={steps_per_epoch} "
         f"device={device} init_checkpoint={train_config.init_checkpoint_path or 'none'} "
         f"num_integration_steps={train_config.num_integration_steps} "
+        f"max_position_step={train_config.max_position_step} "
+        f"max_adjacency_logit_step={train_config.max_adjacency_logit_step} "
         f"use_style_conditioning={'yes' if effective_model_config.use_style_conditioning else 'no'} "
         f"style_token_dropout={train_config.style_token_dropout:.3f} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
         f"min_learning_rate={train_config.min_learning_rate} "
+        f"weight_decay={train_config.weight_decay} "
         f"supervised_weight_start={train_config.supervised_weight_start:.4f} "
         f"supervised_weight_end={train_config.supervised_weight_end:.4f} "
         f"supervised_transition_start_step={train_config.supervised_transition_start_step} "
@@ -990,7 +1174,13 @@ def train_flow_refiner(
         f"allowable_von_mises={train_config.allowable_von_mises:.3e} "
         f"stress_activation_threshold={train_config.stress_activation_threshold:.3f} "
         f"style_kl_loss_weight={train_config.style_kl_loss_weight} "
-        f"style_kl_anneal_steps={train_config.style_kl_anneal_steps}",
+        f"style_kl_anneal_steps={train_config.style_kl_anneal_steps} "
+        f"position_huber_beta={train_config.position_huber_beta} "
+        f"adjacency_huber_beta={train_config.adjacency_huber_beta} "
+        f"simulation_position_grad_clip_norm={train_config.simulation_position_grad_clip_norm} "
+        f"simulation_adjacency_grad_clip_norm={train_config.simulation_adjacency_grad_clip_norm} "
+        f"absolute_physical_loss_weight={train_config.absolute_physical_loss_weight} "
+        f"relative_physical_loss_weight={train_config.relative_physical_loss_weight}",
         flush=True,
     )
 

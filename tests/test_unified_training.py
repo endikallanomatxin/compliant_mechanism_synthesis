@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from compliant_mechanism_synthesis.adjacency import logits_from_adjacency
 from compliant_mechanism_synthesis.dataset import (
@@ -12,7 +13,11 @@ from compliant_mechanism_synthesis.dataset import (
     generate_offline_dataset,
 )
 from compliant_mechanism_synthesis.dataset.types import Analyses, Structures
-from compliant_mechanism_synthesis.models import SupervisedRefinerConfig
+from compliant_mechanism_synthesis.models import (
+    SupervisedRefiner,
+    SupervisedRefinerConfig,
+)
+from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.training import (
     FlowCurriculumTrainingConfig,
     flow_step_predictions,
@@ -25,9 +30,13 @@ from compliant_mechanism_synthesis.training import (
 )
 from compliant_mechanism_synthesis.training.unified import (
     _aggregate_rollout_losses,
+    _clip_grad_norm_per_sample,
     _conditioning_inputs,
     _euler_step,
+    _adjacency_step_loss,
     _objective_clipped_gradients,
+    _optimizer_parameter_groups,
+    _position_step_loss,
     _trajectory_loss_terms,
 )
 
@@ -133,18 +142,16 @@ def test_local_flow_step_targets_use_dt_correctly(tmp_path: Path) -> None:
     )
 
 
-def test_flow_step_predictions_supervise_effective_step_not_raw_velocity() -> None:
-    position_velocity = torch.tensor([[[10.0, 0.0, 0.0]]])
-    adjacency_logit_velocity = torch.tensor([[[0.0]]])
-    step_sizes = torch.tensor([0.1])
+def test_flow_step_predictions_return_model_steps_directly() -> None:
+    position_step = torch.tensor([[[0.05, 0.0, 0.0]]])
+    adjacency_logit_step = torch.tensor([[[0.0]]])
 
     predicted_position_step, predicted_adjacency_step = flow_step_predictions(
-        position_velocity=position_velocity,
-        adjacency_logit_velocity=adjacency_logit_velocity,
-        step_sizes=step_sizes,
+        position_step=position_step,
+        adjacency_logit_step=adjacency_logit_step,
     )
 
-    assert torch.allclose(predicted_position_step, torch.tensor([[[1.0, 0.0, 0.0]]]))
+    assert torch.allclose(predicted_position_step, position_step)
     assert torch.allclose(predicted_adjacency_step, torch.tensor([[[0.0]]]))
 
 
@@ -183,21 +190,18 @@ def test_euler_step_updates_adjacency_in_logit_space() -> None:
         roles=torch.tensor([[0, 2, 2]], dtype=torch.long),
         adjacency=torch.tensor([[[0.0, 0.2, 0.3], [0.2, 0.0, 0.4], [0.3, 0.4, 0.0]]]),
     )
-    step_sizes = torch.tensor([0.5])
-    adjacency_logit_velocity = torch.tensor(
+    adjacency_logit_step = torch.tensor(
         [[[0.0, 1.0, -2.0], [1.0, 0.0, 0.5], [-2.0, 0.5, 0.0]]]
     )
 
     next_structures = _euler_step(
         current_structures=structures,
-        position_velocity=torch.zeros_like(structures.positions),
-        adjacency_logit_velocity=adjacency_logit_velocity,
-        step_sizes=step_sizes,
+        position_step=torch.zeros_like(structures.positions),
+        adjacency_logit_step=adjacency_logit_step,
     )
 
     expected = torch.sigmoid(
-        logits_from_adjacency(structures.adjacency)
-        + step_sizes[:, None, None] * adjacency_logit_velocity
+        logits_from_adjacency(structures.adjacency) + adjacency_logit_step
     )
     expected[:, 0, 0] = 0.0
     expected[:, 1, 1] = 0.0
@@ -216,23 +220,78 @@ def test_euler_step_does_not_use_direct_adjacency_clamp_dynamics() -> None:
         roles=torch.tensor([[0, 2, 2]], dtype=torch.long),
         adjacency=torch.tensor([[[0.0, 0.2, 0.3], [0.2, 0.0, 0.4], [0.3, 0.4, 0.0]]]),
     )
-    step_sizes = torch.tensor([0.5])
-    adjacency_logit_velocity = torch.tensor(
+    adjacency_logit_step = torch.tensor(
         [[[0.0, 4.0, -4.0], [4.0, 0.0, 0.5], [-4.0, 0.5, 0.0]]]
     )
 
     next_structures = _euler_step(
         current_structures=structures,
-        position_velocity=torch.zeros_like(structures.positions),
-        adjacency_logit_velocity=adjacency_logit_velocity,
-        step_sizes=step_sizes,
+        position_step=torch.zeros_like(structures.positions),
+        adjacency_logit_step=adjacency_logit_step,
     )
     direct_clamp = torch.clamp(
-        structures.adjacency + step_sizes[:, None, None] * adjacency_logit_velocity,
+        structures.adjacency + adjacency_logit_step,
         0.0,
         1.0,
     )
     assert not torch.allclose(next_structures.adjacency, direct_clamp)
+
+
+def test_supervised_refiner_has_head_norms_and_positive_branch_scales() -> None:
+    model = SupervisedRefiner(SupervisedRefinerConfig())
+
+    assert isinstance(model.position_head_norm, nn.LayerNorm)
+    assert isinstance(model.connectivity_head_norm, nn.LayerNorm)
+    assert float(model._positive_scale(model.nodal_raw_scale).detach().item()) > 0.0
+    assert float(model._positive_scale(model.mechanics_raw_scale).detach().item()) > 0.0
+    assert (
+        float(model._positive_scale(model.local_geometry_raw_scale).detach().item())
+        > 0.0
+    )
+    assert float(model._positive_scale(model.time_raw_scale).detach().item()) > 0.0
+    assert (
+        float(model._positive_scale(model.style_residual_raw_scale).detach().item())
+        > 0.0
+    )
+
+
+def test_supervised_step_losses_use_smooth_l1() -> None:
+    roles = torch.tensor([[0, 2]])
+    position_loss = _position_step_loss(
+        predicted_step=torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]]),
+        target_step=torch.zeros(1, 2, 3),
+        roles=roles,
+        beta=1.0,
+    )
+    adjacency_loss = _adjacency_step_loss(
+        predicted_step=torch.tensor([[[0.0, 2.0], [2.0, 0.0]]]),
+        target_step=torch.zeros(1, 2, 2),
+        beta=1.0,
+    )
+
+    assert torch.allclose(position_loss, torch.tensor([0.25]))
+    assert torch.allclose(adjacency_loss, torch.tensor([0.75]))
+
+
+def test_euler_step_keeps_position_unclamped_and_reports_real_motion() -> None:
+    structures = Structures(
+        positions=torch.tensor([[[0.99, 0.01, 0.5], [0.5, 0.5, 0.0], [1.0, 0.0, 0.0]]]),
+        roles=torch.tensor([[0, 2, 2]], dtype=torch.long),
+        adjacency=torch.tensor([[[0.0, 0.2, 0.3], [0.2, 0.0, 0.4], [0.3, 0.4, 0.0]]]),
+    )
+
+    next_structures = _euler_step(
+        current_structures=structures,
+        position_step=torch.tensor(
+            [[[0.0, 0.0, 0.0], [0.1, -0.1, 0.0], [0.0, 0.0, 0.0]]]
+        ),
+        adjacency_logit_step=torch.zeros_like(structures.adjacency),
+    )
+
+    assert torch.allclose(
+        next_structures.positions,
+        torch.tensor([[[0.99, 0.01, 0.5], [0.6, 0.4, 0.0], [1.0, 0.0, 0.0]]]),
+    )
 
 
 def test_aggregate_rollout_losses_uses_step_mean_and_endpoint_physics() -> None:
@@ -350,6 +409,33 @@ def test_objective_clipped_gradients_main_loss_can_include_kl_without_extra_grou
     assert torch.allclose(combined_gradients[0], torch.tensor([[1.5]]))
 
 
+def test_clip_grad_norm_per_sample_scales_each_sample_independently() -> None:
+    hook = _clip_grad_norm_per_sample(2.0)
+    grad = torch.tensor([[[3.0, 4.0]], [[0.3, 0.4]]])
+
+    clipped = hook(grad)
+
+    assert torch.allclose(clipped[0], torch.tensor([[1.2, 1.6]]))
+    assert torch.allclose(clipped[1], grad[1])
+
+
+def test_optimizer_parameter_groups_disable_decay_for_norms_biases_embeddings_and_scales() -> (
+    None
+):
+    refiner = SupervisedRefiner(SupervisedRefinerConfig())
+
+    parameter_groups = _optimizer_parameter_groups(refiner, weight_decay=1e-4)
+    decay_ids = {id(parameter) for parameter in parameter_groups[0]["params"]}
+    no_decay_ids = {id(parameter) for parameter in parameter_groups[1]["params"]}
+
+    assert id(refiner.role_embedding.weight) in no_decay_ids
+    assert id(refiner.input_norm.weight) in no_decay_ids
+    assert id(refiner.position_head_norm.weight) in no_decay_ids
+    assert id(refiner.position_head[0].bias) in no_decay_ids
+    assert id(refiner.mechanics_raw_scale) in no_decay_ids
+    assert id(refiner.position_head[0].weight) in decay_ids
+
+
 def test_conditioning_inputs_use_no_grad_when_enabled(
     tmp_path: Path,
     monkeypatch,
@@ -454,8 +540,8 @@ def test_trajectory_loss_terms_uses_endpoint_only_physics(
                 "Prediction",
                 (),
                 {
-                    "position_velocity": torch.zeros_like(structures.positions),
-                    "adjacency_logit_velocity": torch.zeros_like(structures.adjacency),
+                    "position_step": torch.zeros_like(structures.positions),
+                    "adjacency_logit_step": torch.zeros_like(structures.adjacency),
                     "style_kl": None,
                 },
             )()
@@ -561,8 +647,8 @@ def test_trajectory_loss_terms_skips_all_analysis_when_physics_is_disabled(
                 "Prediction",
                 (),
                 {
-                    "position_velocity": torch.zeros_like(structures.positions),
-                    "adjacency_logit_velocity": torch.zeros_like(structures.adjacency),
+                    "position_step": torch.zeros_like(structures.positions),
+                    "adjacency_logit_step": torch.zeros_like(structures.adjacency),
                     "style_kl": None,
                 },
             )()
@@ -605,6 +691,122 @@ def test_trajectory_loss_terms_skips_all_analysis_when_physics_is_disabled(
     assert torch.allclose(loss_terms["physical_loss"], torch.tensor(0.0))
     assert torch.allclose(loss_terms["physical_loss_contribution"], torch.tensor(0.0))
     assert torch.allclose(metrics["stiffness_error"], torch.tensor(0.0))
+
+
+def test_trajectory_loss_terms_can_use_relative_endpoint_physical_loss(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _, cases = _build_cases(tmp_path)
+    batch = make_training_batch(cases, seed=5)
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.config = SupervisedRefinerConfig(use_style_conditioning=False)
+
+        def predict_flow(
+            self,
+            *,
+            structures: Structures,
+            target_stiffness: torch.Tensor,
+            current_stiffness: torch.Tensor,
+            nodal_displacements: torch.Tensor,
+            edge_von_mises: torch.Tensor,
+            flow_times: torch.Tensor,
+            style_structures,
+            style_analyses,
+            style_token_mask,
+        ):
+            del (
+                target_stiffness,
+                current_stiffness,
+                nodal_displacements,
+                edge_von_mises,
+                flow_times,
+                style_structures,
+                style_analyses,
+                style_token_mask,
+            )
+            return type(
+                "Prediction",
+                (),
+                {
+                    "position_step": torch.full_like(structures.positions, 0.01),
+                    "adjacency_logit_step": torch.zeros_like(structures.adjacency),
+                    "style_kl": None,
+                },
+            )()
+
+    def fake_analyze_structures(current: Structures, profile=None) -> Analyses:
+        del profile
+        base = current.positions.sum(dim=(1, 2))
+        batch_size, num_nodes, _ = current.positions.shape
+        return Analyses(
+            generalized_stiffness=base[:, None, None].expand(batch_size, 6, 6),
+            material_usage=base,
+            short_beam_penalty=torch.zeros_like(base),
+            long_beam_penalty=torch.zeros_like(base),
+            thin_beam_penalty=torch.zeros_like(base),
+            thick_beam_penalty=torch.zeros_like(base),
+            free_node_spacing_penalty=torch.zeros_like(base),
+            nodal_displacements=torch.zeros(batch_size, num_nodes, 18),
+            edge_von_mises=torch.zeros(batch_size, num_nodes, num_nodes, 6),
+        )
+
+    def fake_structural_objective_terms(**kwargs):
+        analyses = kwargs["analyses"]
+        value = analyses.material_usage
+        zeros = torch.zeros_like(value)
+        return (
+            {
+                "stiffness_loss_contribution": value,
+                "stress_loss_contribution": zeros,
+            },
+            {
+                "stiffness_error": value,
+                "stress_violation": zeros,
+                "mean_stress_ratio": zeros,
+                "max_stress_ratio": zeros,
+            },
+        )
+
+    monkeypatch.setattr(
+        "compliant_mechanism_synthesis.training.unified.analyze_structures",
+        fake_analyze_structures,
+    )
+    monkeypatch.setattr(
+        "compliant_mechanism_synthesis.training.unified.structural_objective_terms",
+        fake_structural_objective_terms,
+    )
+
+    _, _, loss_terms = _trajectory_loss_terms(
+        model=FakeModel(),
+        batch=batch,
+        config=FlowCurriculumTrainingConfig(
+            dataset_path="dataset.pt",
+            num_integration_steps=2,
+            physical_weight_start=1.0,
+            physical_weight_end=1.0,
+            physical_transition_start_step=0,
+            physical_transition_end_step=0,
+            absolute_physical_loss_weight=0.5,
+            relative_physical_loss_weight=0.5,
+        ),
+        step=0,
+    )
+
+    _, _, free_mask = role_masks(batch.initial_structures.roles)
+    position_delta = 0.02 * free_mask.unsqueeze(-1).to(
+        dtype=batch.initial_structures.positions.dtype
+    )
+    initial_loss = batch.initial_structures.positions.sum(dim=(1, 2)).mean()
+    endpoint_loss = (
+        (batch.initial_structures.positions + position_delta).sum(dim=(1, 2)).mean()
+    )
+    expected = 0.5 * endpoint_loss + 0.5 * (
+        torch.log1p(endpoint_loss) - torch.log1p(initial_loss)
+    )
+    assert torch.allclose(loss_terms["physical_loss"], expected)
 
 
 def test_train_flow_refiner_writes_checkpoint_and_history(tmp_path: Path) -> None:

@@ -37,10 +37,14 @@ def _signed_log1p_features(values: torch.Tensor) -> torch.Tensor:
     return torch.sign(safe_values) * torch.log1p(safe_values.abs())
 
 
+def _inverse_softplus(value: float) -> float:
+    return math.log(math.expm1(value))
+
+
 @dataclass(frozen=True)
 class FlowPrediction:
-    position_velocity: torch.Tensor
-    adjacency_logit_velocity: torch.Tensor
+    position_step: torch.Tensor
+    adjacency_logit_step: torch.Tensor
     predicted_adjacency: torch.Tensor
     connectivity_latents: torch.Tensor
     style_latent: torch.Tensor | None = None
@@ -80,6 +84,8 @@ class SupervisedRefinerConfig:
     local_bar_transformer_layers: int = 1
     # Inference
     num_integration_steps: int = 8
+    max_position_step: float = 0.05
+    max_adjacency_logit_step: float = 1.0
     # Units
     max_distance: float = 0.24
     transition_width: float = 0.08
@@ -632,6 +638,8 @@ class SupervisedRefiner(nn.Module):
             else None
         )
         self.input_norm = nn.LayerNorm(self.config.hidden_dim)
+        self.position_head_norm = nn.LayerNorm(self.config.hidden_dim)
+        self.connectivity_head_norm = nn.LayerNorm(self.config.hidden_dim)
         self.layers = nn.ModuleList(
             [
                 GraphAttentionBlock(
@@ -672,6 +680,24 @@ class SupervisedRefiner(nn.Module):
         )
         nn.init.normal_(self.position_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.position_head[-1].bias)
+        self.nodal_raw_scale = nn.Parameter(
+            torch.tensor(_inverse_softplus(0.1), dtype=torch.float32)
+        )
+        self.mechanics_raw_scale = nn.Parameter(
+            torch.tensor(_inverse_softplus(0.1), dtype=torch.float32)
+        )
+        self.local_geometry_raw_scale = nn.Parameter(
+            torch.tensor(_inverse_softplus(1.0), dtype=torch.float32)
+        )
+        self.time_raw_scale = nn.Parameter(
+            torch.tensor(_inverse_softplus(1.0), dtype=torch.float32)
+        )
+        self.style_residual_raw_scale = nn.Parameter(
+            torch.tensor(_inverse_softplus(0.1), dtype=torch.float32)
+        )
+
+    def _positive_scale(self, raw_scale: torch.Tensor) -> torch.Tensor:
+        return F.softplus(raw_scale)
 
     def _style_conditioning(
         self,
@@ -844,10 +870,16 @@ class SupervisedRefiner(nn.Module):
         normalized_residual_stiffness = (
             normalized_target_stiffness - normalized_current_stiffness
         )
-        hidden = self.position_mlp(positions) + self.nodal_displacement_mlp(
-            _signed_log1p_features(nodal_displacements)
+        hidden = self.position_mlp(positions)
+        hidden = hidden + self._positive_scale(
+            self.nodal_raw_scale
+        ) * self.nodal_displacement_mlp(_signed_log1p_features(nodal_displacements))
+        hidden = hidden + self._positive_scale(
+            self.local_geometry_raw_scale
+        ) * self.local_geometry_encoder(
+            positions,
+            current_adjacency,
         )
-        hidden = hidden + self.local_geometry_encoder(positions, current_adjacency)
         hidden = hidden + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
         edge_stress_conditioning = self.edge_von_mises_mlp(
@@ -866,10 +898,15 @@ class SupervisedRefiner(nn.Module):
             ],
             dim=1,
         )
-        hidden = hidden + self.mechanics_condition_mlp(mechanics_features)[:, None, :]
         hidden = (
             hidden
-            + self.time_mlp(sinusoidal_embedding(flow_times, self.config.hidden_dim))[
+            + self._positive_scale(self.mechanics_raw_scale)
+            * self.mechanics_condition_mlp(mechanics_features)[:, None, :]
+        )
+        hidden = (
+            hidden
+            + self._positive_scale(self.time_raw_scale)
+            * self.time_mlp(sinusoidal_embedding(flow_times, self.config.hidden_dim))[
                 :, None, :
             ]
         )
@@ -888,7 +925,10 @@ class SupervisedRefiner(nn.Module):
             style_token_mask=style_token_mask,
         )
         if style_residual is not None:
-            hidden = hidden + style_residual
+            hidden = (
+                hidden
+                + self._positive_scale(self.style_residual_raw_scale) * style_residual
+            )
 
         for layer in self.layers:
             hidden = layer(
@@ -899,8 +939,12 @@ class SupervisedRefiner(nn.Module):
             )
 
         hidden = self.final_norm(hidden)
-        position_velocity = self.position_head(hidden)
-        connectivity_latents = self.connectivity_latent_head(hidden)
+        position_step = self.config.max_position_step * torch.tanh(
+            self.position_head(self.position_head_norm(hidden))
+        )
+        connectivity_latents = self.connectivity_latent_head(
+            self.connectivity_head_norm(hidden)
+        )
         # Connectivity updates stay grounded in node latents, but use a
         # symmetric pair scorer and update adjacency in logit space.
         pair_features = _symmetric_pair_edge_features(
@@ -916,15 +960,17 @@ class SupervisedRefiner(nn.Module):
             transition_width=self.config.transition_width,
         )
         current_logits = logits_from_adjacency(current_adjacency)
-        adjacency_logit_velocity = delta_logit * update_gate
-        updated_logits = current_logits + adjacency_logit_velocity
+        adjacency_logit_step = (
+            self.config.max_adjacency_logit_step * torch.tanh(delta_logit) * update_gate
+        )
+        updated_logits = current_logits + adjacency_logit_step
         predicted_adjacency = enforce_role_adjacency_constraints(
             torch.sigmoid(updated_logits),
             roles,
         )
         return FlowPrediction(
-            position_velocity=position_velocity,
-            adjacency_logit_velocity=adjacency_logit_velocity,
+            position_step=position_step,
+            adjacency_logit_step=adjacency_logit_step,
             predicted_adjacency=predicted_adjacency,
             connectivity_latents=connectivity_latents,
             style_latent=style_latent,
@@ -1007,17 +1053,14 @@ class SupervisedRefiner(nn.Module):
                 style_structures=style_structures,
                 style_analyses=style_analyses,
             )
-            step_size = 1.0 / num_steps
-            positions = (
-                current.positions + step_size * prediction.position_velocity * free_mask
-            ).clamp(0.0, 1.0)
+            positions = current.positions + prediction.position_step * free_mask
             current_logits = logits_from_adjacency(current.adjacency)
             adjacency = enforce_role_adjacency_constraints(
-                torch.sigmoid(
-                    current_logits + step_size * prediction.adjacency_logit_velocity
-                ),
+                torch.sigmoid(current_logits + prediction.adjacency_logit_step),
                 current.roles,
             )
+            if not bool(((0.0 <= positions) & (positions <= 1.0)).all().item()):
+                raise ValueError("rollout produced positions outside [0, 1]")
             current = Structures(
                 positions=positions,
                 roles=current.roles,
