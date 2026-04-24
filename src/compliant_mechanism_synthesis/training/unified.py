@@ -305,10 +305,6 @@ def _adjacency_step_loss(
     return (predicted_step - target_step).square().mean(dim=(1, 2))
 
 
-def _physical_time_weight(flow_times: torch.Tensor) -> torch.Tensor:
-    return flow_times.clamp(0.0, 1.0)
-
-
 def _euler_step(
     current_structures: Structures,
     position_velocity: torch.Tensor,
@@ -374,81 +370,98 @@ def _physical_loss_enabled(
     )
 
 
-def _detach_analyses(analyses: Analyses) -> Analyses:
-    return Analyses(
-        generalized_stiffness=analyses.generalized_stiffness.detach(),
-        material_usage=analyses.material_usage.detach(),
-        short_beam_penalty=analyses.short_beam_penalty.detach(),
-        long_beam_penalty=analyses.long_beam_penalty.detach(),
-        thin_beam_penalty=analyses.thin_beam_penalty.detach(),
-        thick_beam_penalty=analyses.thick_beam_penalty.detach(),
-        free_node_spacing_penalty=analyses.free_node_spacing_penalty.detach(),
-        nodal_displacements=(
-            None
-            if analyses.nodal_displacements is None
-            else analyses.nodal_displacements.detach()
-        ),
-        edge_von_mises=(
-            None
-            if analyses.edge_von_mises is None
-            else analyses.edge_von_mises.detach()
-        ),
+def _zero_conditioning_inputs(
+    current: Structures,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, num_nodes, _ = current.positions.shape
+    dtype = current.positions.dtype
+    device = current.positions.device
+    return (
+        torch.zeros(batch_size, 6, 6, device=device, dtype=dtype),
+        torch.zeros(batch_size, num_nodes, 18, device=device, dtype=dtype),
+        torch.zeros(batch_size, num_nodes, num_nodes, 6, device=device, dtype=dtype),
     )
 
 
-def _step_analyses(
+def _conditioning_inputs(
     current: Structures,
-    config: FlowCurriculumTrainingConfig,
-    lambda_phys: float,
+    *,
+    use_analysis: bool,
     profile: dict[str, float] | None = None,
-) -> tuple[Analyses, Analyses]:
-    if _physical_loss_enabled(config, lambda_phys):
-        physical_analyses = analyze_structures(current, profile=profile)
-        return _detach_analyses(physical_analyses), physical_analyses
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not use_analysis:
+        return _zero_conditioning_inputs(current)
 
     with torch.no_grad():
-        conditioning_analyses = analyze_structures(current, profile=profile)
-    return conditioning_analyses, conditioning_analyses
+        analyses = analyze_structures(current, profile=profile)
+    if analyses.nodal_displacements is None:
+        raise ValueError("analyze_structures must provide nodal_displacements")
+    if analyses.edge_von_mises is None:
+        raise ValueError("analyze_structures must provide edge_von_mises")
+    return (
+        analyses.generalized_stiffness,
+        analyses.nodal_displacements,
+        analyses.edge_von_mises,
+    )
+
+
+def _endpoint_analyses(
+    current: Structures,
+    *,
+    physical_loss_enabled: bool,
+    profile: dict[str, float] | None = None,
+) -> Analyses | None:
+    if not physical_loss_enabled:
+        return None
+    analyses = analyze_structures(current, profile=profile)
+    if analyses.nodal_displacements is None:
+        raise ValueError("analyze_structures must provide nodal_displacements")
+    if analyses.edge_von_mises is None:
+        raise ValueError("analyze_structures must provide edge_von_mises")
+    return analyses
 
 
 def _aggregate_rollout_losses(
     *,
     supervised_step_losses: list[torch.Tensor],
-    physical_step_losses: list[torch.Tensor],
-    weighted_physical_step_losses: list[torch.Tensor],
-    weighted_stiffness_step_losses: list[torch.Tensor],
-    weighted_stress_step_losses: list[torch.Tensor],
+    endpoint_physical_loss: torch.Tensor,
+    endpoint_stiffness_loss: torch.Tensor,
+    endpoint_stress_loss: torch.Tensor,
     style_kl: torch.Tensor,
     lambda_sup: float,
     lambda_phys: float,
     lambda_kl: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     supervised_total = torch.stack(supervised_step_losses, dim=0).mean(dim=0)
-    physical_total = torch.stack(physical_step_losses, dim=0).mean(dim=0)
-    weighted_physical_total = torch.stack(weighted_physical_step_losses, dim=0).mean(
-        dim=0
-    )
-    weighted_stiffness_total = torch.stack(weighted_stiffness_step_losses, dim=0).mean(
-        dim=0
-    )
-    weighted_stress_total = torch.stack(weighted_stress_step_losses, dim=0).mean(dim=0)
     total_loss = (
         lambda_sup * supervised_total
-        + lambda_phys * weighted_physical_total
+        + lambda_phys * endpoint_physical_loss
         + lambda_kl * style_kl
     )
     loss_terms = {
         "supervised_loss_contribution": lambda_sup * supervised_total.mean(),
-        "physical_loss_contribution": lambda_phys * weighted_physical_total.mean(),
-        "stiffness_loss_contribution": lambda_phys * weighted_stiffness_total.mean(),
-        "stress_loss_contribution": lambda_phys * weighted_stress_total.mean(),
+        "physical_loss_contribution": lambda_phys * endpoint_physical_loss.mean(),
+        "stiffness_loss_contribution": lambda_phys * endpoint_stiffness_loss.mean(),
+        "stress_loss_contribution": lambda_phys * endpoint_stress_loss.mean(),
         "style_kl_loss_contribution": lambda_kl * style_kl.mean(),
         "supervised_loss": supervised_total.mean(),
-        "physical_loss": physical_total.mean(),
-        "time_weighted_physical_loss": weighted_physical_total.mean(),
+        "physical_loss": endpoint_physical_loss.mean(),
         "total_loss": total_loss.mean(),
     }
     return total_loss.mean(), loss_terms
+
+
+def _zero_endpoint_physical_terms(
+    reference: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    zeros = torch.zeros_like(reference)
+    metrics = {
+        "stiffness_error": zeros,
+        "stress_violation": zeros,
+        "mean_stress_ratio": zeros,
+        "max_stress_ratio": zeros,
+    }
+    return zeros, zeros, zeros, metrics
 
 
 def _grad_norm_for_loss(loss: torch.Tensor, model: SupervisedRefiner) -> torch.Tensor:
@@ -476,6 +489,7 @@ def _trajectory_loss_terms(
     lambda_sup = _supervised_weight(step, config)
     lambda_phys = _physical_weight(step, config)
     lambda_kl = _style_kl_weight(step, config)
+    physical_loss_enabled = _physical_loss_enabled(config, lambda_phys)
     step_times, step_sizes = rollout_step_schedule(
         batch.initial_times,
         config.num_integration_steps,
@@ -483,34 +497,21 @@ def _trajectory_loss_terms(
     current = batch.initial_structures
     style_kl = batch.initial_times.new_zeros(batch.initial_times.shape)
     supervised_step_losses: list[torch.Tensor] = []
-    physical_step_losses: list[torch.Tensor] = []
-    weighted_physical_step_losses: list[torch.Tensor] = []
-    weighted_stiffness_step_losses: list[torch.Tensor] = []
-    weighted_stress_step_losses: list[torch.Tensor] = []
     position_step_losses: list[torch.Tensor] = []
     adjacency_step_losses: list[torch.Tensor] = []
-    stiffness_errors: list[torch.Tensor] = []
-    stress_violations: list[torch.Tensor] = []
-    mean_stress_ratios: list[torch.Tensor] = []
-    max_stress_ratios: list[torch.Tensor] = []
 
     for integration_index, flow_times in enumerate(step_times):
-        conditioning_analyses, physical_analyses = _step_analyses(
+        current_stiffness, nodal_displacements, edge_von_mises = _conditioning_inputs(
             current=current,
-            config=config,
-            lambda_phys=lambda_phys,
+            use_analysis=physical_loss_enabled,
             profile=profile,
         )
-        if conditioning_analyses.nodal_displacements is None:
-            raise ValueError("analyze_structures must provide nodal_displacements")
-        if conditioning_analyses.edge_von_mises is None:
-            raise ValueError("analyze_structures must provide edge_von_mises")
         prediction = model.predict_flow(
             structures=current,
             target_stiffness=batch.target_stiffness,
-            current_stiffness=conditioning_analyses.generalized_stiffness,
-            nodal_displacements=conditioning_analyses.nodal_displacements,
-            edge_von_mises=conditioning_analyses.edge_von_mises,
+            current_stiffness=current_stiffness,
+            nodal_displacements=nodal_displacements,
+            edge_von_mises=edge_von_mises,
             flow_times=flow_times,
             style_structures=(
                 batch.oracle_structures if model.config.use_style_conditioning else None
@@ -556,8 +557,33 @@ def _trajectory_loss_terms(
             config.position_loss_weight * position_loss
             + config.adjacency_loss_weight * adjacency_loss
         )
-        structural_terms, structural_metrics = structural_objective_terms(
-            analyses=physical_analyses,
+
+        supervised_step_losses.append(supervised_loss)
+        position_step_losses.append(position_loss)
+        adjacency_step_losses.append(adjacency_loss)
+
+        current = _euler_step(
+            current_structures=current,
+            position_velocity=safe_position_velocity,
+            adjacency_velocity=safe_adjacency_velocity,
+            step_sizes=step_sizes,
+        )
+
+    endpoint_analyses = _endpoint_analyses(
+        current,
+        physical_loss_enabled=physical_loss_enabled,
+        profile=profile,
+    )
+    if endpoint_analyses is None:
+        (
+            endpoint_physical_loss,
+            endpoint_stiffness_loss,
+            endpoint_stress_loss,
+            endpoint_metrics,
+        ) = _zero_endpoint_physical_terms(batch.initial_times)
+    else:
+        structural_terms, endpoint_metrics = structural_objective_terms(
+            analyses=endpoint_analyses,
             adjacency=current.adjacency,
             target_stiffness=batch.target_stiffness,
             weights=StructuralObjectiveWeights(
@@ -573,39 +599,15 @@ def _trajectory_loss_terms(
             allowable_von_mises=config.allowable_von_mises,
             stress_activation_threshold=config.stress_activation_threshold,
         )
-        stiffness_loss = structural_terms["stiffness_loss_contribution"]
-        stress_loss = structural_terms["stress_loss_contribution"]
-        physical_loss = sum(structural_terms.values())
-        time_weight = _physical_time_weight(flow_times)
-        weighted_physical_loss = time_weight * physical_loss
-        weighted_stiffness_loss = time_weight * stiffness_loss
-        weighted_stress_loss = time_weight * stress_loss
-
-        supervised_step_losses.append(supervised_loss)
-        physical_step_losses.append(physical_loss)
-        weighted_physical_step_losses.append(weighted_physical_loss)
-        weighted_stiffness_step_losses.append(weighted_stiffness_loss)
-        weighted_stress_step_losses.append(weighted_stress_loss)
-        position_step_losses.append(position_loss)
-        adjacency_step_losses.append(adjacency_loss)
-        stiffness_errors.append(structural_metrics["stiffness_error"])
-        stress_violations.append(structural_metrics["stress_violation"])
-        mean_stress_ratios.append(structural_metrics["mean_stress_ratio"])
-        max_stress_ratios.append(structural_metrics["max_stress_ratio"])
-
-        current = _euler_step(
-            current_structures=current,
-            position_velocity=safe_position_velocity,
-            adjacency_velocity=safe_adjacency_velocity,
-            step_sizes=step_sizes,
-        )
+        endpoint_stiffness_loss = structural_terms["stiffness_loss_contribution"]
+        endpoint_stress_loss = structural_terms["stress_loss_contribution"]
+        endpoint_physical_loss = sum(structural_terms.values())
 
     total_loss, loss_terms = _aggregate_rollout_losses(
         supervised_step_losses=supervised_step_losses,
-        physical_step_losses=physical_step_losses,
-        weighted_physical_step_losses=weighted_physical_step_losses,
-        weighted_stiffness_step_losses=weighted_stiffness_step_losses,
-        weighted_stress_step_losses=weighted_stress_step_losses,
+        endpoint_physical_loss=endpoint_physical_loss,
+        endpoint_stiffness_loss=endpoint_stiffness_loss,
+        endpoint_stress_loss=endpoint_stress_loss,
         style_kl=(
             style_kl
             if model.config.use_style_conditioning
@@ -622,19 +624,16 @@ def _trajectory_loss_terms(
         "adjacency_step_loss": torch.stack(adjacency_step_losses, dim=0)
         .mean(dim=0)
         .mean(),
-        "stiffness_error": torch.stack(stiffness_errors).mean(),
-        "stress_violation": torch.stack(stress_violations).mean(),
-        "mean_stress_ratio": torch.stack(mean_stress_ratios).mean(),
-        "max_stress_ratio": torch.stack(max_stress_ratios).mean(),
+        "stiffness_error": endpoint_metrics["stiffness_error"].mean(),
+        "stress_violation": endpoint_metrics["stress_violation"].mean(),
+        "mean_stress_ratio": endpoint_metrics["mean_stress_ratio"].mean(),
+        "max_stress_ratio": endpoint_metrics["max_stress_ratio"].mean(),
         "style_kl": style_kl.mean(),
         "lambda_sup": batch.initial_times.new_tensor(lambda_sup),
         "lambda_phys": batch.initial_times.new_tensor(lambda_phys),
         "lambda_kl": batch.initial_times.new_tensor(lambda_kl),
         "integration_end_time": (
             batch.initial_times + config.num_integration_steps * step_sizes
-        ).mean(),
-        "physical_time_weight_mean": torch.stack(
-            [_physical_time_weight(time) for time in step_times]
         ).mean(),
     }
     return total_loss, metrics, loss_terms
