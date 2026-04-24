@@ -37,12 +37,12 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class FlowCurriculumTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 24
+    batch_size: int = 32
     log_every_steps: int = 10
     eval_every_steps: int = 100
     max_grad_norm: float = 1.0
     num_steps: int = 120_000
-    learning_rate: float = 1e-6
+    learning_rate: float = 1e-5
     warmup_steps: int = 1000
     min_learning_rate: float = 1e-7
     eval_fraction: float = 0.02
@@ -51,11 +51,11 @@ class FlowCurriculumTrainingConfig:
     logdir: str = "runs/train"
     seed: int = 7
 
-    num_integration_steps: int = 4
+    num_integration_steps: int = 3
     flow_target_epsilon: float = 0.02
 
     use_style_conditioning: bool = True
-    style_token_dropout: float = 0.10
+    style_token_dropout: float = 0.20
     style_kl_loss_weight: float = 6e-4
     style_kl_anneal_steps: int = 1_000
 
@@ -63,13 +63,13 @@ class FlowCurriculumTrainingConfig:
     adjacency_loss_weight: float = 0.5
     supervised_weight_start: float = 1.0
     supervised_weight_end: float = 0.0
-    supervised_transition_start_step: int = 5_000
-    supervised_transition_end_step: int = 30_000
+    supervised_transition_start_step: int = 20_000
+    supervised_transition_end_step: int = 100_000
 
     physical_weight_start: float = 0.0
-    physical_weight_end: float = 1.0
-    physical_transition_start_step: int = 5_000
-    physical_transition_end_step: int = 30_000
+    physical_weight_end: float = 0.01
+    physical_transition_start_step: int = 20_000
+    physical_transition_end_step: int = 100_000
 
     stiffness_loss_weight: float = 1.0
     stress_loss_weight: float = 0.01
@@ -140,6 +140,41 @@ def local_flow_targets(
         oracle_structures.adjacency - current_structures.adjacency
     ) / remaining
     return target_position_velocity, target_adjacency_velocity
+
+
+def flow_step_predictions(
+    position_velocity: torch.Tensor,
+    adjacency_velocity: torch.Tensor,
+    step_sizes: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if position_velocity.ndim != 3:
+        raise ValueError("position_velocity must have shape [batch, nodes, dims]")
+    if adjacency_velocity.ndim != 3:
+        raise ValueError("adjacency_velocity must have shape [batch, nodes, nodes]")
+    if step_sizes.shape != (position_velocity.shape[0],):
+        raise ValueError("step_sizes must have shape [batch]")
+    step_scale = step_sizes[:, None, None]
+    return step_scale * position_velocity, step_scale * adjacency_velocity
+
+
+def local_flow_step_targets(
+    current_structures: Structures,
+    oracle_structures: Structures,
+    flow_times: torch.Tensor,
+    step_sizes: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    target_position_velocity, target_adjacency_velocity = local_flow_targets(
+        current_structures=current_structures,
+        oracle_structures=oracle_structures,
+        flow_times=flow_times,
+        epsilon=epsilon,
+    )
+    return flow_step_predictions(
+        position_velocity=target_position_velocity,
+        adjacency_velocity=target_adjacency_velocity,
+        step_sizes=step_sizes,
+    )
 
 
 def _max_initial_time(config: FlowCurriculumTrainingConfig) -> float:
@@ -247,25 +282,23 @@ def _style_kl_weight(step: int, config: FlowCurriculumTrainingConfig) -> float:
     return config.style_kl_loss_weight * progress
 
 
-def _position_velocity_loss(
-    prediction_velocity: torch.Tensor,
-    target_velocity: torch.Tensor,
+def _position_step_loss(
+    predicted_step: torch.Tensor,
+    target_step: torch.Tensor,
     roles: torch.Tensor,
 ) -> torch.Tensor:
     _, _, free_mask = role_masks(roles)
-    free_mask = free_mask.unsqueeze(-1).to(dtype=prediction_velocity.dtype)
-    error = ((prediction_velocity - target_velocity).square() * free_mask).sum(
-        dim=(1, 2)
-    )
+    free_mask = free_mask.unsqueeze(-1).to(dtype=predicted_step.dtype)
+    error = ((predicted_step - target_step).square() * free_mask).sum(dim=(1, 2))
     denom = free_mask.sum(dim=(1, 2)).clamp_min(1.0)
     return error / denom
 
 
-def _adjacency_velocity_loss(
-    prediction_velocity: torch.Tensor,
-    target_velocity: torch.Tensor,
+def _adjacency_step_loss(
+    predicted_step: torch.Tensor,
+    target_step: torch.Tensor,
 ) -> torch.Tensor:
-    return (prediction_velocity - target_velocity).square().mean(dim=(1, 2))
+    return (predicted_step - target_step).square().mean(dim=(1, 2))
 
 
 def _physical_time_weight(flow_times: torch.Tensor) -> torch.Tensor:
@@ -328,15 +361,15 @@ def _aggregate_rollout_losses(
     lambda_phys: float,
     lambda_kl: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    supervised_total = torch.stack(supervised_step_losses, dim=0).sum(dim=0)
-    physical_total = torch.stack(physical_step_losses, dim=0).sum(dim=0)
-    weighted_physical_total = torch.stack(weighted_physical_step_losses, dim=0).sum(
+    supervised_total = torch.stack(supervised_step_losses, dim=0).mean(dim=0)
+    physical_total = torch.stack(physical_step_losses, dim=0).mean(dim=0)
+    weighted_physical_total = torch.stack(weighted_physical_step_losses, dim=0).mean(
         dim=0
     )
-    weighted_stiffness_total = torch.stack(weighted_stiffness_step_losses, dim=0).sum(
+    weighted_stiffness_total = torch.stack(weighted_stiffness_step_losses, dim=0).mean(
         dim=0
     )
-    weighted_stress_total = torch.stack(weighted_stress_step_losses, dim=0).sum(dim=0)
+    weighted_stress_total = torch.stack(weighted_stress_step_losses, dim=0).mean(dim=0)
     total_loss = (
         lambda_sup * supervised_total
         + lambda_phys * weighted_physical_total
@@ -431,20 +464,26 @@ def _trajectory_loss_terms(
         safe_position_velocity = _safe_velocity(prediction.position_velocity)
         safe_adjacency_velocity = _safe_velocity(prediction.adjacency_velocity)
 
-        target_position_velocity, target_adjacency_velocity = local_flow_targets(
-            current,
-            batch.oracle_structures,
-            flow_times,
+        predicted_position_step, predicted_adjacency_step = flow_step_predictions(
+            position_velocity=safe_position_velocity,
+            adjacency_velocity=safe_adjacency_velocity,
+            step_sizes=step_sizes,
+        )
+        target_position_step, target_adjacency_step = local_flow_step_targets(
+            current_structures=current,
+            oracle_structures=batch.oracle_structures,
+            flow_times=flow_times,
+            step_sizes=step_sizes,
             epsilon=config.flow_target_epsilon,
         )
-        position_loss = _position_velocity_loss(
-            safe_position_velocity,
-            target_position_velocity,
+        position_loss = _position_step_loss(
+            predicted_position_step,
+            target_position_step,
             current.roles,
         )
-        adjacency_loss = _adjacency_velocity_loss(
-            safe_adjacency_velocity,
-            target_adjacency_velocity,
+        adjacency_loss = _adjacency_step_loss(
+            predicted_adjacency_step,
+            target_adjacency_step,
         )
         supervised_loss = (
             config.position_loss_weight * position_loss
@@ -510,11 +549,11 @@ def _trajectory_loss_terms(
         lambda_kl=lambda_kl,
     )
     metrics = {
-        "position_velocity_loss": torch.stack(position_step_losses, dim=0)
-        .sum(dim=0)
+        "position_step_loss": torch.stack(position_step_losses, dim=0)
+        .mean(dim=0)
         .mean(),
-        "adjacency_velocity_loss": torch.stack(adjacency_step_losses, dim=0)
-        .sum(dim=0)
+        "adjacency_step_loss": torch.stack(adjacency_step_losses, dim=0)
+        .mean(dim=0)
         .mean(),
         "stiffness_error": torch.stack(stiffness_errors).mean(),
         "stress_violation": torch.stack(stress_violations).mean(),

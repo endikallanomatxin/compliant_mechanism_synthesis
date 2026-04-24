@@ -13,7 +13,9 @@ from compliant_mechanism_synthesis.dataset import (
 from compliant_mechanism_synthesis.models import SupervisedRefinerConfig
 from compliant_mechanism_synthesis.training import (
     FlowCurriculumTrainingConfig,
+    flow_step_predictions,
     load_training_cases,
+    local_flow_step_targets,
     local_flow_targets,
     make_training_batch,
     rollout_step_schedule,
@@ -73,7 +75,73 @@ def test_local_flow_targets_use_current_state_and_remaining_time(
     )
 
 
-def test_aggregate_rollout_losses_sums_steps_and_applies_time_weighted_physics() -> (
+def test_local_flow_step_targets_use_dt_correctly(tmp_path: Path) -> None:
+    _, cases = _build_cases(tmp_path)
+    batch = make_training_batch(cases, seed=5)
+    _, step_sizes = rollout_step_schedule(batch.initial_times, num_integration_steps=4)
+
+    target_position_velocity, target_adjacency_velocity = local_flow_targets(
+        batch.initial_structures,
+        batch.oracle_structures,
+        batch.initial_times,
+        epsilon=1e-4,
+    )
+    target_position_step, target_adjacency_step = local_flow_step_targets(
+        batch.initial_structures,
+        batch.oracle_structures,
+        batch.initial_times,
+        step_sizes,
+        epsilon=1e-4,
+    )
+
+    step_scale = step_sizes[:, None, None]
+    assert torch.allclose(target_position_step, step_scale * target_position_velocity)
+    assert torch.allclose(target_adjacency_step, step_scale * target_adjacency_velocity)
+
+
+def test_flow_step_predictions_supervise_effective_step_not_raw_velocity() -> None:
+    position_velocity = torch.tensor([[[10.0, 0.0, 0.0]]])
+    adjacency_velocity = torch.tensor([[[0.0]]])
+    step_sizes = torch.tensor([0.1])
+
+    predicted_position_step, predicted_adjacency_step = flow_step_predictions(
+        position_velocity=position_velocity,
+        adjacency_velocity=adjacency_velocity,
+        step_sizes=step_sizes,
+    )
+
+    assert torch.allclose(predicted_position_step, torch.tensor([[[1.0, 0.0, 0.0]]]))
+    assert torch.allclose(predicted_adjacency_step, torch.tensor([[[0.0]]]))
+
+
+def test_local_flow_step_targets_are_coherent_for_single_integration_step(
+    tmp_path: Path,
+) -> None:
+    _, cases = _build_cases(tmp_path)
+    batch = make_training_batch(cases, seed=5)
+    _, step_sizes = rollout_step_schedule(batch.initial_times, num_integration_steps=1)
+
+    target_position_step, target_adjacency_step = local_flow_step_targets(
+        batch.initial_structures,
+        batch.oracle_structures,
+        batch.initial_times,
+        step_sizes,
+        epsilon=1e-4,
+    )
+
+    assert torch.allclose(
+        batch.initial_structures.positions + target_position_step,
+        batch.oracle_structures.positions,
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        batch.initial_structures.adjacency + target_adjacency_step,
+        batch.oracle_structures.adjacency,
+        atol=1e-5,
+    )
+
+
+def test_aggregate_rollout_losses_means_steps_and_applies_time_weighted_physics() -> (
     None
 ):
     total_loss, loss_terms = _aggregate_rollout_losses(
@@ -99,14 +167,16 @@ def test_aggregate_rollout_losses_sums_steps_and_applies_time_weighted_physics()
 
     expected = torch.tensor(
         [
-            0.5 * (1.0 + 3.0) + 2.0 * (0.5 + 1.4) + 3.0 * 0.1,
-            0.5 * (2.0 + 4.0) + 2.0 * (0.6 + 1.6) + 3.0 * 0.2,
+            0.5 * ((1.0 + 3.0) / 2.0) + 2.0 * ((0.5 + 1.4) / 2.0) + 3.0 * 0.1,
+            0.5 * ((2.0 + 4.0) / 2.0) + 2.0 * ((0.6 + 1.6) / 2.0) + 3.0 * 0.2,
         ]
     ).mean()
     assert torch.allclose(total_loss, expected)
-    assert torch.allclose(loss_terms["supervised_loss"], torch.tensor(5.0))
-    assert torch.allclose(loss_terms["physical_loss"], torch.tensor(13.0))
-    assert torch.allclose(loss_terms["time_weighted_physical_loss"], torch.tensor(2.05))
+    assert torch.allclose(loss_terms["supervised_loss"], torch.tensor(2.5))
+    assert torch.allclose(loss_terms["physical_loss"], torch.tensor(6.5))
+    assert torch.allclose(
+        loss_terms["time_weighted_physical_loss"], torch.tensor(1.025)
+    )
 
 
 def test_train_flow_refiner_writes_checkpoint_and_history(tmp_path: Path) -> None:
