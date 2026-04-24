@@ -179,9 +179,9 @@ def test_train_main_uses_default_curriculum_config(tmp_path: Path) -> None:
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    assert checkpoint["train_config"]["num_integration_steps"] == 4
+    assert checkpoint["train_config"]["num_integration_steps"] == 3
     assert checkpoint["train_config"]["physical_weight_start"] == 0.0
-    assert checkpoint["train_config"]["physical_weight_end"] == 1.0
+    assert checkpoint["train_config"]["physical_weight_end"] == 0.01
     assert checkpoint["train_config"]["supervised_weight_start"] == 1.0
     assert checkpoint["train_config"]["supervised_weight_end"] == 0.0
     assert checkpoint["train_config"]["stress_loss_weight"] == 0.01

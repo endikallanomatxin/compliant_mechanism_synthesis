@@ -9,7 +9,11 @@ from pathlib import Path
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from compliant_mechanism_synthesis.dataset.types import OptimizedCases, Structures
+from compliant_mechanism_synthesis.dataset.types import (
+    Analyses,
+    OptimizedCases,
+    Structures,
+)
 from compliant_mechanism_synthesis.losses import (
     StructuralObjectiveWeights,
     structural_objective_terms,
@@ -349,6 +353,64 @@ def _all_finite_tensors(values: list[torch.Tensor]) -> bool:
     return all(bool(torch.isfinite(value).all().item()) for value in values)
 
 
+def _physical_loss_enabled(
+    config: FlowCurriculumTrainingConfig,
+    lambda_phys: float,
+) -> bool:
+    if lambda_phys <= 0.0:
+        return False
+    return any(
+        weight > 0.0
+        for weight in (
+            config.stiffness_loss_weight,
+            config.stress_loss_weight,
+            config.material_loss_weight,
+            config.short_beam_penalty_weight,
+            config.long_beam_penalty_weight,
+            config.thin_beam_penalty_weight,
+            config.thick_beam_penalty_weight,
+            config.free_node_spacing_penalty_weight,
+        )
+    )
+
+
+def _detach_analyses(analyses: Analyses) -> Analyses:
+    return Analyses(
+        generalized_stiffness=analyses.generalized_stiffness.detach(),
+        material_usage=analyses.material_usage.detach(),
+        short_beam_penalty=analyses.short_beam_penalty.detach(),
+        long_beam_penalty=analyses.long_beam_penalty.detach(),
+        thin_beam_penalty=analyses.thin_beam_penalty.detach(),
+        thick_beam_penalty=analyses.thick_beam_penalty.detach(),
+        free_node_spacing_penalty=analyses.free_node_spacing_penalty.detach(),
+        nodal_displacements=(
+            None
+            if analyses.nodal_displacements is None
+            else analyses.nodal_displacements.detach()
+        ),
+        edge_von_mises=(
+            None
+            if analyses.edge_von_mises is None
+            else analyses.edge_von_mises.detach()
+        ),
+    )
+
+
+def _step_analyses(
+    current: Structures,
+    config: FlowCurriculumTrainingConfig,
+    lambda_phys: float,
+    profile: dict[str, float] | None = None,
+) -> tuple[Analyses, Analyses]:
+    if _physical_loss_enabled(config, lambda_phys):
+        physical_analyses = analyze_structures(current, profile=profile)
+        return _detach_analyses(physical_analyses), physical_analyses
+
+    with torch.no_grad():
+        conditioning_analyses = analyze_structures(current, profile=profile)
+    return conditioning_analyses, conditioning_analyses
+
+
 def _aggregate_rollout_losses(
     *,
     supervised_step_losses: list[torch.Tensor],
@@ -433,17 +495,22 @@ def _trajectory_loss_terms(
     max_stress_ratios: list[torch.Tensor] = []
 
     for integration_index, flow_times in enumerate(step_times):
-        analyses = analyze_structures(current, profile=profile)
-        if analyses.nodal_displacements is None:
+        conditioning_analyses, physical_analyses = _step_analyses(
+            current=current,
+            config=config,
+            lambda_phys=lambda_phys,
+            profile=profile,
+        )
+        if conditioning_analyses.nodal_displacements is None:
             raise ValueError("analyze_structures must provide nodal_displacements")
-        if analyses.edge_von_mises is None:
+        if conditioning_analyses.edge_von_mises is None:
             raise ValueError("analyze_structures must provide edge_von_mises")
         prediction = model.predict_flow(
             structures=current,
             target_stiffness=batch.target_stiffness,
-            current_stiffness=analyses.generalized_stiffness,
-            nodal_displacements=analyses.nodal_displacements,
-            edge_von_mises=analyses.edge_von_mises,
+            current_stiffness=conditioning_analyses.generalized_stiffness,
+            nodal_displacements=conditioning_analyses.nodal_displacements,
+            edge_von_mises=conditioning_analyses.edge_von_mises,
             flow_times=flow_times,
             style_structures=(
                 batch.oracle_structures if model.config.use_style_conditioning else None
@@ -490,7 +557,7 @@ def _trajectory_loss_terms(
             + config.adjacency_loss_weight * adjacency_loss
         )
         structural_terms, structural_metrics = structural_objective_terms(
-            analyses=analyses,
+            analyses=physical_analyses,
             adjacency=current.adjacency,
             target_stiffness=batch.target_stiffness,
             weights=StructuralObjectiveWeights(

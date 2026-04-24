@@ -10,6 +10,7 @@ from compliant_mechanism_synthesis.dataset import (
     PrimitiveConfig,
     generate_offline_dataset,
 )
+from compliant_mechanism_synthesis.dataset.types import Analyses, Structures
 from compliant_mechanism_synthesis.models import SupervisedRefinerConfig
 from compliant_mechanism_synthesis.training import (
     FlowCurriculumTrainingConfig,
@@ -21,7 +22,10 @@ from compliant_mechanism_synthesis.training import (
     rollout_step_schedule,
     train_flow_refiner,
 )
-from compliant_mechanism_synthesis.training.unified import _aggregate_rollout_losses
+from compliant_mechanism_synthesis.training.unified import (
+    _aggregate_rollout_losses,
+    _step_analyses,
+)
 
 
 def _build_cases(tmp_path: Path):
@@ -37,6 +41,27 @@ def _build_cases(tmp_path: Path):
         )
     )
     return path, load_training_cases(str(path))
+
+
+def _fake_analyses_from_structures(structures: Structures) -> Analyses:
+    batch_size, num_nodes, _ = structures.positions.shape
+    base = structures.positions.sum(dim=(1, 2)) + structures.adjacency.sum(dim=(1, 2))
+    generalized_stiffness = base[:, None, None].expand(batch_size, 6, 6)
+    nodal_displacements = base[:, None, None].expand(batch_size, num_nodes, 18)
+    edge_von_mises = base[:, None, None, None].expand(
+        batch_size, num_nodes, num_nodes, 6
+    )
+    return Analyses(
+        generalized_stiffness=generalized_stiffness,
+        material_usage=base,
+        short_beam_penalty=base,
+        long_beam_penalty=base,
+        thin_beam_penalty=base,
+        thick_beam_penalty=base,
+        free_node_spacing_penalty=base,
+        nodal_displacements=nodal_displacements,
+        edge_von_mises=edge_von_mises,
+    )
 
 
 def test_rollout_step_schedule_reaches_final_time_one() -> None:
@@ -179,6 +204,75 @@ def test_aggregate_rollout_losses_means_steps_and_applies_time_weighted_physics(
     )
 
 
+def test_step_analyses_uses_no_grad_when_physics_is_inactive(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _, cases = _build_cases(tmp_path)
+    batch = make_training_batch(cases, seed=5)
+    grad_enabled_states: list[bool] = []
+
+    def fake_analyze_structures(current: Structures, profile=None) -> Analyses:
+        del profile
+        grad_enabled_states.append(torch.is_grad_enabled())
+        return _fake_analyses_from_structures(current)
+
+    monkeypatch.setattr(
+        "compliant_mechanism_synthesis.training.unified.analyze_structures",
+        fake_analyze_structures,
+    )
+
+    conditioning_analyses, physical_analyses = _step_analyses(
+        current=batch.initial_structures,
+        config=FlowCurriculumTrainingConfig(dataset_path="dataset.pt"),
+        lambda_phys=0.0,
+    )
+
+    assert grad_enabled_states == [False]
+    assert conditioning_analyses is physical_analyses
+    assert not conditioning_analyses.generalized_stiffness.requires_grad
+    assert not conditioning_analyses.nodal_displacements.requires_grad
+    assert not conditioning_analyses.edge_von_mises.requires_grad
+
+
+def test_step_analyses_detaches_conditioning_when_physics_is_active(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _, cases = _build_cases(tmp_path)
+    batch = make_training_batch(cases, seed=5)
+    grad_enabled_states: list[bool] = []
+    current = Structures(
+        positions=batch.initial_structures.positions.clone().requires_grad_(True),
+        roles=batch.initial_structures.roles,
+        adjacency=batch.initial_structures.adjacency.clone().requires_grad_(True),
+    )
+
+    def fake_analyze_structures(current: Structures, profile=None) -> Analyses:
+        del profile
+        grad_enabled_states.append(torch.is_grad_enabled())
+        return _fake_analyses_from_structures(current)
+
+    monkeypatch.setattr(
+        "compliant_mechanism_synthesis.training.unified.analyze_structures",
+        fake_analyze_structures,
+    )
+
+    conditioning_analyses, physical_analyses = _step_analyses(
+        current=current,
+        config=FlowCurriculumTrainingConfig(dataset_path="dataset.pt"),
+        lambda_phys=1.0,
+    )
+
+    assert grad_enabled_states == [True]
+    assert physical_analyses.generalized_stiffness.requires_grad
+    assert physical_analyses.nodal_displacements.requires_grad
+    assert physical_analyses.edge_von_mises.requires_grad
+    assert not conditioning_analyses.generalized_stiffness.requires_grad
+    assert not conditioning_analyses.nodal_displacements.requires_grad
+    assert not conditioning_analyses.edge_von_mises.requires_grad
+
+
 def test_train_flow_refiner_writes_checkpoint_and_history(tmp_path: Path) -> None:
     dataset_path, cases = _build_cases(tmp_path)
 
@@ -207,7 +301,7 @@ def test_train_flow_refiner_writes_checkpoint_and_history(tmp_path: Path) -> Non
     assert "total_loss" in summary.history
     assert "supervised_loss_contribution" in summary.history
     assert "physical_loss_contribution" in summary.history
-    assert checkpoint["train_config"]["num_integration_steps"] == 4
+    assert checkpoint["train_config"]["num_integration_steps"] == 3
     assert "style_sample_dropout" not in checkpoint["train_config"]
 
 
