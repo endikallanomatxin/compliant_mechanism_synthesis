@@ -1053,14 +1053,18 @@ class SupervisedRefiner(nn.Module):
                 style_structures=style_structures,
                 style_analyses=style_analyses,
             )
-            positions = current.positions + prediction.position_step * free_mask
+            # Sampling should stay renderable even if a checkpoint produces a
+            # small out-of-domain step; training keeps the unclamped dynamics.
+            positions = torch.clamp(
+                current.positions + prediction.position_step * free_mask,
+                0.0,
+                1.0,
+            )
             current_logits = logits_from_adjacency(current.adjacency)
             adjacency = enforce_role_adjacency_constraints(
                 torch.sigmoid(current_logits + prediction.adjacency_logit_step),
                 current.roles,
             )
-            if not bool(((0.0 <= positions) & (positions <= 1.0)).all().item()):
-                raise ValueError("rollout produced positions outside [0, 1]")
             current = Structures(
                 positions=positions,
                 roles=current.roles,

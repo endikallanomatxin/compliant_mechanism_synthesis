@@ -28,15 +28,27 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 from compliant_mechanism_synthesis.visualization.plots import ROLE_STYLE
 
 
+_AUTO_DEVICE_FALLBACK_ERRORS = (
+    RuntimeError,
+    getattr(torch, "AcceleratorError", RuntimeError),
+)
+
+
 def load_supervised_refiner_checkpoint(
     checkpoint_path: str | Path,
     device: str = "auto",
 ) -> SupervisedRefiner:
     resolved_device = resolve_torch_device(device)
-    checkpoint = torch.load(checkpoint_path, map_location=resolved_device)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model = SupervisedRefiner(SupervisedRefinerConfig(**checkpoint["model_config"]))
     model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(resolved_device)
+    if device == "auto" and resolved_device.type != "cpu":
+        try:
+            model = model.to(resolved_device)
+        except _AUTO_DEVICE_FALLBACK_ERRORS:
+            model = model.to(torch.device("cpu"))
+    else:
+        model = model.to(resolved_device)
     model.eval()
     return model
 
