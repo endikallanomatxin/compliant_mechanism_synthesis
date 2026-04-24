@@ -25,6 +25,7 @@ from compliant_mechanism_synthesis.training import (
 from compliant_mechanism_synthesis.training.unified import (
     _aggregate_rollout_losses,
     _conditioning_inputs,
+    _loss_gradient_diagnostics,
     _trajectory_loss_terms,
 )
 
@@ -188,6 +189,52 @@ def test_aggregate_rollout_losses_uses_step_mean_and_endpoint_physics() -> None:
     assert torch.allclose(total_loss, expected)
     assert torch.allclose(loss_terms["supervised_loss"], torch.tensor(2.5))
     assert torch.allclose(loss_terms["physical_loss"], torch.tensor(5.5))
+
+
+def test_loss_gradient_diagnostics_reports_norms_and_cosine() -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(2.0)
+
+    input_tensor = torch.tensor([[3.0]])
+    supervised_loss = (model(input_tensor) ** 2).sum()
+    physical_loss = (2.0 * model(input_tensor) ** 2).sum()
+
+    diagnostics = _loss_gradient_diagnostics(
+        supervised_loss=supervised_loss,
+        physical_loss=physical_loss,
+        model=model,
+    )
+
+    assert torch.allclose(diagnostics["supervised_grad_norm"], torch.tensor(36.0))
+    assert torch.allclose(diagnostics["physical_grad_norm"], torch.tensor(72.0))
+    assert torch.allclose(
+        diagnostics["supervised_physical_grad_cosine"],
+        torch.tensor(1.0),
+    )
+
+
+def test_loss_gradient_diagnostics_returns_zero_cosine_for_zero_norm() -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()
+
+    input_tensor = torch.tensor([[3.0]])
+    supervised_loss = (model(input_tensor) ** 2).sum()
+    physical_loss = supervised_loss * 0.0
+
+    diagnostics = _loss_gradient_diagnostics(
+        supervised_loss=supervised_loss,
+        physical_loss=physical_loss,
+        model=model,
+    )
+
+    assert torch.allclose(diagnostics["supervised_grad_norm"], torch.tensor(0.0))
+    assert torch.allclose(diagnostics["physical_grad_norm"], torch.tensor(0.0))
+    assert torch.allclose(
+        diagnostics["supervised_physical_grad_cosine"],
+        torch.tensor(0.0),
+    )
 
 
 def test_conditioning_inputs_use_no_grad_when_enabled(

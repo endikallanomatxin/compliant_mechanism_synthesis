@@ -60,8 +60,8 @@ class FlowCurriculumTrainingConfig:
 
     use_style_conditioning: bool = True
     style_token_dropout: float = 0.20
-    style_kl_loss_weight: float = 6e-4
-    style_kl_anneal_steps: int = 1_000
+    style_kl_loss_weight: float = 1e-5
+    style_kl_anneal_steps: int = 10_000
 
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.5
@@ -476,6 +476,66 @@ def _grad_norm_for_loss(loss: torch.Tensor, model: SupervisedRefiner) -> torch.T
         if gradient is not None:
             squared_norm = squared_norm + gradient.square().sum()
     return torch.sqrt(squared_norm)
+
+
+def _loss_gradient_diagnostics(
+    supervised_loss: torch.Tensor,
+    physical_loss: torch.Tensor,
+    model: torch.nn.Module,
+) -> dict[str, torch.Tensor]:
+    parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    supervised_gradients = torch.autograd.grad(
+        supervised_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    physical_gradients = torch.autograd.grad(
+        physical_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+
+    reference = supervised_loss
+    supervised_squared_norm = reference.new_zeros(())
+    physical_squared_norm = reference.new_zeros(())
+    dot_product = reference.new_zeros(())
+    for supervised_gradient, physical_gradient in zip(
+        supervised_gradients,
+        physical_gradients,
+        strict=True,
+    ):
+        if supervised_gradient is not None:
+            supervised_squared_norm = (
+                supervised_squared_norm + supervised_gradient.square().sum()
+            )
+        if physical_gradient is not None:
+            physical_squared_norm = (
+                physical_squared_norm + physical_gradient.square().sum()
+            )
+        if supervised_gradient is not None and physical_gradient is not None:
+            dot_product = dot_product + (supervised_gradient * physical_gradient).sum()
+
+    supervised_grad_norm = torch.sqrt(supervised_squared_norm)
+    physical_grad_norm = torch.sqrt(physical_squared_norm)
+    denom = supervised_grad_norm * physical_grad_norm
+    if float(denom.detach().item()) == 0.0:
+        grad_cosine = reference.new_zeros(())
+    else:
+        grad_cosine = dot_product / denom
+    return {
+        "supervised_grad_norm": supervised_grad_norm,
+        "physical_grad_norm": physical_grad_norm,
+        "supervised_physical_grad_cosine": torch.nan_to_num(
+            grad_cosine,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ),
+    }
 
 
 def _trajectory_loss_terms(
@@ -916,19 +976,14 @@ def train_flow_refiner(
 
                 gradient_metrics: dict[str, float] = {}
                 if train_config.log_gradient_diagnostics:
-                    supervised_grad_norm = _grad_norm_for_loss(
-                        loss_terms["supervised_loss_contribution"],
-                        model,
-                    )
-                    physical_grad_norm = _grad_norm_for_loss(
-                        loss_terms["physical_loss_contribution"],
-                        model,
+                    gradient_diagnostics = _loss_gradient_diagnostics(
+                        supervised_loss=loss_terms["supervised_loss_contribution"],
+                        physical_loss=loss_terms["physical_loss_contribution"],
+                        model=model,
                     )
                     gradient_metrics = {
-                        "supervised_grad_norm": float(
-                            supervised_grad_norm.detach().item()
-                        ),
-                        "physical_grad_norm": float(physical_grad_norm.detach().item()),
+                        name: float(value.detach().item())
+                        for name, value in gradient_diagnostics.items()
                     }
 
                 optimizer.zero_grad(set_to_none=True)
