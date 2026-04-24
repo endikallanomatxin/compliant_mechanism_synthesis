@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from compliant_mechanism_synthesis.adjacency import logits_from_adjacency
 from compliant_mechanism_synthesis.dataset.types import (
     Analyses,
     OptimizedCases,
@@ -41,12 +42,14 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class FlowCurriculumTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 32
+    batch_size: int = 40
     log_every_steps: int = 10
     eval_every_steps: int = 100
     max_grad_norm: float = 1.0
+    main_grad_clip_norm: float = 1.0
+    physical_grad_clip_norm: float = 0.1
     num_steps: int = 120_000
-    learning_rate: float = 1e-5
+    learning_rate: float = 2e-5
     warmup_steps: int = 1000
     min_learning_rate: float = 1e-7
     eval_fraction: float = 0.02
@@ -59,12 +62,12 @@ class FlowCurriculumTrainingConfig:
     flow_target_epsilon: float = 0.02
 
     use_style_conditioning: bool = True
-    style_token_dropout: float = 0.20
-    style_kl_loss_weight: float = 1e-5
-    style_kl_anneal_steps: int = 10_000
+    style_token_dropout: float = 0.50
+    style_kl_loss_weight: float = 4e-5
+    style_kl_anneal_steps: int = 20_000
 
     position_loss_weight: float = 1.0
-    adjacency_loss_weight: float = 0.5
+    adjacency_loss_weight: float = 0.001  # Loss occurs in logit space
     supervised_weight_start: float = 1.0
     supervised_weight_end: float = 0.0
     supervised_transition_start_step: int = 20_000
@@ -140,25 +143,29 @@ def local_flow_targets(
     target_position_velocity = (
         oracle_structures.positions - current_structures.positions
     ) / remaining
-    target_adjacency_velocity = (
-        oracle_structures.adjacency - current_structures.adjacency
+    current_adjacency_logits = logits_from_adjacency(current_structures.adjacency)
+    oracle_adjacency_logits = logits_from_adjacency(oracle_structures.adjacency)
+    target_adjacency_logit_velocity = (
+        oracle_adjacency_logits - current_adjacency_logits
     ) / remaining
-    return target_position_velocity, target_adjacency_velocity
+    return target_position_velocity, target_adjacency_logit_velocity
 
 
 def flow_step_predictions(
     position_velocity: torch.Tensor,
-    adjacency_velocity: torch.Tensor,
+    adjacency_logit_velocity: torch.Tensor,
     step_sizes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if position_velocity.ndim != 3:
         raise ValueError("position_velocity must have shape [batch, nodes, dims]")
-    if adjacency_velocity.ndim != 3:
-        raise ValueError("adjacency_velocity must have shape [batch, nodes, nodes]")
+    if adjacency_logit_velocity.ndim != 3:
+        raise ValueError(
+            "adjacency_logit_velocity must have shape [batch, nodes, nodes]"
+        )
     if step_sizes.shape != (position_velocity.shape[0],):
         raise ValueError("step_sizes must have shape [batch]")
     step_scale = step_sizes[:, None, None]
-    return step_scale * position_velocity, step_scale * adjacency_velocity
+    return step_scale * position_velocity, step_scale * adjacency_logit_velocity
 
 
 def local_flow_step_targets(
@@ -168,7 +175,7 @@ def local_flow_step_targets(
     step_sizes: torch.Tensor,
     epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    target_position_velocity, target_adjacency_velocity = local_flow_targets(
+    target_position_velocity, target_adjacency_logit_velocity = local_flow_targets(
         current_structures=current_structures,
         oracle_structures=oracle_structures,
         flow_times=flow_times,
@@ -176,7 +183,7 @@ def local_flow_step_targets(
     )
     return flow_step_predictions(
         position_velocity=target_position_velocity,
-        adjacency_velocity=target_adjacency_velocity,
+        adjacency_logit_velocity=target_adjacency_logit_velocity,
         step_sizes=step_sizes,
     )
 
@@ -308,7 +315,7 @@ def _adjacency_step_loss(
 def _euler_step(
     current_structures: Structures,
     position_velocity: torch.Tensor,
-    adjacency_velocity: torch.Tensor,
+    adjacency_logit_velocity: torch.Tensor,
     step_sizes: torch.Tensor,
 ) -> Structures:
     _, _, free_mask = role_masks(current_structures.roles)
@@ -320,13 +327,15 @@ def _euler_step(
         posinf=1.0,
         neginf=0.0,
     ).clamp(0.0, 1.0)
+    current_adjacency_logits = logits_from_adjacency(current_structures.adjacency)
+    next_adjacency_logits = torch.nan_to_num(
+        current_adjacency_logits + step_scale * adjacency_logit_velocity,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     next_adjacency = enforce_role_adjacency_constraints(
-        torch.nan_to_num(
-            current_structures.adjacency + step_scale * adjacency_velocity,
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        ).clamp(0.0, 1.0),
+        torch.sigmoid(next_adjacency_logits),
         current_structures.roles,
     )
     return Structures(
@@ -464,78 +473,159 @@ def _zero_endpoint_physical_terms(
     return zeros, zeros, zeros, metrics
 
 
-def _grad_norm_for_loss(loss: torch.Tensor, model: SupervisedRefiner) -> torch.Tensor:
-    gradients = torch.autograd.grad(
-        loss,
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        retain_graph=True,
-        allow_unused=True,
+def _loss_gradients(
+    loss: torch.Tensor,
+    parameters: list[torch.nn.Parameter],
+) -> list[torch.Tensor | None]:
+    if not loss.requires_grad:
+        return [None] * len(parameters)
+    return list(
+        torch.autograd.grad(
+            loss,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
     )
-    squared_norm = loss.new_zeros(())
+
+
+def _gradient_list_norm(
+    gradients: list[torch.Tensor | None],
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    squared_norm = reference.new_zeros(())
     for gradient in gradients:
         if gradient is not None:
             squared_norm = squared_norm + gradient.square().sum()
     return torch.sqrt(squared_norm)
 
 
-def _loss_gradient_diagnostics(
-    supervised_loss: torch.Tensor,
-    physical_loss: torch.Tensor,
-    model: torch.nn.Module,
-) -> dict[str, torch.Tensor]:
-    parameters = [
-        parameter for parameter in model.parameters() if parameter.requires_grad
-    ]
-    supervised_gradients = torch.autograd.grad(
-        supervised_loss,
-        parameters,
-        retain_graph=True,
-        allow_unused=True,
-    )
-    physical_gradients = torch.autograd.grad(
-        physical_loss,
-        parameters,
-        retain_graph=True,
-        allow_unused=True,
-    )
-
-    reference = supervised_loss
-    supervised_squared_norm = reference.new_zeros(())
-    physical_squared_norm = reference.new_zeros(())
-    dot_product = reference.new_zeros(())
-    for supervised_gradient, physical_gradient in zip(
-        supervised_gradients,
-        physical_gradients,
-        strict=True,
-    ):
-        if supervised_gradient is not None:
-            supervised_squared_norm = (
-                supervised_squared_norm + supervised_gradient.square().sum()
-            )
-        if physical_gradient is not None:
-            physical_squared_norm = (
-                physical_squared_norm + physical_gradient.square().sum()
-            )
-        if supervised_gradient is not None and physical_gradient is not None:
-            dot_product = dot_product + (supervised_gradient * physical_gradient).sum()
-
-    supervised_grad_norm = torch.sqrt(supervised_squared_norm)
-    physical_grad_norm = torch.sqrt(physical_squared_norm)
-    denom = supervised_grad_norm * physical_grad_norm
+def _gradient_lists_cosine(
+    lhs_gradients: list[torch.Tensor | None],
+    rhs_gradients: list[torch.Tensor | None],
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    lhs_norm = _gradient_list_norm(lhs_gradients, reference)
+    rhs_norm = _gradient_list_norm(rhs_gradients, reference)
+    denom = lhs_norm * rhs_norm
     if float(denom.detach().item()) == 0.0:
-        grad_cosine = reference.new_zeros(())
-    else:
-        grad_cosine = dot_product / denom
-    return {
-        "supervised_grad_norm": supervised_grad_norm,
-        "physical_grad_norm": physical_grad_norm,
-        "supervised_physical_grad_cosine": torch.nan_to_num(
-            grad_cosine,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
+        return reference.new_zeros(())
+    dot_product = reference.new_zeros(())
+    for lhs_gradient, rhs_gradient in zip(lhs_gradients, rhs_gradients, strict=True):
+        if lhs_gradient is not None and rhs_gradient is not None:
+            dot_product = dot_product + (lhs_gradient * rhs_gradient).sum()
+    return torch.nan_to_num(
+        dot_product / denom,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+
+def _clip_gradient_list(
+    gradients: list[torch.Tensor | None],
+    max_norm: float,
+    reference: torch.Tensor,
+    prefix: str,
+) -> tuple[list[torch.Tensor | None], dict[str, torch.Tensor]]:
+    if max_norm <= 0.0:
+        raise ValueError(f"{prefix} max_norm must be positive")
+    pre_clip_norm = _gradient_list_norm(gradients, reference)
+    pre_clip_value = float(pre_clip_norm.detach().item())
+    metrics = {
+        f"{prefix}_grad_norm_pre_clip": pre_clip_norm,
+        f"{prefix}_grad_norm_post_clip": pre_clip_norm,
+        f"{prefix}_grad_clip_ratio": reference.new_tensor(pre_clip_value / max_norm),
+        f"{prefix}_grad_clipped": reference.new_tensor(
+            float(pre_clip_value > max_norm)
         ),
     }
+    if (
+        pre_clip_value == 0.0
+        or not math.isfinite(pre_clip_value)
+        or pre_clip_value <= max_norm
+    ):
+        return gradients, metrics
+
+    scale = max_norm / pre_clip_value
+    clipped_gradients = [
+        None if gradient is None else gradient * scale for gradient in gradients
+    ]
+    metrics[f"{prefix}_grad_norm_post_clip"] = _gradient_list_norm(
+        clipped_gradients,
+        reference,
+    )
+    return clipped_gradients, metrics
+
+
+def _combine_gradient_lists(
+    gradient_groups: list[list[torch.Tensor | None]],
+) -> list[torch.Tensor | None]:
+    combined_gradients: list[torch.Tensor | None] = []
+    for grouped_gradients in zip(*gradient_groups, strict=True):
+        combined_gradient = None
+        for gradient in grouped_gradients:
+            if gradient is not None:
+                combined_gradient = (
+                    gradient
+                    if combined_gradient is None
+                    else combined_gradient + gradient
+                )
+        combined_gradients.append(combined_gradient)
+    return combined_gradients
+
+
+def _assign_gradients(
+    parameters: list[torch.nn.Parameter],
+    gradients: list[torch.Tensor | None],
+) -> None:
+    for parameter, gradient in zip(parameters, gradients, strict=True):
+        parameter.grad = gradient
+
+
+def _objective_clipped_gradients(
+    *,
+    main_loss: torch.Tensor,
+    physical_loss: torch.Tensor,
+    parameters: list[torch.nn.Parameter],
+    config: FlowCurriculumTrainingConfig,
+) -> tuple[list[torch.Tensor | None], dict[str, torch.Tensor]]:
+    reference = main_loss
+    main_gradients = _loss_gradients(main_loss, parameters)
+    physical_gradients = _loss_gradients(physical_loss, parameters)
+
+    clipped_main_gradients, main_metrics = _clip_gradient_list(
+        main_gradients,
+        config.main_grad_clip_norm,
+        reference,
+        prefix="main",
+    )
+    clipped_physical_gradients, physical_metrics = _clip_gradient_list(
+        physical_gradients,
+        config.physical_grad_clip_norm,
+        reference,
+        prefix="physical",
+    )
+    combined_gradients = _combine_gradient_lists(
+        [
+            clipped_main_gradients,
+            clipped_physical_gradients,
+        ]
+    )
+    metrics = {
+        **main_metrics,
+        **physical_metrics,
+        "combined_grad_norm_pre_global_clip": _gradient_list_norm(
+            combined_gradients,
+            reference,
+        ),
+    }
+    metrics["main_physical_grad_cosine"] = _gradient_lists_cosine(
+        main_gradients,
+        physical_gradients,
+        reference,
+    )
+    return combined_gradients, metrics
 
 
 def _trajectory_loss_terms(
@@ -590,11 +680,13 @@ def _trajectory_loss_terms(
             )
 
         safe_position_velocity = _safe_velocity(prediction.position_velocity)
-        safe_adjacency_velocity = _safe_velocity(prediction.adjacency_velocity)
+        safe_adjacency_logit_velocity = _safe_velocity(
+            prediction.adjacency_logit_velocity
+        )
 
         predicted_position_step, predicted_adjacency_step = flow_step_predictions(
             position_velocity=safe_position_velocity,
-            adjacency_velocity=safe_adjacency_velocity,
+            adjacency_logit_velocity=safe_adjacency_logit_velocity,
             step_sizes=step_sizes,
         )
         target_position_step, target_adjacency_step = local_flow_step_targets(
@@ -625,7 +717,7 @@ def _trajectory_loss_terms(
         current = _euler_step(
             current_structures=current,
             position_velocity=safe_position_velocity,
-            adjacency_velocity=safe_adjacency_velocity,
+            adjacency_logit_velocity=safe_adjacency_logit_velocity,
             step_sizes=step_sizes,
         )
 
@@ -817,6 +909,10 @@ def train_flow_refiner(
         raise ValueError("eval_every_steps must be positive")
     if train_config.max_grad_norm <= 0.0:
         raise ValueError("max_grad_norm must be positive")
+    if train_config.main_grad_clip_norm <= 0.0:
+        raise ValueError("main_grad_clip_norm must be positive")
+    if train_config.physical_grad_clip_norm <= 0.0:
+        raise ValueError("physical_grad_clip_norm must be positive")
     if train_config.num_integration_steps <= 0:
         raise ValueError("num_integration_steps must be positive")
     if train_config.flow_target_epsilon <= 0.0:
@@ -902,6 +998,9 @@ def train_flow_refiner(
         step = 0
         examples_seen = 0
         nonfinite_step_skips = 0
+        trainable_parameters = [
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        ]
         while step < train_config.num_steps:
             for batch_cases in iter_training_batches(
                 train_cases,
@@ -975,26 +1074,105 @@ def train_flow_refiner(
                     continue
 
                 gradient_metrics: dict[str, float] = {}
-                if train_config.log_gradient_diagnostics:
-                    gradient_diagnostics = _loss_gradient_diagnostics(
-                        supervised_loss=loss_terms["supervised_loss_contribution"],
-                        physical_loss=loss_terms["physical_loss_contribution"],
-                        model=model,
-                    )
-                    gradient_metrics = {
-                        name: float(value.detach().item())
-                        for name, value in gradient_diagnostics.items()
-                    }
-
                 optimizer.zero_grad(set_to_none=True)
-                total_loss.backward()
-                grad_norm = float(
+                combined_gradients, gradient_metric_tensors = (
+                    _objective_clipped_gradients(
+                        main_loss=(
+                            loss_terms["supervised_loss_contribution"]
+                            + loss_terms["style_kl_loss_contribution"]
+                        ),
+                        physical_loss=loss_terms["physical_loss_contribution"],
+                        parameters=trainable_parameters,
+                        config=train_config,
+                    )
+                )
+                if train_config.log_gradient_diagnostics:
+                    gradient_metrics["main_grad_norm"] = float(
+                        gradient_metric_tensors["main_grad_norm_pre_clip"]
+                        .detach()
+                        .item()
+                    )
+                    gradient_metrics["physical_grad_norm"] = float(
+                        gradient_metric_tensors["physical_grad_norm_pre_clip"]
+                        .detach()
+                        .item()
+                    )
+                    gradient_metrics["main_physical_grad_cosine"] = float(
+                        gradient_metric_tensors["main_physical_grad_cosine"]
+                        .detach()
+                        .item()
+                    )
+
+                if not _all_finite_tensors(list(gradient_metric_tensors.values())):
+                    optimizer.zero_grad(set_to_none=True)
+                    nonfinite_step_skips += 1
+                    history["nonfinite_step_skips"].append(float(nonfinite_step_skips))
+                    writer.add_scalar(
+                        "train/gradients/nonfinite_step_skips",
+                        float(nonfinite_step_skips),
+                        step,
+                    )
+                    print(
+                        f"train step={step + 1}/{train_config.num_steps} skipped_update=yes reason=nonfinite_objective_grad "
+                        f"nonfinite_step_skips={nonfinite_step_skips}",
+                        flush=True,
+                    )
+                    step += 1
+                    if step >= train_config.num_steps:
+                        break
+                    continue
+
+                _assign_gradients(trainable_parameters, combined_gradients)
+                global_pre_clip_norm = float(
+                    gradient_metric_tensors["combined_grad_norm_pre_global_clip"]
+                    .detach()
+                    .item()
+                )
+                if not math.isfinite(global_pre_clip_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    nonfinite_step_skips += 1
+                    history["nonfinite_step_skips"].append(float(nonfinite_step_skips))
+                    writer.add_scalar(
+                        "train/gradients/nonfinite_step_skips",
+                        float(nonfinite_step_skips),
+                        step,
+                    )
+                    print(
+                        f"train step={step + 1}/{train_config.num_steps} skipped_update=yes reason=nonfinite_combined_grad "
+                        f"nonfinite_step_skips={nonfinite_step_skips}",
+                        flush=True,
+                    )
+                    step += 1
+                    if step >= train_config.num_steps:
+                        break
+                    continue
+
+                pre_global_clip_norm = float(
                     torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
+                        trainable_parameters,
                         max_norm=train_config.max_grad_norm,
                     ).item()
                 )
-                if not math.isfinite(grad_norm):
+                post_global_clip_norm = float(
+                    _gradient_list_norm(
+                        [parameter.grad for parameter in trainable_parameters],
+                        loss_terms["total_loss"],
+                    )
+                    .detach()
+                    .item()
+                )
+                global_clipped = pre_global_clip_norm > train_config.max_grad_norm
+                global_clip_ratio = pre_global_clip_norm / train_config.max_grad_norm
+
+                if train_config.log_gradient_diagnostics:
+                    gradient_metrics.update(
+                        {
+                            "combined_grad_norm_pre_global_clip": pre_global_clip_norm,
+                            "combined_grad_norm": post_global_clip_norm,
+                        }
+                    )
+
+                if not math.isfinite(post_global_clip_norm):
                     optimizer.zero_grad(set_to_none=True)
                     nonfinite_step_skips += 1
                     history["nonfinite_step_skips"].append(float(nonfinite_step_skips))
@@ -1012,8 +1190,30 @@ def train_flow_refiner(
                     if step >= train_config.num_steps:
                         break
                     continue
-                clipped = grad_norm > train_config.max_grad_norm
-                clip_ratio = grad_norm / train_config.max_grad_norm
+
+                for name, value_tensor in gradient_metric_tensors.items():
+                    writer.add_scalar(
+                        f"train/gradients/{name}",
+                        float(value_tensor.detach().item()),
+                        step,
+                    )
+
+                writer.add_scalar(
+                    "train/gradients/combined_grad_norm",
+                    post_global_clip_norm,
+                    step,
+                )
+                writer.add_scalar(
+                    "train/gradients/combined_global_clip_ratio",
+                    global_clip_ratio,
+                    step,
+                )
+                writer.add_scalar(
+                    "train/gradients/combined_global_clipped",
+                    float(global_clipped),
+                    step,
+                )
+
                 optimizer.step()
                 _synchronize_device_if_needed(device)
                 optimizer_time = time.perf_counter()
@@ -1038,9 +1238,19 @@ def train_flow_refiner(
                     ),
                     step,
                 )
-                writer.add_scalar("train/gradients/grad_norm", grad_norm, step)
-                writer.add_scalar("train/gradients/clip_ratio", clip_ratio, step)
-                writer.add_scalar("train/gradients/clipped", float(clipped), step)
+                writer.add_scalar(
+                    "train/gradients/grad_norm", post_global_clip_norm, step
+                )
+                writer.add_scalar(
+                    "train/gradients/clip_ratio",
+                    global_clip_ratio,
+                    step,
+                )
+                writer.add_scalar(
+                    "train/gradients/clipped",
+                    float(global_clipped),
+                    step,
+                )
                 writer.add_scalar(
                     "train/gradients/nonfinite_step_skips",
                     float(nonfinite_step_skips),
@@ -1070,9 +1280,9 @@ def train_flow_refiner(
                         f"stress={float(metrics['stress_violation'].detach().item()):.6f} "
                         f"lambda_sup={float(metrics['lambda_sup'].detach().item()):.6f} "
                         f"lambda_phys={float(metrics['lambda_phys'].detach().item()):.6f} "
-                        f"grad_norm={grad_norm:.6f} clipped={'yes' if clipped else 'no'} "
+                        f"grad_norm={post_global_clip_norm:.6f} clipped={'yes' if global_clipped else 'no'} "
                         f"nonfinite_step_skips={nonfinite_step_skips} "
-                        f"clip_ratio={clip_ratio:.3f} "
+                        f"clip_ratio={global_clip_ratio:.3f} "
                         f"t_transfer={batch_transfer_time - step_start_time:.3f}s "
                         f"t_batch={batch_build_time - batch_transfer_time:.3f}s "
                         f"t_loss={loss_time - batch_build_time:.3f}s "

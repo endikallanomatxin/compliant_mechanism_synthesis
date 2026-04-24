@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from compliant_mechanism_synthesis.adjacency import logits_from_adjacency
 from compliant_mechanism_synthesis.dataset import (
     CaseOptimizationConfig,
     OfflineDatasetConfig,
@@ -25,7 +26,8 @@ from compliant_mechanism_synthesis.training import (
 from compliant_mechanism_synthesis.training.unified import (
     _aggregate_rollout_losses,
     _conditioning_inputs,
-    _loss_gradient_diagnostics,
+    _euler_step,
+    _objective_clipped_gradients,
     _trajectory_loss_terms,
 )
 
@@ -83,7 +85,7 @@ def test_local_flow_targets_use_current_state_and_remaining_time(
     _, cases = _build_cases(tmp_path)
     batch = make_training_batch(cases, seed=5)
 
-    target_position_velocity, target_adjacency_velocity = local_flow_targets(
+    target_position_velocity, target_adjacency_logit_velocity = local_flow_targets(
         batch.initial_structures,
         batch.oracle_structures,
         batch.initial_times,
@@ -95,9 +97,11 @@ def test_local_flow_targets_use_current_state_and_remaining_time(
         batch.oracle_structures.positions,
         atol=1e-5,
     )
+    current_logits = logits_from_adjacency(batch.initial_structures.adjacency)
+    oracle_logits = logits_from_adjacency(batch.oracle_structures.adjacency)
     assert torch.allclose(
-        batch.initial_structures.adjacency + remaining * target_adjacency_velocity,
-        batch.oracle_structures.adjacency,
+        current_logits + remaining * target_adjacency_logit_velocity,
+        oracle_logits,
         atol=1e-5,
     )
 
@@ -107,7 +111,7 @@ def test_local_flow_step_targets_use_dt_correctly(tmp_path: Path) -> None:
     batch = make_training_batch(cases, seed=5)
     _, step_sizes = rollout_step_schedule(batch.initial_times, num_integration_steps=4)
 
-    target_position_velocity, target_adjacency_velocity = local_flow_targets(
+    target_position_velocity, target_adjacency_logit_velocity = local_flow_targets(
         batch.initial_structures,
         batch.oracle_structures,
         batch.initial_times,
@@ -123,17 +127,20 @@ def test_local_flow_step_targets_use_dt_correctly(tmp_path: Path) -> None:
 
     step_scale = step_sizes[:, None, None]
     assert torch.allclose(target_position_step, step_scale * target_position_velocity)
-    assert torch.allclose(target_adjacency_step, step_scale * target_adjacency_velocity)
+    assert torch.allclose(
+        target_adjacency_step,
+        step_scale * target_adjacency_logit_velocity,
+    )
 
 
 def test_flow_step_predictions_supervise_effective_step_not_raw_velocity() -> None:
     position_velocity = torch.tensor([[[10.0, 0.0, 0.0]]])
-    adjacency_velocity = torch.tensor([[[0.0]]])
+    adjacency_logit_velocity = torch.tensor([[[0.0]]])
     step_sizes = torch.tensor([0.1])
 
     predicted_position_step, predicted_adjacency_step = flow_step_predictions(
         position_velocity=position_velocity,
-        adjacency_velocity=adjacency_velocity,
+        adjacency_logit_velocity=adjacency_logit_velocity,
         step_sizes=step_sizes,
     )
 
@@ -161,11 +168,71 @@ def test_local_flow_step_targets_are_coherent_for_single_integration_step(
         batch.oracle_structures.positions,
         atol=1e-5,
     )
+    current_logits = logits_from_adjacency(batch.initial_structures.adjacency)
+    oracle_logits = logits_from_adjacency(batch.oracle_structures.adjacency)
     assert torch.allclose(
-        batch.initial_structures.adjacency + target_adjacency_step,
-        batch.oracle_structures.adjacency,
+        current_logits + target_adjacency_step,
+        oracle_logits,
         atol=1e-5,
     )
+
+
+def test_euler_step_updates_adjacency_in_logit_space() -> None:
+    structures = Structures(
+        positions=torch.tensor([[[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [1.0, 0.0, 0.0]]]),
+        roles=torch.tensor([[0, 2, 2]], dtype=torch.long),
+        adjacency=torch.tensor([[[0.0, 0.2, 0.3], [0.2, 0.0, 0.4], [0.3, 0.4, 0.0]]]),
+    )
+    step_sizes = torch.tensor([0.5])
+    adjacency_logit_velocity = torch.tensor(
+        [[[0.0, 1.0, -2.0], [1.0, 0.0, 0.5], [-2.0, 0.5, 0.0]]]
+    )
+
+    next_structures = _euler_step(
+        current_structures=structures,
+        position_velocity=torch.zeros_like(structures.positions),
+        adjacency_logit_velocity=adjacency_logit_velocity,
+        step_sizes=step_sizes,
+    )
+
+    expected = torch.sigmoid(
+        logits_from_adjacency(structures.adjacency)
+        + step_sizes[:, None, None] * adjacency_logit_velocity
+    )
+    expected[:, 0, 0] = 0.0
+    expected[:, 1, 1] = 0.0
+    expected[:, 2, 2] = 0.0
+    assert torch.allclose(next_structures.adjacency, expected)
+    assert bool(
+        ((0.0 <= next_structures.adjacency) & (next_structures.adjacency <= 1.0))
+        .all()
+        .item()
+    )
+
+
+def test_euler_step_does_not_use_direct_adjacency_clamp_dynamics() -> None:
+    structures = Structures(
+        positions=torch.tensor([[[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [1.0, 0.0, 0.0]]]),
+        roles=torch.tensor([[0, 2, 2]], dtype=torch.long),
+        adjacency=torch.tensor([[[0.0, 0.2, 0.3], [0.2, 0.0, 0.4], [0.3, 0.4, 0.0]]]),
+    )
+    step_sizes = torch.tensor([0.5])
+    adjacency_logit_velocity = torch.tensor(
+        [[[0.0, 4.0, -4.0], [4.0, 0.0, 0.5], [-4.0, 0.5, 0.0]]]
+    )
+
+    next_structures = _euler_step(
+        current_structures=structures,
+        position_velocity=torch.zeros_like(structures.positions),
+        adjacency_logit_velocity=adjacency_logit_velocity,
+        step_sizes=step_sizes,
+    )
+    direct_clamp = torch.clamp(
+        structures.adjacency + step_sizes[:, None, None] * adjacency_logit_velocity,
+        0.0,
+        1.0,
+    )
+    assert not torch.allclose(next_structures.adjacency, direct_clamp)
 
 
 def test_aggregate_rollout_losses_uses_step_mean_and_endpoint_physics() -> None:
@@ -191,50 +258,96 @@ def test_aggregate_rollout_losses_uses_step_mean_and_endpoint_physics() -> None:
     assert torch.allclose(loss_terms["physical_loss"], torch.tensor(5.5))
 
 
-def test_loss_gradient_diagnostics_reports_norms_and_cosine() -> None:
+def test_objective_clipped_gradients_clip_each_loss_and_sum_correctly() -> None:
     model = torch.nn.Linear(1, 1, bias=False)
     with torch.no_grad():
-        model.weight.fill_(2.0)
+        model.weight.fill_(1.0)
 
-    input_tensor = torch.tensor([[3.0]])
-    supervised_loss = (model(input_tensor) ** 2).sum()
-    physical_loss = (2.0 * model(input_tensor) ** 2).sum()
+    main_loss = 6.0 * model.weight.squeeze()
+    physical_loss = 3.0 * model.weight.squeeze()
 
-    diagnostics = _loss_gradient_diagnostics(
-        supervised_loss=supervised_loss,
+    combined_gradients, metrics = _objective_clipped_gradients(
+        main_loss=main_loss,
         physical_loss=physical_loss,
-        model=model,
+        parameters=[model.weight],
+        config=FlowCurriculumTrainingConfig(
+            dataset_path="dataset.pt",
+            main_grad_clip_norm=1.0,
+            physical_grad_clip_norm=0.5,
+        ),
     )
 
-    assert torch.allclose(diagnostics["supervised_grad_norm"], torch.tensor(36.0))
-    assert torch.allclose(diagnostics["physical_grad_norm"], torch.tensor(72.0))
+    assert torch.allclose(metrics["main_grad_norm_pre_clip"], torch.tensor(6.0))
+    assert torch.allclose(metrics["main_grad_norm_post_clip"], torch.tensor(1.0))
+    assert torch.allclose(metrics["physical_grad_norm_pre_clip"], torch.tensor(3.0))
+    assert torch.allclose(metrics["physical_grad_norm_post_clip"], torch.tensor(0.5))
     assert torch.allclose(
-        diagnostics["supervised_physical_grad_cosine"],
+        metrics["combined_grad_norm_pre_global_clip"],
+        torch.tensor(1.5),
+    )
+    assert torch.allclose(combined_gradients[0], torch.tensor([[1.5]]))
+    assert torch.allclose(
+        metrics["main_physical_grad_cosine"],
         torch.tensor(1.0),
     )
 
 
-def test_loss_gradient_diagnostics_returns_zero_cosine_for_zero_norm() -> None:
+def test_objective_clipped_gradients_handle_zero_physical_loss() -> None:
     model = torch.nn.Linear(1, 1, bias=False)
     with torch.no_grad():
-        model.weight.zero_()
+        model.weight.fill_(1.0)
 
-    input_tensor = torch.tensor([[3.0]])
-    supervised_loss = (model(input_tensor) ** 2).sum()
-    physical_loss = supervised_loss * 0.0
+    main_loss = 3.0 * model.weight.squeeze()
+    physical_loss = model.weight.squeeze() * 0.0
 
-    diagnostics = _loss_gradient_diagnostics(
-        supervised_loss=supervised_loss,
+    combined_gradients, metrics = _objective_clipped_gradients(
+        main_loss=main_loss,
         physical_loss=physical_loss,
-        model=model,
+        parameters=[model.weight],
+        config=FlowCurriculumTrainingConfig(
+            dataset_path="dataset.pt",
+            main_grad_clip_norm=1.0,
+            physical_grad_clip_norm=0.5,
+        ),
     )
 
-    assert torch.allclose(diagnostics["supervised_grad_norm"], torch.tensor(0.0))
-    assert torch.allclose(diagnostics["physical_grad_norm"], torch.tensor(0.0))
+    assert torch.allclose(metrics["physical_grad_norm_pre_clip"], torch.tensor(0.0))
+    assert torch.allclose(metrics["physical_grad_norm_post_clip"], torch.tensor(0.0))
+    assert torch.allclose(metrics["main_grad_norm_pre_clip"], torch.tensor(3.0))
+    assert torch.allclose(metrics["main_grad_norm_post_clip"], torch.tensor(1.0))
+    assert torch.allclose(combined_gradients[0], torch.tensor([[1.0]]))
     assert torch.allclose(
-        diagnostics["supervised_physical_grad_cosine"],
+        metrics["main_physical_grad_cosine"],
         torch.tensor(0.0),
     )
+
+
+def test_objective_clipped_gradients_main_loss_can_include_kl_without_extra_group() -> (
+    None
+):
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+
+    main_loss = 3.0 * model.weight.squeeze()
+    physical_loss = 4.0 * model.weight.squeeze()
+
+    combined_gradients, metrics = _objective_clipped_gradients(
+        main_loss=main_loss,
+        physical_loss=physical_loss,
+        parameters=[model.weight],
+        config=FlowCurriculumTrainingConfig(
+            dataset_path="dataset.pt",
+            main_grad_clip_norm=1.0,
+            physical_grad_clip_norm=0.5,
+        ),
+    )
+
+    assert torch.allclose(metrics["main_grad_norm_pre_clip"], torch.tensor(3.0))
+    assert torch.allclose(metrics["main_grad_norm_post_clip"], torch.tensor(1.0))
+    assert torch.allclose(metrics["physical_grad_norm_pre_clip"], torch.tensor(4.0))
+    assert torch.allclose(metrics["physical_grad_norm_post_clip"], torch.tensor(0.5))
+    assert torch.allclose(combined_gradients[0], torch.tensor([[1.5]]))
 
 
 def test_conditioning_inputs_use_no_grad_when_enabled(
@@ -342,7 +455,7 @@ def test_trajectory_loss_terms_uses_endpoint_only_physics(
                 (),
                 {
                     "position_velocity": torch.zeros_like(structures.positions),
-                    "adjacency_velocity": torch.zeros_like(structures.adjacency),
+                    "adjacency_logit_velocity": torch.zeros_like(structures.adjacency),
                     "style_kl": None,
                 },
             )()
@@ -449,7 +562,7 @@ def test_trajectory_loss_terms_skips_all_analysis_when_physics_is_disabled(
                 (),
                 {
                     "position_velocity": torch.zeros_like(structures.positions),
-                    "adjacency_velocity": torch.zeros_like(structures.adjacency),
+                    "adjacency_logit_velocity": torch.zeros_like(structures.adjacency),
                     "style_kl": None,
                 },
             )()
@@ -524,6 +637,44 @@ def test_train_flow_refiner_writes_checkpoint_and_history(tmp_path: Path) -> Non
     assert "physical_loss_contribution" in summary.history
     assert checkpoint["train_config"]["num_integration_steps"] == 3
     assert "style_sample_dropout" not in checkpoint["train_config"]
+
+
+def test_train_flow_refiner_uses_single_optimizer_step_per_iteration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset_path, cases = _build_cases(tmp_path)
+    step_calls = 0
+    original_step = torch.optim.AdamW.step
+
+    def counted_step(self, closure=None):
+        nonlocal step_calls
+        step_calls += 1
+        return original_step(self, closure=closure)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", counted_step)
+
+    train_flow_refiner(
+        optimized_cases=cases,
+        model_config=SupervisedRefinerConfig(
+            hidden_dim=64,
+            connectivity_latent_dim=32,
+            num_attention_layers=3,
+            num_heads=16,
+        ),
+        train_config=FlowCurriculumTrainingConfig(
+            dataset_path=str(dataset_path),
+            device="cpu",
+            batch_size=2,
+            num_steps=2,
+            eval_fraction=0.0,
+            checkpoint_path=str(tmp_path / "refiner_step_count.pt"),
+            logdir=str(tmp_path / "runs_step_count"),
+            seed=13,
+        ),
+    )
+
+    assert step_calls == 2
 
 
 def test_train_flow_refiner_supports_warm_start_from_checkpoint(tmp_path: Path) -> None:

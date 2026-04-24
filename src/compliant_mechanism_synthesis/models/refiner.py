@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from compliant_mechanism_synthesis.adjacency import logits_from_adjacency
 from compliant_mechanism_synthesis.dataset.types import Analyses, Structures
 from compliant_mechanism_synthesis.mechanics import normalize_generalized_stiffness
 from compliant_mechanism_synthesis.roles import role_masks
@@ -39,7 +40,7 @@ def _signed_log1p_features(values: torch.Tensor) -> torch.Tensor:
 @dataclass(frozen=True)
 class FlowPrediction:
     position_velocity: torch.Tensor
-    adjacency_velocity: torch.Tensor
+    adjacency_logit_velocity: torch.Tensor
     predicted_adjacency: torch.Tensor
     connectivity_latents: torch.Tensor
     style_latent: torch.Tensor | None = None
@@ -914,21 +915,16 @@ class SupervisedRefiner(nn.Module):
             max_distance=self.config.max_distance,
             transition_width=self.config.transition_width,
         )
-        current_logits = torch.logit(
-            current_adjacency.clamp(
-                self.config.pair_edge_logit_eps,
-                1.0 - self.config.pair_edge_logit_eps,
-            )
-        )
-        updated_logits = current_logits + delta_logit * update_gate
+        current_logits = logits_from_adjacency(current_adjacency)
+        adjacency_logit_velocity = delta_logit * update_gate
+        updated_logits = current_logits + adjacency_logit_velocity
         predicted_adjacency = enforce_role_adjacency_constraints(
             torch.sigmoid(updated_logits),
             roles,
         )
-        adjacency_velocity = predicted_adjacency - current_adjacency
         return FlowPrediction(
             position_velocity=position_velocity,
-            adjacency_velocity=adjacency_velocity,
+            adjacency_logit_velocity=adjacency_logit_velocity,
             predicted_adjacency=predicted_adjacency,
             connectivity_latents=connectivity_latents,
             style_latent=style_latent,
@@ -1015,9 +1011,10 @@ class SupervisedRefiner(nn.Module):
             positions = (
                 current.positions + step_size * prediction.position_velocity * free_mask
             ).clamp(0.0, 1.0)
+            current_logits = logits_from_adjacency(current.adjacency)
             adjacency = enforce_role_adjacency_constraints(
-                (current.adjacency + step_size * prediction.adjacency_velocity).clamp(
-                    0.0, 1.0
+                torch.sigmoid(
+                    current_logits + step_size * prediction.adjacency_logit_velocity
                 ),
                 current.roles,
             )

@@ -27,6 +27,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--eval-every-steps", type=int, default=defaults.eval_every_steps
     )
     parser.add_argument("--max-grad-norm", type=float, default=defaults.max_grad_norm)
+    parser.add_argument(
+        "--main-grad-clip-norm",
+        type=float,
+        default=defaults.main_grad_clip_norm,
+    )
+    parser.add_argument(
+        "--physical-grad-clip-norm",
+        type=float,
+        default=defaults.physical_grad_clip_norm,
+    )
     parser.add_argument("--num-steps", type=int, default=defaults.num_steps)
     parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
     parser.add_argument("--warmup-steps", type=int, default=defaults.warmup_steps)
@@ -162,6 +172,8 @@ def train_main(argv: list[str] | None = None) -> None:
             log_every_steps=args.log_every_steps,
             eval_every_steps=args.eval_every_steps,
             max_grad_norm=args.max_grad_norm,
+            main_grad_clip_norm=args.main_grad_clip_norm,
+            physical_grad_clip_norm=args.physical_grad_clip_norm,
             num_steps=args.num_steps,
             learning_rate=args.learning_rate,
             warmup_steps=args.warmup_steps,
