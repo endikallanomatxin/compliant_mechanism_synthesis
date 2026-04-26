@@ -52,7 +52,7 @@ class FlowCurriculumTrainingConfig:
     physical_grad_clip_norm: float = 0.1
     weight_decay: float = 1e-4
     num_steps: int = 120_000
-    learning_rate: float = 4e-5
+    learning_rate: float = 2e-6
     warmup_steps: int = 1000
     min_learning_rate: float = 1e-7
     eval_fraction: float = 0.02
