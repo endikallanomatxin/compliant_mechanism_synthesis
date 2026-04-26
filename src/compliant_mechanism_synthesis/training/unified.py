@@ -49,12 +49,12 @@ class FlowCurriculumTrainingConfig:
     eval_every_steps: int = 100
     max_grad_norm: float = 1.0
     main_grad_clip_norm: float = 1.0
-    physical_grad_clip_norm: float = 0.1
+    physical_grad_clip_norm: float = 1.0
     weight_decay: float = 1e-4
     num_steps: int = 120_000
-    learning_rate: float = 2e-6
+    learning_rate: float = 1e-5
     warmup_steps: int = 1000
-    min_learning_rate: float = 1e-7
+    min_learning_rate: float = 1e-6
     eval_fraction: float = 0.02
     init_checkpoint_path: str | None = None
     checkpoint_path: str | None = None
@@ -76,7 +76,7 @@ class FlowCurriculumTrainingConfig:
     position_huber_beta: float = 0.02
     adjacency_huber_beta: float = 0.05
     supervised_weight_start: float = 1.0
-    supervised_weight_end: float = 0.0
+    supervised_weight_end: float = 0.05
     supervised_transition_start_step: int = 20_000
     supervised_transition_end_step: int = 100_000
 
@@ -312,7 +312,7 @@ def _position_step_loss(
         raise ValueError("position_huber_beta must be positive")
     _, _, free_mask = role_masks(roles)
     free_mask = free_mask.unsqueeze(-1).to(dtype=predicted_step.dtype)
-    return (
+    error = (
         F.smooth_l1_loss(
             predicted_step,
             target_step,
@@ -320,7 +320,9 @@ def _position_step_loss(
             beta=beta,
         )
         * free_mask
-    ).mean(dim=(1, 2))
+    ).sum(dim=(1, 2))
+    denom = free_mask.sum(dim=(1, 2)).clamp_min(1.0)
+    return error / denom
 
 
 def _adjacency_step_loss(
@@ -778,7 +780,7 @@ def _trajectory_loss_terms(
     for integration_index, flow_times in enumerate(step_times):
         current_stiffness, nodal_displacements, edge_von_mises = _conditioning_inputs(
             current=current,
-            use_analysis=physical_loss_enabled,
+            use_analysis=True,
             profile=profile,
         )
         prediction = model.predict_flow(

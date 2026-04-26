@@ -269,7 +269,7 @@ def test_supervised_step_losses_use_smooth_l1() -> None:
         beta=1.0,
     )
 
-    assert torch.allclose(position_loss, torch.tensor([0.25]))
+    assert torch.allclose(position_loss, torch.tensor([1.50]))
     assert torch.allclose(adjacency_loss, torch.tensor([0.75]))
 
 
@@ -605,12 +605,13 @@ def test_trajectory_loss_terms_uses_endpoint_only_physics(
     assert torch.allclose(metrics["stiffness_error"], torch.tensor(3.0))
 
 
-def test_trajectory_loss_terms_skips_all_analysis_when_physics_is_disabled(
+def test_trajectory_loss_terms_keeps_mechanics_conditioning_when_physics_is_disabled(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     _, cases = _build_cases(tmp_path)
     batch = make_training_batch(cases, seed=5)
+    analysis_calls: list[bool] = []
 
     class FakeModel:
         def __init__(self) -> None:
@@ -636,13 +637,18 @@ def test_trajectory_loss_terms_skips_all_analysis_when_physics_is_disabled(
                 style_analyses,
                 style_token_mask,
             )
-            assert torch.allclose(
-                current_stiffness, torch.zeros_like(current_stiffness)
+            assert current_stiffness.shape == (structures.batch_size, 6, 6)
+            assert nodal_displacements.shape == (
+                structures.batch_size,
+                structures.num_nodes,
+                18,
             )
-            assert torch.allclose(
-                nodal_displacements, torch.zeros_like(nodal_displacements)
+            assert edge_von_mises.shape == (
+                structures.batch_size,
+                structures.num_nodes,
+                structures.num_nodes,
+                6,
             )
-            assert torch.allclose(edge_von_mises, torch.zeros_like(edge_von_mises))
             return type(
                 "Prediction",
                 (),
@@ -654,10 +660,9 @@ def test_trajectory_loss_terms_skips_all_analysis_when_physics_is_disabled(
             )()
 
     def fake_analyze_structures(current: Structures, profile=None) -> Analyses:
-        del current, profile
-        raise AssertionError(
-            "analyze_structures should not be called when lambda_phys=0"
-        )
+        del profile
+        analysis_calls.append(torch.is_grad_enabled())
+        return _fake_analyses_from_structures(current)
 
     def fake_structural_objective_terms(**kwargs):
         raise AssertionError(
@@ -688,6 +693,7 @@ def test_trajectory_loss_terms_skips_all_analysis_when_physics_is_disabled(
     )
 
     assert torch.isfinite(total_loss)
+    assert analysis_calls == [False, False, False]
     assert torch.allclose(loss_terms["physical_loss"], torch.tensor(0.0))
     assert torch.allclose(loss_terms["physical_loss_contribution"], torch.tensor(0.0))
     assert torch.allclose(metrics["stiffness_error"], torch.tensor(0.0))
