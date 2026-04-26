@@ -41,6 +41,15 @@ def _inverse_softplus(value: float) -> float:
     return math.log(math.expm1(value))
 
 
+_EDGE_VON_MISES_INPUT_SCALE = 250e6
+
+
+def _normalized_edge_von_mises_features(edge_von_mises: torch.Tensor) -> torch.Tensor:
+    safe_values = torch.nan_to_num(edge_von_mises, nan=0.0, posinf=1e30, neginf=0.0)
+    normalized_values = (safe_values / _EDGE_VON_MISES_INPUT_SCALE).clamp_min(0.0)
+    return torch.log1p(normalized_values)
+
+
 @dataclass(frozen=True)
 class FlowPrediction:
     position_step: torch.Tensor
@@ -527,14 +536,7 @@ class StyleLocalEncoder(nn.Module):
         )
         hidden = self.input_norm(self.stem_down_proj(shared_hidden))
         edge_stress_conditioning = self.edge_von_mises_mlp(
-            torch.log1p(
-                torch.nan_to_num(
-                    analyses.edge_von_mises,
-                    nan=0.0,
-                    posinf=1e30,
-                    neginf=0.0,
-                ).clamp_min(0.0)
-            )
+            _normalized_edge_von_mises_features(analyses.edge_von_mises)
         ).permute(0, 3, 1, 2)
         for layer in self.layers:
             hidden = layer(
@@ -883,11 +885,7 @@ class SupervisedRefiner(nn.Module):
         hidden = hidden + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
         edge_stress_conditioning = self.edge_von_mises_mlp(
-            torch.log1p(
-                torch.nan_to_num(
-                    edge_von_mises, nan=0.0, posinf=1e30, neginf=0.0
-                ).clamp_min(0.0)
-            )
+            _normalized_edge_von_mises_features(edge_von_mises)
         ).permute(0, 3, 1, 2)
 
         mechanics_features = torch.cat(

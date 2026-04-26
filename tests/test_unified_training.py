@@ -17,6 +17,9 @@ from compliant_mechanism_synthesis.models import (
     SupervisedRefiner,
     SupervisedRefinerConfig,
 )
+from compliant_mechanism_synthesis.models.refiner import (
+    _normalized_edge_von_mises_features,
+)
 from compliant_mechanism_synthesis.roles import role_masks
 from compliant_mechanism_synthesis.training import (
     FlowCurriculumTrainingConfig,
@@ -253,6 +256,17 @@ def test_supervised_refiner_has_head_norms_and_positive_branch_scales() -> None:
         float(model._positive_scale(model.style_residual_raw_scale).detach().item())
         > 0.0
     )
+
+
+def test_normalized_edge_von_mises_features_scale_by_allowable_stress() -> None:
+    edge_von_mises = torch.tensor([[[[0.0, 250e6, 500e6, float("nan")]]]])
+
+    normalized = _normalized_edge_von_mises_features(edge_von_mises)
+
+    expected = torch.tensor(
+        [[[[0.0, torch.log1p(torch.tensor(1.0)), torch.log1p(torch.tensor(2.0)), 0.0]]]]
+    )
+    assert torch.allclose(normalized, expected)
 
 
 def test_supervised_step_losses_use_smooth_l1() -> None:
