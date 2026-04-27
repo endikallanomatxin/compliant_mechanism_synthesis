@@ -76,14 +76,14 @@ class FlowCurriculumTrainingConfig:
     position_huber_beta: float = 0.02
     adjacency_huber_beta: float = 0.05
     supervised_weight_start: float = 1.0
-    supervised_weight_end: float = 0.05
+    supervised_weight_end: float = 0.01
     supervised_transition_start_step: int = 20_000
-    supervised_transition_end_step: int = 100_000
+    supervised_transition_end_step: int = 60_000
 
-    physical_weight_start: float = 0.0
-    physical_weight_end: float = 0.01
-    physical_transition_start_step: int = 20_000
-    physical_transition_end_step: int = 100_000
+    physical_weight_start: float = 0
+    physical_weight_end: float = 1
+    physical_transition_start_step: int = 0
+    physical_transition_end_step: int = 80_000
 
     stiffness_loss_weight: float = 1.0
     stress_loss_weight: float = 0.01
