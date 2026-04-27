@@ -44,7 +44,7 @@ from compliant_mechanism_synthesis.utils import resolve_torch_device
 class FlowCurriculumTrainingConfig:
     dataset_path: str
     device: str = "auto"
-    batch_size: int = 40
+    batch_size: int = 32
     log_every_steps: int = 10
     eval_every_steps: int = 100
     max_grad_norm: float = 1.0
@@ -97,8 +97,8 @@ class FlowCurriculumTrainingConfig:
     stress_activation_threshold: float = 0.15
     simulation_position_grad_clip_norm: float = 1.0
     simulation_adjacency_grad_clip_norm: float = 0.25
-    absolute_physical_loss_weight: float = 1.0
-    relative_physical_loss_weight: float = 0.0
+    absolute_physical_loss_weight: float = 0.2
+    relative_physical_loss_weight: float = 0.8
 
     log_gradient_diagnostics: bool = False
 
