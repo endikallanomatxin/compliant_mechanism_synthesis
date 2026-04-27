@@ -77,6 +77,17 @@ def test_make_training_batch_returns_noisy_initial_and_oracle_structures(
             interpolation,
         ),
     )
+    assert batch.source_structures.edge_radius is not None
+    assert batch.oracle_structures.edge_radius is not None
+    assert batch.initial_structures.edge_radius is not None
+    assert torch.allclose(
+        batch.initial_structures.edge_radius,
+        torch.lerp(
+            batch.source_structures.edge_radius,
+            batch.oracle_structures.edge_radius,
+            interpolation,
+        ),
+    )
 
 
 def test_make_training_batch_respects_max_initial_time(tmp_path: Path) -> None:
@@ -100,6 +111,7 @@ def test_sample_noisy_structures_is_seeded_gaussian_from_dataset_stats(
 
     assert torch.allclose(structures_a.positions, structures_b.positions)
     assert torch.allclose(structures_a.adjacency, structures_b.adjacency)
+    assert torch.allclose(structures_a.edge_radius, structures_b.edge_radius)
     assert not torch.allclose(structures_a.positions, structures_c.positions)
 
 
@@ -121,6 +133,9 @@ def test_make_training_batch_matches_permuted_free_oracle_nodes(tmp_path: Path) 
             ),
             roles=optimized_cases.optimized_structures.roles,
             adjacency=optimized_cases.optimized_structures.adjacency.index_select(
+                1, permutation
+            ).index_select(2, permutation),
+            edge_radius=optimized_cases.optimized_structures.edge_radius.index_select(
                 1, permutation
             ).index_select(2, permutation),
         ),
@@ -162,6 +177,10 @@ def test_make_training_batch_matches_permuted_free_oracle_nodes(tmp_path: Path) 
     assert torch.allclose(
         reference_batch.initial_structures.adjacency,
         permuted_batch.initial_structures.adjacency,
+    )
+    assert torch.allclose(
+        reference_batch.initial_structures.edge_radius,
+        permuted_batch.initial_structures.edge_radius,
     )
 
 

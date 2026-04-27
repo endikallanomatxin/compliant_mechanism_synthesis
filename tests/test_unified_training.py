@@ -5,7 +5,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from compliant_mechanism_synthesis.adjacency import logits_from_adjacency
+from compliant_mechanism_synthesis.adjacency import (
+    logits_from_adjacency,
+    logits_from_unit_interval,
+)
 from compliant_mechanism_synthesis.dataset import (
     CaseOptimizationConfig,
     OfflineDatasetConfig,
@@ -33,6 +36,7 @@ from compliant_mechanism_synthesis.training import (
 )
 from compliant_mechanism_synthesis.training.unified import (
     _aggregate_rollout_losses,
+    _edge_radius_step_loss,
     _clip_grad_norm_per_sample,
     _conditioning_inputs,
     _euler_step,
@@ -97,7 +101,11 @@ def test_local_flow_targets_use_current_state_and_remaining_time(
     _, cases = _build_cases(tmp_path)
     batch = make_training_batch(cases, seed=5)
 
-    target_position_velocity, target_adjacency_logit_velocity = local_flow_targets(
+    (
+        target_position_velocity,
+        target_adjacency_logit_velocity,
+        target_edge_radius_logit_velocity,
+    ) = local_flow_targets(
         batch.initial_structures,
         batch.oracle_structures,
         batch.initial_times,
@@ -116,6 +124,17 @@ def test_local_flow_targets_use_current_state_and_remaining_time(
         oracle_logits,
         atol=1e-5,
     )
+    current_edge_radius_logits = logits_from_unit_interval(
+        batch.initial_structures.edge_radius
+    )
+    oracle_edge_radius_logits = logits_from_unit_interval(
+        batch.oracle_structures.edge_radius
+    )
+    assert torch.allclose(
+        current_edge_radius_logits + remaining * target_edge_radius_logit_velocity,
+        oracle_edge_radius_logits,
+        atol=1e-5,
+    )
 
 
 def test_local_flow_step_targets_use_dt_correctly(tmp_path: Path) -> None:
@@ -123,13 +142,21 @@ def test_local_flow_step_targets_use_dt_correctly(tmp_path: Path) -> None:
     batch = make_training_batch(cases, seed=5)
     _, step_sizes = rollout_step_schedule(batch.initial_times, num_integration_steps=4)
 
-    target_position_velocity, target_adjacency_logit_velocity = local_flow_targets(
+    (
+        target_position_velocity,
+        target_adjacency_logit_velocity,
+        target_edge_radius_logit_velocity,
+    ) = local_flow_targets(
         batch.initial_structures,
         batch.oracle_structures,
         batch.initial_times,
         epsilon=1e-4,
     )
-    target_position_step, target_adjacency_step = local_flow_step_targets(
+    (
+        target_position_step,
+        target_adjacency_step,
+        target_edge_radius_step,
+    ) = local_flow_step_targets(
         batch.initial_structures,
         batch.oracle_structures,
         batch.initial_times,
@@ -143,19 +170,30 @@ def test_local_flow_step_targets_use_dt_correctly(tmp_path: Path) -> None:
         target_adjacency_step,
         step_scale * target_adjacency_logit_velocity,
     )
+    assert torch.allclose(
+        target_edge_radius_step,
+        step_scale * target_edge_radius_logit_velocity,
+    )
 
 
 def test_flow_step_predictions_return_model_steps_directly() -> None:
     position_step = torch.tensor([[[0.05, 0.0, 0.0]]])
     adjacency_logit_step = torch.tensor([[[0.0]]])
+    edge_radius_logit_step = torch.tensor([[[0.2]]])
 
-    predicted_position_step, predicted_adjacency_step = flow_step_predictions(
+    (
+        predicted_position_step,
+        predicted_adjacency_step,
+        predicted_edge_radius_step,
+    ) = flow_step_predictions(
         position_step=position_step,
         adjacency_logit_step=adjacency_logit_step,
+        edge_radius_logit_step=edge_radius_logit_step,
     )
 
     assert torch.allclose(predicted_position_step, position_step)
     assert torch.allclose(predicted_adjacency_step, torch.tensor([[[0.0]]]))
+    assert torch.allclose(predicted_edge_radius_step, edge_radius_logit_step)
 
 
 def test_local_flow_step_targets_are_coherent_for_single_integration_step(
@@ -165,7 +203,11 @@ def test_local_flow_step_targets_are_coherent_for_single_integration_step(
     batch = make_training_batch(cases, seed=5)
     _, step_sizes = rollout_step_schedule(batch.initial_times, num_integration_steps=1)
 
-    target_position_step, target_adjacency_step = local_flow_step_targets(
+    (
+        target_position_step,
+        target_adjacency_step,
+        target_edge_radius_step,
+    ) = local_flow_step_targets(
         batch.initial_structures,
         batch.oracle_structures,
         batch.initial_times,
@@ -185,6 +227,17 @@ def test_local_flow_step_targets_are_coherent_for_single_integration_step(
         oracle_logits,
         atol=1e-5,
     )
+    current_edge_radius_logits = logits_from_unit_interval(
+        batch.initial_structures.edge_radius
+    )
+    oracle_edge_radius_logits = logits_from_unit_interval(
+        batch.oracle_structures.edge_radius
+    )
+    assert torch.allclose(
+        current_edge_radius_logits + target_edge_radius_step,
+        oracle_edge_radius_logits,
+        atol=1e-5,
+    )
 
 
 def test_euler_step_updates_adjacency_in_logit_space() -> None:
@@ -201,6 +254,7 @@ def test_euler_step_updates_adjacency_in_logit_space() -> None:
         current_structures=structures,
         position_step=torch.zeros_like(structures.positions),
         adjacency_logit_step=adjacency_logit_step,
+        edge_radius_logit_step=torch.zeros_like(structures.adjacency),
     )
 
     expected = torch.sigmoid(
@@ -231,6 +285,7 @@ def test_euler_step_does_not_use_direct_adjacency_clamp_dynamics() -> None:
         current_structures=structures,
         position_step=torch.zeros_like(structures.positions),
         adjacency_logit_step=adjacency_logit_step,
+        edge_radius_logit_step=torch.zeros_like(structures.adjacency),
     )
     direct_clamp = torch.clamp(
         structures.adjacency + adjacency_logit_step,
@@ -282,9 +337,15 @@ def test_supervised_step_losses_use_smooth_l1() -> None:
         target_step=torch.zeros(1, 2, 2),
         beta=1.0,
     )
+    edge_radius_loss = _edge_radius_step_loss(
+        predicted_step=torch.tensor([[[0.0, 2.0], [2.0, 0.0]]]),
+        target_step=torch.zeros(1, 2, 2),
+        beta=1.0,
+    )
 
     assert torch.allclose(position_loss, torch.tensor([1.50]))
     assert torch.allclose(adjacency_loss, torch.tensor([0.75]))
+    assert torch.allclose(edge_radius_loss, torch.tensor([0.75]))
 
 
 def test_euler_step_keeps_position_unclamped_and_reports_real_motion() -> None:
@@ -300,12 +361,42 @@ def test_euler_step_keeps_position_unclamped_and_reports_real_motion() -> None:
             [[[0.0, 0.0, 0.0], [0.1, -0.1, 0.0], [0.0, 0.0, 0.0]]]
         ),
         adjacency_logit_step=torch.zeros_like(structures.adjacency),
+        edge_radius_logit_step=torch.zeros_like(structures.adjacency),
     )
 
     assert torch.allclose(
         next_structures.positions,
         torch.tensor([[[0.99, 0.01, 0.5], [0.6, 0.4, 0.0], [1.0, 0.0, 0.0]]]),
     )
+
+
+def test_euler_step_updates_edge_radius_in_logit_space() -> None:
+    structures = Structures(
+        positions=torch.tensor([[[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [1.0, 0.0, 0.0]]]),
+        roles=torch.tensor([[0, 2, 2]], dtype=torch.long),
+        adjacency=torch.tensor([[[0.0, 0.2, 0.3], [0.2, 0.0, 0.4], [0.3, 0.4, 0.0]]]),
+        edge_radius=torch.tensor(
+            [[[0.0, 0.25, 0.50], [0.25, 0.0, 0.75], [0.50, 0.75, 0.0]]]
+        ),
+    )
+    edge_radius_logit_step = torch.tensor(
+        [[[0.0, 0.5, -0.5], [0.5, 0.0, 0.25], [-0.5, 0.25, 0.0]]]
+    )
+
+    next_structures = _euler_step(
+        current_structures=structures,
+        position_step=torch.zeros_like(structures.positions),
+        adjacency_logit_step=torch.zeros_like(structures.adjacency),
+        edge_radius_logit_step=edge_radius_logit_step,
+    )
+
+    expected = torch.sigmoid(
+        logits_from_unit_interval(structures.edge_radius) + edge_radius_logit_step
+    )
+    expected[:, 0, 0] = 0.0
+    expected[:, 1, 1] = 0.0
+    expected[:, 2, 2] = 0.0
+    assert torch.allclose(next_structures.edge_radius, expected)
 
 
 def test_aggregate_rollout_losses_uses_step_mean_and_endpoint_physics() -> None:
@@ -556,6 +647,7 @@ def test_trajectory_loss_terms_uses_endpoint_only_physics(
                 {
                     "position_step": torch.zeros_like(structures.positions),
                     "adjacency_logit_step": torch.zeros_like(structures.adjacency),
+                    "edge_radius_logit_step": torch.zeros_like(structures.adjacency),
                     "style_kl": None,
                 },
             )()
@@ -604,6 +696,8 @@ def test_trajectory_loss_terms_uses_endpoint_only_physics(
             physical_weight_end=1.0,
             physical_transition_start_step=0,
             physical_transition_end_step=0,
+            absolute_physical_loss_weight=1.0,
+            relative_physical_loss_weight=0.0,
         ),
         step=0,
     )
@@ -669,6 +763,7 @@ def test_trajectory_loss_terms_keeps_mechanics_conditioning_when_physics_is_disa
                 {
                     "position_step": torch.zeros_like(structures.positions),
                     "adjacency_logit_step": torch.zeros_like(structures.adjacency),
+                    "edge_radius_logit_step": torch.zeros_like(structures.adjacency),
                     "style_kl": None,
                 },
             )()
@@ -753,6 +848,7 @@ def test_trajectory_loss_terms_can_use_relative_endpoint_physical_loss(
                 {
                     "position_step": torch.full_like(structures.positions, 0.01),
                     "adjacency_logit_step": torch.zeros_like(structures.adjacency),
+                    "edge_radius_logit_step": torch.zeros_like(structures.adjacency),
                     "style_kl": None,
                 },
             )()

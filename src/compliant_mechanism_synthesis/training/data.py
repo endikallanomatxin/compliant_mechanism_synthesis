@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 from scipy.optimize import linear_sum_assignment
 
+from compliant_mechanism_synthesis.adjacency import resolve_edge_radius
 from compliant_mechanism_synthesis.dataset import load_offline_dataset
 from compliant_mechanism_synthesis.dataset.types import (
     Analyses,
@@ -87,6 +88,37 @@ def _dataset_adjacency_statistics(
     mean = torch.stack(means)
     std = torch.stack(stds)
     return mean, std
+
+
+def _dataset_edge_radius_statistics(
+    optimized_cases: OptimizedCases,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    edge_radius = resolve_edge_radius(
+        optimized_cases.optimized_structures.adjacency,
+        optimized_cases.optimized_structures.edge_radius,
+    )
+    fixed_mask, mobile_mask, free_mask = role_masks(
+        optimized_cases.optimized_structures.roles
+    )
+    diagonal = torch.eye(
+        edge_radius.shape[1], device=edge_radius.device, dtype=torch.bool
+    )
+    diagonal = diagonal.unsqueeze(0)
+    free_free = (free_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)) & ~diagonal
+    free_fixed = (free_mask.unsqueeze(-1) & fixed_mask.unsqueeze(-2)) | (
+        fixed_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    free_mobile = (free_mask.unsqueeze(-1) & mobile_mask.unsqueeze(-2)) | (
+        mobile_mask.unsqueeze(-1) & free_mask.unsqueeze(-2)
+    )
+    masks = [free_free, free_fixed, free_mobile]
+    means: list[torch.Tensor] = []
+    stds: list[torch.Tensor] = []
+    for mask in masks:
+        values = edge_radius[mask]
+        means.append(values.mean())
+        stds.append(values.std(unbiased=False).clamp_min(1e-3))
+    return torch.stack(means), torch.stack(stds)
 
 
 def dataset_noise_statistics(
@@ -189,6 +221,19 @@ def _match_oracle_to_source(
         positions=matched_positions,
         roles=oracle_structures.roles,
         adjacency=matched_adjacency,
+        edge_radius=(
+            None
+            if oracle_structures.edge_radius is None
+            else torch.stack(
+                [
+                    oracle_structures.edge_radius[index]
+                    .index_select(0, stacked_permutations[index])
+                    .index_select(1, stacked_permutations[index])
+                    for index in range(batch_size)
+                ],
+                dim=0,
+            )
+        ),
     )
     matched_analyses = Analyses(
         generalized_stiffness=oracle_analyses.generalized_stiffness,
@@ -257,6 +302,8 @@ def sample_noisy_structures(
     position_std: torch.Tensor | None = None,
     adjacency_mean: torch.Tensor | None = None,
     adjacency_std: torch.Tensor | None = None,
+    edge_radius_mean: torch.Tensor | None = None,
+    edge_radius_std: torch.Tensor | None = None,
     seed: int | None = None,
 ) -> Structures:
     optimized_cases.validate()
@@ -269,10 +316,23 @@ def sample_noisy_structures(
         position_mean, position_std = _dataset_position_statistics(optimized_cases)
     if adjacency_mean is None or adjacency_std is None:
         adjacency_mean, adjacency_std = _dataset_adjacency_statistics(optimized_cases)
+    if edge_radius_mean is None or edge_radius_std is None:
+        edge_radius_mean, edge_radius_std = _dataset_edge_radius_statistics(
+            optimized_cases
+        )
     adjacency_mean_matrix, adjacency_std_matrix = _role_pair_adjacency_matrices(
         optimized_cases.optimized_structures.roles,
         adjacency_mean.to(device=oracle_adjacency.device, dtype=oracle_adjacency.dtype),
         adjacency_std.to(device=oracle_adjacency.device, dtype=oracle_adjacency.dtype),
+    )
+    edge_radius_mean_matrix, edge_radius_std_matrix = _role_pair_adjacency_matrices(
+        optimized_cases.optimized_structures.roles,
+        edge_radius_mean.to(
+            device=oracle_adjacency.device, dtype=oracle_adjacency.dtype
+        ),
+        edge_radius_std.to(
+            device=oracle_adjacency.device, dtype=oracle_adjacency.dtype
+        ),
     )
     sampled_positions = position_mean + position_std * torch.randn(
         oracle_positions.shape,
@@ -286,10 +346,24 @@ def sample_noisy_structures(
         device=oracle_adjacency.device,
         dtype=oracle_adjacency.dtype,
     )
+    sampled_edge_radius = (
+        edge_radius_mean_matrix
+        + edge_radius_std_matrix
+        * torch.randn(
+            oracle_adjacency.shape,
+            generator=generator,
+            device=oracle_adjacency.device,
+            dtype=oracle_adjacency.dtype,
+        )
+    )
     noisy_positions = sampled_positions.clamp(0.0, 1.0)
     noisy_adjacency = enforce_role_adjacency_constraints(
         symmetrize_matrix(sampled_adjacency.clamp(0.0, 1.0)),
         optimized_cases.optimized_structures.roles,
+    )
+    noisy_edge_radius = resolve_edge_radius(
+        noisy_adjacency,
+        symmetrize_matrix(sampled_edge_radius.clamp(0.0, 1.0)),
     )
 
     _, _, free_mask = role_masks(optimized_cases.optimized_structures.roles)
@@ -302,6 +376,7 @@ def sample_noisy_structures(
         positions=noisy_positions,
         roles=optimized_cases.optimized_structures.roles,
         adjacency=noisy_adjacency,
+        edge_radius=noisy_edge_radius,
     )
     structures.validate()
     return structures
@@ -335,6 +410,7 @@ def analyze_structures(
             positions=structures.positions,
             roles=structures.roles,
             adjacency=structures.adjacency,
+            edge_radius=structures.edge_radius,
             frame_config=frame_config,
             penalty_config=geometry_config,
             profile=profile,
@@ -390,6 +466,11 @@ def make_training_batch(
         oracle_structures.adjacency,
         interpolation,
     )
+    initial_edge_radius = torch.lerp(
+        resolve_edge_radius(source_structures.adjacency, source_structures.edge_radius),
+        resolve_edge_radius(oracle_structures.adjacency, oracle_structures.edge_radius),
+        interpolation,
+    )
     initial_structures = Structures(
         positions=initial_positions,
         roles=source_structures.roles,
@@ -397,6 +478,7 @@ def make_training_batch(
             initial_adjacency,
             source_structures.roles,
         ),
+        edge_radius=resolve_edge_radius(initial_adjacency, initial_edge_radius),
     )
     initial_structures.validate()
     return TrainingBatch(

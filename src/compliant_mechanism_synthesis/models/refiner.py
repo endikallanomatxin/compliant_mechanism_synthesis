@@ -7,7 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from compliant_mechanism_synthesis.adjacency import logits_from_adjacency
+from compliant_mechanism_synthesis.adjacency import (
+    logits_from_adjacency,
+    logits_from_unit_interval,
+    resolve_edge_radius,
+)
 from compliant_mechanism_synthesis.dataset.types import Analyses, Structures
 from compliant_mechanism_synthesis.mechanics import normalize_generalized_stiffness
 from compliant_mechanism_synthesis.roles import role_masks
@@ -54,8 +58,11 @@ def _normalized_edge_von_mises_features(edge_von_mises: torch.Tensor) -> torch.T
 class FlowPrediction:
     position_step: torch.Tensor
     adjacency_logit_step: torch.Tensor
+    edge_radius_logit_step: torch.Tensor
     predicted_adjacency: torch.Tensor
+    predicted_edge_radius: torch.Tensor
     connectivity_latents: torch.Tensor
+    edge_radius_latents: torch.Tensor
     style_latent: torch.Tensor | None = None
     style_residual: torch.Tensor | None = None
     style_token_mask: torch.Tensor | None = None
@@ -95,6 +102,7 @@ class SupervisedRefinerConfig:
     num_integration_steps: int = 8
     max_position_step: float = 0.05
     max_adjacency_logit_step: float = 1.0
+    max_edge_radius_logit_step: float = 1.0
     # Units
     max_distance: float = 0.24
     transition_width: float = 0.08
@@ -118,9 +126,10 @@ class GraphAttentionBlock(nn.Module):
         self.head_dim = hidden_dim // num_heads
         self.hybrid_head_slices = (
             ("distance", slice(0, 4)),
-            ("connectivity", slice(4, 8)),
-            ("stress", slice(8, 12)),
-            ("free", slice(12, 16)),
+            ("presence", slice(4, 8)),
+            ("radius", slice(8, 11)),
+            ("mechanics", slice(11, 14)),
+            ("free", slice(14, 16)),
         )
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim)
@@ -138,34 +147,49 @@ class GraphAttentionBlock(nn.Module):
         self,
         mode: str,
         adjacency: torch.Tensor,
+        edge_radius: torch.Tensor,
         positions: torch.Tensor,
+        edge_head_conditioning: torch.Tensor | None,
     ) -> torch.Tensor | None:
         if mode == "free":
             return None
-        if mode == "connectivity":
+        if mode == "presence":
             return adjacency
-        if mode == "stress":
-            return None
+        if mode == "radius":
+            return edge_radius
+        if mode == "mechanics":
+            if edge_head_conditioning is None:
+                return None
+            return torch.sigmoid(edge_head_conditioning.mean(dim=1))
         return distance_affinity(positions, length_scale=0.22)
 
     def _hybrid_attention(
         self,
         logits: torch.Tensor,
         adjacency: torch.Tensor,
+        edge_radius: torch.Tensor,
         positions: torch.Tensor,
         edge_head_conditioning: torch.Tensor | None,
     ) -> torch.Tensor:
         logits_bias = torch.zeros_like(logits)
         weight_scale = torch.ones_like(logits)
         for mode, head_slice in self.hybrid_head_slices:
-            conditioning = self._conditioning_matrix(mode, adjacency, positions)
+            conditioning = self._conditioning_matrix(
+                mode,
+                adjacency,
+                edge_radius,
+                positions,
+                edge_head_conditioning,
+            )
             if conditioning is not None:
                 logits_bias[:, head_slice] = 2.0 * conditioning[:, None, :, :] - 1.0
                 weight_scale[:, head_slice] = 0.25 + 0.75 * conditioning[:, None]
         if edge_head_conditioning is not None:
             if edge_head_conditioning.shape[1] != 4:
                 raise ValueError("hybrid stress conditioning must have 4 head channels")
-            logits_bias[:, 8:12] = logits_bias[:, 8:12] + edge_head_conditioning
+            logits_bias[:, 11:14] = (
+                logits_bias[:, 11:14] + edge_head_conditioning[:, :3]
+            )
         weights = torch.softmax(logits + logits_bias, dim=-1)
         weights = weights * weight_scale
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -175,6 +199,7 @@ class GraphAttentionBlock(nn.Module):
         self,
         hidden: torch.Tensor,
         adjacency: torch.Tensor,
+        edge_radius: torch.Tensor,
         positions: torch.Tensor,
         edge_head_conditioning: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -200,6 +225,7 @@ class GraphAttentionBlock(nn.Module):
         weights = self._hybrid_attention(
             logits,
             adjacency,
+            edge_radius,
             positions,
             edge_head_conditioning,
         )
@@ -221,6 +247,7 @@ def _incident_bar_pair_features(
     directions_2d: torch.Tensor,
     lengths: torch.Tensor,
     weights: torch.Tensor,
+    radii: torch.Tensor,
 ) -> torch.Tensor:
     direction_a = directions_2d.unsqueeze(-2)
     direction_b = directions_2d.unsqueeze(-3)
@@ -230,8 +257,19 @@ def _incident_bar_pair_features(
     length_b = lengths.unsqueeze(-2).expand_as(dot_products)
     weight_a = weights.unsqueeze(-1).expand_as(dot_products)
     weight_b = weights.unsqueeze(-2).expand_as(dot_products)
+    radius_a = radii.unsqueeze(-1).expand_as(dot_products)
+    radius_b = radii.unsqueeze(-2).expand_as(dot_products)
     return torch.stack(
-        [dot_products, sin_magnitudes, length_a, length_b, weight_a, weight_b],
+        [
+            dot_products,
+            sin_magnitudes,
+            length_a,
+            length_b,
+            weight_a,
+            weight_b,
+            radius_a,
+            radius_b,
+        ],
         dim=-1,
     )
 
@@ -253,12 +291,12 @@ class LocalNodeGeometryEncoder(nn.Module):
         self.relation_hidden_dim = config.local_relation_hidden_dim
         self.bar_hidden_dim = config.local_bar_hidden_dim
         self.bar_feature_mlp = nn.Sequential(
-            nn.Linear(4, self.relation_hidden_dim),
+            nn.Linear(5, self.relation_hidden_dim),
             nn.GELU(),
             nn.Linear(self.relation_hidden_dim, self.relation_hidden_dim),
         )
         self.pair_mlp = nn.Sequential(
-            nn.Linear(6, self.relation_hidden_dim),
+            nn.Linear(8, self.relation_hidden_dim),
             nn.GELU(),
             nn.Linear(self.relation_hidden_dim, self.relation_hidden_dim),
         )
@@ -352,12 +390,21 @@ class LocalNodeGeometryEncoder(nn.Module):
         pooled = self._pool_encoded_set(encoded, flat_valid)
         return pooled.view(batch_size, num_nodes, hidden_dim)
 
-    def forward(self, positions: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        positions: torch.Tensor,
+        adjacency: torch.Tensor,
+        edge_radius: torch.Tensor,
+    ) -> torch.Tensor:
         batch_size, num_nodes, spatial_dim = positions.shape
         if spatial_dim != 3:
             raise ValueError("LocalNodeGeometryEncoder expects 3D positions")
         if adjacency.shape != (batch_size, num_nodes, num_nodes):
             raise ValueError("adjacency must match positions batch and node dimensions")
+        if edge_radius.shape != (batch_size, num_nodes, num_nodes):
+            raise ValueError(
+                "edge_radius must match positions batch and node dimensions"
+            )
         if num_nodes <= 1:
             return positions.new_zeros(
                 batch_size, num_nodes, self.output_proj[-1].out_features
@@ -375,6 +422,7 @@ class LocalNodeGeometryEncoder(nn.Module):
         bar_valid = top_weights > 0.0
         batch_index = torch.arange(batch_size, device=positions.device)[:, None, None]
         neighbor_positions = positions[batch_index, top_indices]
+        neighbor_radii = edge_radius.gather(2, top_indices)
         node_positions = positions[:, :, None, :]
         bar_vectors = neighbor_positions - node_positions
         bar_lengths = torch.linalg.vector_norm(bar_vectors, dim=-1)
@@ -385,9 +433,13 @@ class LocalNodeGeometryEncoder(nn.Module):
         directions_2d = directions_2d * bar_valid.unsqueeze(-1)
         bar_lengths = bar_lengths * bar_valid
         top_weights = top_weights * bar_valid
+        neighbor_radii = neighbor_radii * bar_valid
 
         pair_features = _incident_bar_pair_features(
-            directions_2d, bar_lengths, top_weights
+            directions_2d,
+            bar_lengths,
+            top_weights,
+            neighbor_radii,
         )
         relation_tokens = self.pair_mlp(pair_features)
         eye_mask = torch.eye(num_bars, device=adjacency.device, dtype=torch.bool).view(
@@ -397,7 +449,12 @@ class LocalNodeGeometryEncoder(nn.Module):
         relation_summary = self._encode_relation_sets(relation_tokens, relation_valid)
 
         bar_features = torch.cat(
-            [directions_2d, bar_lengths.unsqueeze(-1), top_weights.unsqueeze(-1)],
+            [
+                directions_2d,
+                bar_lengths.unsqueeze(-1),
+                top_weights.unsqueeze(-1),
+                neighbor_radii.unsqueeze(-1),
+            ],
             dim=-1,
         )
         bar_tokens = self.bar_feature_mlp(bar_features) + relation_summary
@@ -410,6 +467,7 @@ def _symmetric_pair_edge_features(
     connectivity_latents: torch.Tensor,
     positions: torch.Tensor,
     current_adjacency: torch.Tensor,
+    current_edge_radius: torch.Tensor,
 ) -> torch.Tensor:
     latent_i = connectivity_latents.unsqueeze(2)
     latent_j = connectivity_latents.unsqueeze(1)
@@ -424,6 +482,7 @@ def _symmetric_pair_edge_features(
             latent_dot_product,
             pair_distance,
             current_adjacency.unsqueeze(-1),
+            current_edge_radius.unsqueeze(-1),
         ],
         dim=-1,
     )
@@ -514,6 +573,7 @@ class StyleLocalEncoder(nn.Module):
         shared_hidden = shared_hidden + self.local_geometry_encoder(
             structures.positions,
             structures.adjacency,
+            resolve_edge_radius(structures.adjacency, structures.edge_radius),
         )
         shared_hidden = shared_hidden + self.role_embedding(structures.roles)
         normalized_target_stiffness = normalize_generalized_stiffness(target_stiffness)
@@ -542,6 +602,7 @@ class StyleLocalEncoder(nn.Module):
             hidden = layer(
                 hidden,
                 structures.adjacency,
+                resolve_edge_radius(structures.adjacency, structures.edge_radius),
                 structures.positions,
                 edge_head_conditioning=edge_stress_conditioning,
             )
@@ -642,6 +703,7 @@ class SupervisedRefiner(nn.Module):
         self.input_norm = nn.LayerNorm(self.config.hidden_dim)
         self.position_head_norm = nn.LayerNorm(self.config.hidden_dim)
         self.connectivity_head_norm = nn.LayerNorm(self.config.hidden_dim)
+        self.edge_radius_head_norm = nn.LayerNorm(self.config.hidden_dim)
         self.layers = nn.ModuleList(
             [
                 GraphAttentionBlock(
@@ -670,8 +732,26 @@ class SupervisedRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, self.config.connectivity_latent_dim),
         )
-        pair_edge_input_dim = 3 * self.config.connectivity_latent_dim + 3
-        self.pair_edge_mlp = nn.Sequential(
+        self.edge_radius_latent_head = nn.Sequential(
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.config.hidden_dim, self.config.connectivity_latent_dim),
+        )
+        pair_edge_input_dim = 3 * self.config.connectivity_latent_dim + 4
+        self.presence_pair_edge_mlp = nn.Sequential(
+            nn.Linear(pair_edge_input_dim, self.config.pair_edge_hidden_dim),
+            nn.GELU(),
+            nn.Linear(
+                self.config.pair_edge_hidden_dim, self.config.pair_edge_hidden_dim
+            ),
+            nn.GELU(),
+            nn.Linear(self.config.pair_edge_hidden_dim, 1),
+        )
+        self.edge_radius_pair_edge_mlp = nn.Sequential(
             nn.Linear(pair_edge_input_dim, self.config.pair_edge_hidden_dim),
             nn.GELU(),
             nn.Linear(
@@ -865,6 +945,10 @@ class SupervisedRefiner(nn.Module):
         current_adjacency = enforce_role_adjacency_constraints(
             structures.adjacency, roles
         )
+        current_edge_radius = resolve_edge_radius(
+            current_adjacency,
+            structures.edge_radius,
+        )
         normalized_target_stiffness = normalize_generalized_stiffness(target_stiffness)
         normalized_current_stiffness = normalize_generalized_stiffness(
             current_stiffness
@@ -881,6 +965,7 @@ class SupervisedRefiner(nn.Module):
         ) * self.local_geometry_encoder(
             positions,
             current_adjacency,
+            current_edge_radius,
         )
         hidden = hidden + self.role_embedding(roles)
         hidden = self.input_norm(hidden)
@@ -932,6 +1017,7 @@ class SupervisedRefiner(nn.Module):
             hidden = layer(
                 hidden,
                 current_adjacency,
+                current_edge_radius,
                 positions,
                 edge_stress_conditioning,
             )
@@ -943,15 +1029,31 @@ class SupervisedRefiner(nn.Module):
         connectivity_latents = self.connectivity_latent_head(
             self.connectivity_head_norm(hidden)
         )
+        edge_radius_latents = self.edge_radius_latent_head(
+            self.edge_radius_head_norm(hidden)
+        )
         # Connectivity updates stay grounded in node latents, but use a
         # symmetric pair scorer and update adjacency in logit space.
-        pair_features = _symmetric_pair_edge_features(
+        presence_pair_features = _symmetric_pair_edge_features(
             connectivity_latents,
             positions,
             current_adjacency,
+            current_edge_radius,
         )
-        delta_logit = self.pair_edge_mlp(pair_features).squeeze(-1)
-        delta_logit = symmetrize_matrix(delta_logit)
+        radius_pair_features = _symmetric_pair_edge_features(
+            edge_radius_latents,
+            positions,
+            current_adjacency,
+            current_edge_radius,
+        )
+        presence_delta_logit = self.presence_pair_edge_mlp(
+            presence_pair_features
+        ).squeeze(-1)
+        presence_delta_logit = symmetrize_matrix(presence_delta_logit)
+        edge_radius_delta_logit = self.edge_radius_pair_edge_mlp(
+            radius_pair_features
+        ).squeeze(-1)
+        edge_radius_delta_logit = symmetrize_matrix(edge_radius_delta_logit)
         update_gate = max_length_gate(
             positions,
             max_distance=self.config.max_distance,
@@ -959,18 +1061,33 @@ class SupervisedRefiner(nn.Module):
         )
         current_logits = logits_from_adjacency(current_adjacency)
         adjacency_logit_step = (
-            self.config.max_adjacency_logit_step * torch.tanh(delta_logit) * update_gate
+            self.config.max_adjacency_logit_step
+            * torch.tanh(presence_delta_logit)
+            * update_gate
         )
         updated_logits = current_logits + adjacency_logit_step
         predicted_adjacency = enforce_role_adjacency_constraints(
             torch.sigmoid(updated_logits),
             roles,
         )
+        current_edge_radius_logits = logits_from_unit_interval(current_edge_radius)
+        edge_radius_logit_step = (
+            self.config.max_edge_radius_logit_step
+            * torch.tanh(edge_radius_delta_logit)
+            * update_gate
+        )
+        predicted_edge_radius = resolve_edge_radius(
+            predicted_adjacency,
+            torch.sigmoid(current_edge_radius_logits + edge_radius_logit_step),
+        )
         return FlowPrediction(
             position_step=position_step,
             adjacency_logit_step=adjacency_logit_step,
+            edge_radius_logit_step=edge_radius_logit_step,
             predicted_adjacency=predicted_adjacency,
+            predicted_edge_radius=predicted_edge_radius,
             connectivity_latents=connectivity_latents,
+            edge_radius_latents=edge_radius_latents,
             style_latent=style_latent,
             style_residual=style_residual,
             style_token_mask=style_token_mask,
@@ -1059,14 +1176,25 @@ class SupervisedRefiner(nn.Module):
                 1.0,
             )
             current_logits = logits_from_adjacency(current.adjacency)
+            current_edge_radius = resolve_edge_radius(
+                current.adjacency, current.edge_radius
+            )
+            current_edge_radius_logits = logits_from_unit_interval(current_edge_radius)
             adjacency = enforce_role_adjacency_constraints(
                 torch.sigmoid(current_logits + prediction.adjacency_logit_step),
                 current.roles,
+            )
+            edge_radius = resolve_edge_radius(
+                adjacency,
+                torch.sigmoid(
+                    current_edge_radius_logits + prediction.edge_radius_logit_step
+                ),
             )
             current = Structures(
                 positions=positions,
                 roles=current.roles,
                 adjacency=adjacency,
+                edge_radius=edge_radius,
             )
             trajectory.append(current)
         trajectory[-1].validate()

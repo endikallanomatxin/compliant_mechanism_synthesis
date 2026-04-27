@@ -11,6 +11,7 @@ from compliant_mechanism_synthesis.dataset.optimization import (
     optimize_cases,
     optimize_scaffolds,
 )
+from compliant_mechanism_synthesis.adjacency import split_legacy_adjacency
 from compliant_mechanism_synthesis.dataset.primitives import (
     PrimitiveConfig,
     sample_random_primitive,
@@ -55,18 +56,44 @@ def _sample_preview_case_indices(
 
 
 def _concatenate_structures(batches: list[Structures]) -> Structures:
+    edge_radii = [batch.edge_radius for batch in batches]
+    if any(edge_radius is not None for edge_radius in edge_radii) and not all(
+        edge_radius is not None for edge_radius in edge_radii
+    ):
+        raise ValueError("all structure batches must consistently include edge_radius")
     return Structures(
         positions=torch.cat([batch.positions for batch in batches], dim=0),
         roles=torch.cat([batch.roles for batch in batches], dim=0),
         adjacency=torch.cat([batch.adjacency for batch in batches], dim=0),
+        edge_radius=(
+            None
+            if not edge_radii or edge_radii[0] is None
+            else torch.cat(
+                [edge_radius for edge_radius in edge_radii if edge_radius is not None],
+                dim=0,
+            )
+        ),
     )
 
 
 def _concatenate_scaffolds(batches: list[Scaffolds]) -> Scaffolds:
+    edge_radii = [batch.edge_radius for batch in batches]
+    if any(edge_radius is not None for edge_radius in edge_radii) and not all(
+        edge_radius is not None for edge_radius in edge_radii
+    ):
+        raise ValueError("all scaffold batches must consistently include edge_radius")
     return Scaffolds(
         positions=torch.cat([batch.positions for batch in batches], dim=0),
         roles=torch.cat([batch.roles for batch in batches], dim=0),
         adjacency=torch.cat([batch.adjacency for batch in batches], dim=0),
+        edge_radius=(
+            None
+            if not edge_radii or edge_radii[0] is None
+            else torch.cat(
+                [edge_radius for edge_radius in edge_radii if edge_radius is not None],
+                dim=0,
+            )
+        ),
         edge_primitive_ids=torch.cat(
             [batch.edge_primitive_ids for batch in batches], dim=0
         ),
@@ -353,9 +380,20 @@ def load_offline_dataset(
     optimized_cases = OptimizedCases(
         target_stiffness=payload["target_stiffness"],
         optimized_structures=Structures(
+            adjacency=(
+                payload["optimized_structures"]["adjacency"]
+                if "edge_radius" in payload["optimized_structures"]
+                else split_legacy_adjacency(
+                    payload["optimized_structures"]["adjacency"]
+                )[0]
+            ),
             positions=payload["optimized_structures"]["positions"],
             roles=payload["optimized_structures"]["roles"],
-            adjacency=payload["optimized_structures"]["adjacency"],
+            edge_radius=payload["optimized_structures"].get("edge_radius")
+            if "edge_radius" in payload["optimized_structures"]
+            else split_legacy_adjacency(payload["optimized_structures"]["adjacency"])[
+                1
+            ],
         ),
         initial_loss=payload["initial_loss"],
         best_loss=payload["best_loss"],
@@ -395,6 +433,7 @@ def load_offline_dataset(
             edge_twist_start=payload["scaffolds"]["edge_twist_start"],
             edge_twist_end=payload["scaffolds"]["edge_twist_end"],
             edge_sweep_phase=payload["scaffolds"]["edge_sweep_phase"],
+            edge_radius=payload["scaffolds"].get("edge_radius"),
         ),
     )
     optimized_cases.validate()
@@ -417,6 +456,7 @@ def _serialize_optimized_cases(
             "positions": serialized.optimized_structures.positions,
             "roles": serialized.optimized_structures.roles,
             "adjacency": serialized.optimized_structures.adjacency,
+            "edge_radius": serialized.optimized_structures.edge_radius,
         },
         "initial_loss": serialized.initial_loss,
         "best_loss": serialized.best_loss,
@@ -435,6 +475,7 @@ def _serialize_optimized_cases(
             "positions": serialized.scaffolds.positions,
             "roles": serialized.scaffolds.roles,
             "adjacency": serialized.scaffolds.adjacency,
+            "edge_radius": serialized.scaffolds.edge_radius,
             "edge_primitive_ids": serialized.scaffolds.edge_primitive_ids,
             "edge_primitive_types": serialized.scaffolds.edge_primitive_types,
             "edge_sheet_width_nodes": serialized.scaffolds.edge_sheet_width_nodes,

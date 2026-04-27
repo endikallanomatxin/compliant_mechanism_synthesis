@@ -59,6 +59,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=defaults.max_adjacency_logit_step,
     )
     parser.add_argument(
+        "--max-edge-radius-logit-step",
+        type=float,
+        default=defaults.max_edge_radius_logit_step,
+    )
+    parser.add_argument(
         "--style-token-dropout", type=float, default=defaults.style_token_dropout
     )
     parser.add_argument(
@@ -80,10 +85,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--adjacency-loss-weight", type=float, default=defaults.adjacency_loss_weight
     )
     parser.add_argument(
+        "--edge-radius-loss-weight",
+        type=float,
+        default=defaults.edge_radius_loss_weight,
+    )
+    parser.add_argument(
         "--position-huber-beta", type=float, default=defaults.position_huber_beta
     )
     parser.add_argument(
         "--adjacency-huber-beta", type=float, default=defaults.adjacency_huber_beta
+    )
+    parser.add_argument(
+        "--edge-radius-huber-beta",
+        type=float,
+        default=defaults.edge_radius_huber_beta,
     )
     parser.add_argument(
         "--supervised-weight-start",
@@ -173,6 +188,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=defaults.simulation_adjacency_grad_clip_norm,
     )
     parser.add_argument(
+        "--simulation-edge-radius-grad-clip-norm",
+        type=float,
+        default=defaults.simulation_edge_radius_grad_clip_norm,
+    )
+    parser.add_argument(
         "--absolute-physical-loss-weight",
         type=float,
         default=defaults.absolute_physical_loss_weight,
@@ -222,14 +242,17 @@ def train_main(argv: list[str] | None = None) -> None:
             flow_target_epsilon=args.flow_target_epsilon,
             max_position_step=args.max_position_step,
             max_adjacency_logit_step=args.max_adjacency_logit_step,
+            max_edge_radius_logit_step=args.max_edge_radius_logit_step,
             use_style_conditioning=args.use_style_conditioning,
             style_token_dropout=args.style_token_dropout,
             style_kl_loss_weight=args.style_kl_loss_weight,
             style_kl_anneal_steps=args.style_kl_anneal_steps,
             position_loss_weight=args.position_loss_weight,
             adjacency_loss_weight=args.adjacency_loss_weight,
+            edge_radius_loss_weight=args.edge_radius_loss_weight,
             position_huber_beta=args.position_huber_beta,
             adjacency_huber_beta=args.adjacency_huber_beta,
+            edge_radius_huber_beta=args.edge_radius_huber_beta,
             supervised_weight_start=args.supervised_weight_start,
             supervised_weight_end=args.supervised_weight_end,
             supervised_transition_start_step=args.supervised_transition_start_step,
@@ -251,6 +274,7 @@ def train_main(argv: list[str] | None = None) -> None:
             weight_decay=args.weight_decay,
             simulation_position_grad_clip_norm=args.simulation_position_grad_clip_norm,
             simulation_adjacency_grad_clip_norm=args.simulation_adjacency_grad_clip_norm,
+            simulation_edge_radius_grad_clip_norm=args.simulation_edge_radius_grad_clip_norm,
             absolute_physical_loss_weight=args.absolute_physical_loss_weight,
             relative_physical_loss_weight=args.relative_physical_loss_weight,
             log_gradient_diagnostics=args.log_gradient_diagnostics,

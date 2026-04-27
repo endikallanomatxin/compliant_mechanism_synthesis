@@ -18,12 +18,16 @@ def test_graph_attention_block_supports_stress_heads() -> None:
     adjacency = torch.rand(2, 5, 5)
     adjacency = 0.5 * (adjacency + adjacency.transpose(1, 2))
     adjacency[:, torch.arange(5), torch.arange(5)] = 0.0
+    edge_radius = torch.rand(2, 5, 5)
+    edge_radius = 0.5 * (edge_radius + edge_radius.transpose(1, 2))
+    edge_radius[:, torch.arange(5), torch.arange(5)] = 0.0
     positions = torch.rand(2, 5, 3)
     edge_head_conditioning = torch.randn(2, 4, 5, 5)
 
     output = block(
         hidden,
         adjacency,
+        edge_radius,
         positions,
         edge_head_conditioning=edge_head_conditioning,
     )
@@ -57,11 +61,16 @@ def test_symmetric_pair_edge_features_match_transposed_pairs() -> None:
         [[[0.0, 0.2, 0.4], [0.2, 0.0, 0.6], [0.4, 0.6, 0.0]]],
         dtype=torch.float32,
     )
+    edge_radius = torch.tensor(
+        [[[0.0, 0.3, 0.5], [0.3, 0.0, 0.7], [0.5, 0.7, 0.0]]],
+        dtype=torch.float32,
+    )
 
     features = _symmetric_pair_edge_features(
         connectivity_latents,
         positions,
         adjacency,
+        edge_radius,
     )
 
     assert torch.allclose(features, features.transpose(1, 2))

@@ -11,7 +11,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from compliant_mechanism_synthesis.adjacency import logits_from_adjacency
+from compliant_mechanism_synthesis.adjacency import (
+    logits_from_adjacency,
+    logits_from_unit_interval,
+    resolve_edge_radius,
+)
 from compliant_mechanism_synthesis.dataset.types import (
     Analyses,
     OptimizedCases,
@@ -65,6 +69,7 @@ class FlowCurriculumTrainingConfig:
     flow_target_epsilon: float = 0.02
     max_position_step: float = 0.05
     max_adjacency_logit_step: float = 1.0
+    max_edge_radius_logit_step: float = 1.0
 
     use_style_conditioning: bool = True
     style_token_dropout: float = 0.50
@@ -73,8 +78,10 @@ class FlowCurriculumTrainingConfig:
 
     position_loss_weight: float = 1.0
     adjacency_loss_weight: float = 0.001  # Loss occurs in logit space
+    edge_radius_loss_weight: float = 0.001
     position_huber_beta: float = 0.02
     adjacency_huber_beta: float = 0.05
+    edge_radius_huber_beta: float = 0.05
     supervised_weight_start: float = 1.0
     supervised_weight_end: float = 0.01
     supervised_transition_start_step: int = 20_000
@@ -97,6 +104,7 @@ class FlowCurriculumTrainingConfig:
     stress_activation_threshold: float = 0.15
     simulation_position_grad_clip_norm: float = 1.0
     simulation_adjacency_grad_clip_norm: float = 0.25
+    simulation_edge_radius_grad_clip_norm: float = 0.25
     absolute_physical_loss_weight: float = 0.2
     relative_physical_loss_weight: float = 0.8
 
@@ -137,7 +145,7 @@ def local_flow_targets(
     oracle_structures: Structures,
     flow_times: torch.Tensor,
     epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     current_structures.validate()
     oracle_structures.validate()
     if current_structures.positions.shape != oracle_structures.positions.shape:
@@ -159,22 +167,45 @@ def local_flow_targets(
     target_adjacency_logit_velocity = (
         oracle_adjacency_logits - current_adjacency_logits
     ) / remaining
-    return target_position_velocity, target_adjacency_logit_velocity
+    current_edge_radius = resolve_edge_radius(
+        current_structures.adjacency,
+        current_structures.edge_radius,
+    )
+    oracle_edge_radius = resolve_edge_radius(
+        oracle_structures.adjacency,
+        oracle_structures.edge_radius,
+    )
+    current_edge_radius_logits = logits_from_unit_interval(current_edge_radius)
+    oracle_edge_radius_logits = logits_from_unit_interval(oracle_edge_radius)
+    target_edge_radius_logit_velocity = (
+        oracle_edge_radius_logits - current_edge_radius_logits
+    ) / remaining
+    return (
+        target_position_velocity,
+        target_adjacency_logit_velocity,
+        target_edge_radius_logit_velocity,
+    )
 
 
 def flow_step_predictions(
     position_step: torch.Tensor,
     adjacency_logit_step: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    edge_radius_logit_step: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if position_step.ndim != 3:
         raise ValueError("position_step must have shape [batch, nodes, dims]")
     if adjacency_logit_step.ndim != 3:
         raise ValueError("adjacency_logit_step must have shape [batch, nodes, nodes]")
-    if position_step.shape[:2] != adjacency_logit_step.shape[:2]:
+    if edge_radius_logit_step.ndim != 3:
+        raise ValueError("edge_radius_logit_step must have shape [batch, nodes, nodes]")
+    if (
+        position_step.shape[:2] != adjacency_logit_step.shape[:2]
+        or position_step.shape[:2] != edge_radius_logit_step.shape[:2]
+    ):
         raise ValueError(
-            "position_step and adjacency_logit_step batch/node dims must match"
+            "position_step, adjacency_logit_step, and edge_radius_logit_step batch/node dims must match"
         )
-    return position_step, adjacency_logit_step
+    return position_step, adjacency_logit_step, edge_radius_logit_step
 
 
 def local_flow_step_targets(
@@ -183,8 +214,12 @@ def local_flow_step_targets(
     flow_times: torch.Tensor,
     step_sizes: torch.Tensor,
     epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    target_position_velocity, target_adjacency_logit_velocity = local_flow_targets(
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    (
+        target_position_velocity,
+        target_adjacency_logit_velocity,
+        target_edge_radius_logit_velocity,
+    ) = local_flow_targets(
         current_structures=current_structures,
         oracle_structures=oracle_structures,
         flow_times=flow_times,
@@ -194,6 +229,7 @@ def local_flow_step_targets(
     return (
         step_scale * target_position_velocity,
         step_scale * target_adjacency_logit_velocity,
+        step_scale * target_edge_radius_logit_velocity,
     )
 
 
@@ -340,10 +376,26 @@ def _adjacency_step_loss(
     ).mean(dim=(1, 2))
 
 
+def _edge_radius_step_loss(
+    predicted_step: torch.Tensor,
+    target_step: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
+    if beta <= 0.0:
+        raise ValueError("edge_radius_huber_beta must be positive")
+    return F.smooth_l1_loss(
+        predicted_step,
+        target_step,
+        reduction="none",
+        beta=beta,
+    ).mean(dim=(1, 2))
+
+
 def _euler_step(
     current_structures: Structures,
     position_step: torch.Tensor,
     adjacency_logit_step: torch.Tensor,
+    edge_radius_logit_step: torch.Tensor,
 ) -> Structures:
     _, _, free_mask = role_masks(current_structures.roles)
     free_mask = free_mask.unsqueeze(-1).to(dtype=current_structures.positions.dtype)
@@ -364,10 +416,26 @@ def _euler_step(
         torch.sigmoid(next_adjacency_logits),
         current_structures.roles,
     )
+    current_edge_radius = resolve_edge_radius(
+        current_structures.adjacency,
+        current_structures.edge_radius,
+    )
+    current_edge_radius_logits = logits_from_unit_interval(current_edge_radius)
+    next_edge_radius_logits = torch.nan_to_num(
+        current_edge_radius_logits + edge_radius_logit_step,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    next_edge_radius = resolve_edge_radius(
+        next_adjacency,
+        torch.sigmoid(next_edge_radius_logits),
+    )
     return Structures(
         positions=next_positions,
         roles=current_structures.roles,
         adjacency=next_adjacency,
+        edge_radius=next_edge_radius,
     )
 
 
@@ -410,6 +478,10 @@ def _register_simulation_gradient_hooks(
     if structures.adjacency.requires_grad:
         structures.adjacency.register_hook(
             _clip_grad_norm_per_sample(config.simulation_adjacency_grad_clip_norm)
+        )
+    if structures.edge_radius is not None and structures.edge_radius.requires_grad:
+        structures.edge_radius.register_hook(
+            _clip_grad_norm_per_sample(config.simulation_edge_radius_grad_clip_norm)
         )
 
 
@@ -774,8 +846,10 @@ def _trajectory_loss_terms(
     supervised_step_losses: list[torch.Tensor] = []
     position_step_losses: list[torch.Tensor] = []
     adjacency_step_losses: list[torch.Tensor] = []
+    edge_radius_step_losses: list[torch.Tensor] = []
     position_range_violations: list[torch.Tensor] = []
     adjacency_range_violations: list[torch.Tensor] = []
+    edge_radius_range_violations: list[torch.Tensor] = []
 
     for integration_index, flow_times in enumerate(step_times):
         current_stiffness, nodal_displacements, edge_von_mises = _conditioning_inputs(
@@ -808,12 +882,22 @@ def _trajectory_loss_terms(
 
         safe_position_step = _safe_velocity(prediction.position_step)
         safe_adjacency_logit_step = _safe_velocity(prediction.adjacency_logit_step)
+        safe_edge_radius_logit_step = _safe_velocity(prediction.edge_radius_logit_step)
 
-        predicted_position_step, predicted_adjacency_step = flow_step_predictions(
+        (
+            predicted_position_step,
+            predicted_adjacency_step,
+            predicted_edge_radius_step,
+        ) = flow_step_predictions(
             position_step=safe_position_step,
             adjacency_logit_step=safe_adjacency_logit_step,
+            edge_radius_logit_step=safe_edge_radius_logit_step,
         )
-        target_position_step, target_adjacency_step = local_flow_step_targets(
+        (
+            target_position_step,
+            target_adjacency_step,
+            target_edge_radius_step,
+        ) = local_flow_step_targets(
             current_structures=current,
             oracle_structures=batch.oracle_structures,
             flow_times=flow_times,
@@ -831,14 +915,21 @@ def _trajectory_loss_terms(
             target_adjacency_step,
             beta=config.adjacency_huber_beta,
         )
+        edge_radius_loss = _edge_radius_step_loss(
+            predicted_edge_radius_step,
+            target_edge_radius_step,
+            beta=config.edge_radius_huber_beta,
+        )
         supervised_loss = (
             config.position_loss_weight * position_loss
             + config.adjacency_loss_weight * adjacency_loss
+            + config.edge_radius_loss_weight * edge_radius_loss
         )
 
         supervised_step_losses.append(supervised_loss)
         position_step_losses.append(position_loss)
         adjacency_step_losses.append(adjacency_loss)
+        edge_radius_step_losses.append(edge_radius_loss)
         position_range_violations.append(
             _range_violation(current.positions + predicted_position_step)
         )
@@ -846,11 +937,21 @@ def _trajectory_loss_terms(
         adjacency_range_violations.append(
             _range_violation(torch.sigmoid(current_logits + predicted_adjacency_step))
         )
+        current_edge_radius = resolve_edge_radius(
+            current.adjacency, current.edge_radius
+        )
+        current_edge_radius_logits = logits_from_unit_interval(current_edge_radius)
+        edge_radius_range_violations.append(
+            _range_violation(
+                torch.sigmoid(current_edge_radius_logits + predicted_edge_radius_step)
+            )
+        )
 
         current = _euler_step(
             current_structures=current,
             position_step=safe_position_step,
             adjacency_logit_step=safe_adjacency_logit_step,
+            edge_radius_logit_step=safe_edge_radius_logit_step,
         )
 
     initial_physical_loss = None
@@ -925,10 +1026,16 @@ def _trajectory_loss_terms(
         "adjacency_step_loss": torch.stack(adjacency_step_losses, dim=0)
         .mean(dim=0)
         .mean(),
+        "edge_radius_step_loss": torch.stack(edge_radius_step_losses, dim=0)
+        .mean(dim=0)
+        .mean(),
         "position_range_violation": torch.stack(position_range_violations, dim=0)
         .mean(dim=0)
         .mean(),
         "adjacency_range_violation": torch.stack(adjacency_range_violations, dim=0)
+        .mean(dim=0)
+        .mean(),
+        "edge_radius_range_violation": torch.stack(edge_radius_range_violations, dim=0)
         .mean(dim=0)
         .mean(),
         "stiffness_error": endpoint_metrics["stiffness_error"].mean(),
@@ -1035,6 +1142,7 @@ def _load_initial_model(
         num_integration_steps=train_config.num_integration_steps,
         max_position_step=train_config.max_position_step,
         max_adjacency_logit_step=train_config.max_adjacency_logit_step,
+        max_edge_radius_logit_step=train_config.max_edge_radius_logit_step,
     )
     model = SupervisedRefiner(effective_config).to(device)
     if train_config.init_checkpoint_path is None:
@@ -1046,6 +1154,9 @@ def _load_initial_model(
         checkpoint_model_config["max_position_step"] = train_config.max_position_step
         checkpoint_model_config["max_adjacency_logit_step"] = (
             train_config.max_adjacency_logit_step
+        )
+        checkpoint_model_config["max_edge_radius_logit_step"] = (
+            train_config.max_edge_radius_logit_step
         )
         effective_config = SupervisedRefinerConfig(**checkpoint_model_config)
         model = SupervisedRefiner(effective_config).to(device)
@@ -1085,10 +1196,14 @@ def train_flow_refiner(
         raise ValueError("max_position_step must be positive")
     if train_config.max_adjacency_logit_step <= 0.0:
         raise ValueError("max_adjacency_logit_step must be positive")
+    if train_config.max_edge_radius_logit_step <= 0.0:
+        raise ValueError("max_edge_radius_logit_step must be positive")
     if train_config.position_huber_beta <= 0.0:
         raise ValueError("position_huber_beta must be positive")
     if train_config.adjacency_huber_beta <= 0.0:
         raise ValueError("adjacency_huber_beta must be positive")
+    if train_config.edge_radius_huber_beta <= 0.0:
+        raise ValueError("edge_radius_huber_beta must be positive")
     if not 0.0 <= train_config.style_token_dropout <= 1.0:
         raise ValueError("style_token_dropout must be in [0.0, 1.0]")
     if not 0.0 <= train_config.eval_fraction < 1.0:
@@ -1101,10 +1216,14 @@ def train_flow_refiner(
         raise ValueError("simulation_position_grad_clip_norm must be positive")
     if train_config.simulation_adjacency_grad_clip_norm <= 0.0:
         raise ValueError("simulation_adjacency_grad_clip_norm must be positive")
+    if train_config.simulation_edge_radius_grad_clip_norm <= 0.0:
+        raise ValueError("simulation_edge_radius_grad_clip_norm must be positive")
     if train_config.absolute_physical_loss_weight < 0.0:
         raise ValueError("absolute_physical_loss_weight must be non-negative")
     if train_config.relative_physical_loss_weight < 0.0:
         raise ValueError("relative_physical_loss_weight must be non-negative")
+    if train_config.edge_radius_loss_weight < 0.0:
+        raise ValueError("edge_radius_loss_weight must be non-negative")
     _max_initial_time(train_config)
 
     split = split_train_eval_cases(optimized_cases, train_config.eval_fraction)
@@ -1158,6 +1277,7 @@ def train_flow_refiner(
         f"num_integration_steps={train_config.num_integration_steps} "
         f"max_position_step={train_config.max_position_step} "
         f"max_adjacency_logit_step={train_config.max_adjacency_logit_step} "
+        f"max_edge_radius_logit_step={train_config.max_edge_radius_logit_step} "
         f"use_style_conditioning={'yes' if effective_model_config.use_style_conditioning else 'no'} "
         f"style_token_dropout={train_config.style_token_dropout:.3f} "
         f"learning_rate={train_config.learning_rate} warmup_steps={train_config.warmup_steps} "
@@ -1179,10 +1299,13 @@ def train_flow_refiner(
         f"style_kl_anneal_steps={train_config.style_kl_anneal_steps} "
         f"position_huber_beta={train_config.position_huber_beta} "
         f"adjacency_huber_beta={train_config.adjacency_huber_beta} "
+        f"edge_radius_huber_beta={train_config.edge_radius_huber_beta} "
         f"simulation_position_grad_clip_norm={train_config.simulation_position_grad_clip_norm} "
         f"simulation_adjacency_grad_clip_norm={train_config.simulation_adjacency_grad_clip_norm} "
+        f"simulation_edge_radius_grad_clip_norm={train_config.simulation_edge_radius_grad_clip_norm} "
         f"absolute_physical_loss_weight={train_config.absolute_physical_loss_weight} "
-        f"relative_physical_loss_weight={train_config.relative_physical_loss_weight}",
+        f"relative_physical_loss_weight={train_config.relative_physical_loss_weight} "
+        f"edge_radius_loss_weight={train_config.edge_radius_loss_weight}",
         flush=True,
     )
 

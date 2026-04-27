@@ -19,12 +19,16 @@ class Structures:
     positions: torch.Tensor
     roles: torch.Tensor
     adjacency: torch.Tensor
+    edge_radius: torch.Tensor | None = None
 
     def to(self, device: torch.device | str) -> Structures:
         return Structures(
             positions=self.positions.to(device),
             roles=self.roles.to(device),
             adjacency=self.adjacency.to(device),
+            edge_radius=(
+                None if self.edge_radius is None else self.edge_radius.to(device)
+            ),
         )
 
     def index_select(self, batch_indices: torch.Tensor) -> Structures:
@@ -32,6 +36,11 @@ class Structures:
             positions=self.positions.index_select(0, batch_indices),
             roles=self.roles.index_select(0, batch_indices),
             adjacency=self.adjacency.index_select(0, batch_indices),
+            edge_radius=(
+                None
+                if self.edge_radius is None
+                else self.edge_radius.index_select(0, batch_indices)
+            ),
         )
 
     def validate(self) -> None:
@@ -52,6 +61,18 @@ class Structures:
         diagonal = torch.diagonal(self.adjacency, dim1=1, dim2=2)
         if not torch.allclose(diagonal, torch.zeros_like(diagonal)):
             raise ValueError("adjacency diagonal must be zero")
+        if self.edge_radius is not None:
+            _require_rank("edge_radius", self.edge_radius, 3)
+            if self.edge_radius.shape != (batch_size, num_nodes, num_nodes):
+                raise ValueError("edge_radius must have shape [batch, nodes, nodes]")
+            if not torch.allclose(self.edge_radius, self.edge_radius.transpose(1, 2)):
+                raise ValueError("edge_radius must be symmetric")
+            edge_radius_diagonal = torch.diagonal(self.edge_radius, dim1=1, dim2=2)
+            if not torch.allclose(
+                edge_radius_diagonal,
+                torch.zeros_like(edge_radius_diagonal),
+            ):
+                raise ValueError("edge_radius diagonal must be zero")
 
         role_values = {int(role) for role in self.roles.unique().tolist()}
         valid_roles = {int(NodeRole.FIXED), int(NodeRole.MOBILE), int(NodeRole.FREE)}
@@ -82,6 +103,11 @@ class Structures:
             positions=self.positions[index : index + 1],
             roles=self.roles[index : index + 1],
             adjacency=self.adjacency[index : index + 1],
+            edge_radius=(
+                None
+                if self.edge_radius is None
+                else self.edge_radius[index : index + 1]
+            ),
         )
 
 
@@ -106,12 +132,16 @@ class Scaffolds:
     edge_twist_start: torch.Tensor
     edge_twist_end: torch.Tensor
     edge_sweep_phase: torch.Tensor
+    edge_radius: torch.Tensor | None = None
 
     def to(self, device: torch.device | str) -> Scaffolds:
         return Scaffolds(
             positions=self.positions.to(device),
             roles=self.roles.to(device),
             adjacency=self.adjacency.to(device),
+            edge_radius=(
+                None if self.edge_radius is None else self.edge_radius.to(device)
+            ),
             edge_primitive_ids=self.edge_primitive_ids.to(device),
             edge_primitive_types=self.edge_primitive_types.to(device),
             edge_sheet_width_nodes=self.edge_sheet_width_nodes.to(device),
@@ -135,6 +165,11 @@ class Scaffolds:
             positions=self.positions.index_select(0, batch_indices),
             roles=self.roles.index_select(0, batch_indices),
             adjacency=self.adjacency.index_select(0, batch_indices),
+            edge_radius=(
+                None
+                if self.edge_radius is None
+                else self.edge_radius.index_select(0, batch_indices)
+            ),
             edge_primitive_ids=self.edge_primitive_ids.index_select(0, batch_indices),
             edge_primitive_types=self.edge_primitive_types.index_select(
                 0, batch_indices
@@ -167,6 +202,8 @@ class Scaffolds:
         _require_rank("positions", self.positions, 3)
         _require_rank("roles", self.roles, 2)
         _require_rank("adjacency", self.adjacency, 3)
+        if self.edge_radius is not None:
+            _require_rank("edge_radius", self.edge_radius, 3)
         _require_rank("edge_primitive_ids", self.edge_primitive_ids, 3)
         _require_rank("edge_primitive_types", self.edge_primitive_types, 3)
         int_parameter_tensors = {
@@ -200,6 +237,14 @@ class Scaffolds:
             raise ValueError("scaffold roles must have shape [batch, nodes]")
         if self.adjacency.shape != (batch_size, num_nodes, num_nodes):
             raise ValueError("scaffold adjacency must have shape [batch, nodes, nodes]")
+        if self.edge_radius is not None and self.edge_radius.shape != (
+            batch_size,
+            num_nodes,
+            num_nodes,
+        ):
+            raise ValueError(
+                "scaffold edge_radius must have shape [batch, nodes, nodes]"
+            )
         if self.edge_primitive_ids.shape != (batch_size, num_nodes, num_nodes):
             raise ValueError("edge_primitive_ids must have shape [batch, nodes, nodes]")
         if self.edge_primitive_types.shape != (batch_size, num_nodes, num_nodes):
@@ -214,6 +259,10 @@ class Scaffolds:
                 raise ValueError(f"{name} must have shape [batch, nodes, nodes]")
         if not torch.allclose(self.adjacency, self.adjacency.transpose(1, 2)):
             raise ValueError("scaffold adjacency must be symmetric")
+        if self.edge_radius is not None and not torch.allclose(
+            self.edge_radius, self.edge_radius.transpose(1, 2)
+        ):
+            raise ValueError("scaffold edge_radius must be symmetric")
         if not torch.equal(
             self.edge_primitive_ids, self.edge_primitive_ids.transpose(1, 2)
         ):
@@ -246,6 +295,13 @@ class Scaffolds:
         adjacency_diagonal = torch.diagonal(self.adjacency, dim1=1, dim2=2)
         if not torch.allclose(adjacency_diagonal, torch.zeros_like(adjacency_diagonal)):
             raise ValueError("scaffold adjacency diagonal must be zero")
+        if self.edge_radius is not None:
+            edge_radius_diagonal = torch.diagonal(self.edge_radius, dim1=1, dim2=2)
+            if not torch.allclose(
+                edge_radius_diagonal,
+                torch.zeros_like(edge_radius_diagonal),
+            ):
+                raise ValueError("scaffold edge_radius diagonal must be zero")
         primitive_id_diagonal = torch.diagonal(self.edge_primitive_ids, dim1=1, dim2=2)
         if not torch.equal(
             primitive_id_diagonal, -torch.ones_like(primitive_id_diagonal)
@@ -297,6 +353,11 @@ class Scaffolds:
             positions=self.positions[index : index + 1],
             roles=self.roles[index : index + 1],
             adjacency=self.adjacency[index : index + 1],
+            edge_radius=(
+                None
+                if self.edge_radius is None
+                else self.edge_radius[index : index + 1]
+            ),
             edge_primitive_ids=self.edge_primitive_ids[index : index + 1],
             edge_primitive_types=self.edge_primitive_types[index : index + 1],
             edge_sheet_width_nodes=self.edge_sheet_width_nodes[index : index + 1],

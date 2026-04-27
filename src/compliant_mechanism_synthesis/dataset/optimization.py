@@ -10,6 +10,7 @@ from compliant_mechanism_synthesis.adjacency import (
     allowed_edge_mask,
     build_adjacency,
     logits_from_adjacency,
+    split_legacy_adjacency,
 )
 from compliant_mechanism_synthesis.dataset.types import (
     Analyses,
@@ -129,6 +130,7 @@ def _loss_breakdown(
         positions=structures.positions,
         roles=structures.roles,
         adjacency=structures.adjacency,
+        edge_radius=structures.edge_radius,
         frame_config=config.mechanics,
         penalty_config=config.geometry,
     )
@@ -177,6 +179,11 @@ def optimize_cases(
 
     writer = SummaryWriter(log_dir=str(logdir)) if logdir is not None else None
     initial_structures = structures
+    initial_edge_radius = (
+        initial_structures.edge_radius
+        if initial_structures.edge_radius is not None
+        else split_legacy_adjacency(initial_structures.adjacency)[1]
+    )
     free_mask = role_masks(initial_structures.roles)[2]
     free_positions = torch.nn.Parameter(initial_structures.positions.clone())
     edge_i, edge_j = upper_triangle_edge_index(
@@ -192,6 +199,7 @@ def optimize_cases(
         positions=initial_structures.positions,
         roles=initial_structures.roles,
         adjacency=initial_structures.adjacency,
+        edge_radius=initial_edge_radius,
         frame_config=config.mechanics,
         penalty_config=config.geometry,
     )
@@ -221,6 +229,7 @@ def optimize_cases(
                 positions=positions,
                 roles=initial_structures.roles,
                 adjacency=adjacency,
+                edge_radius=initial_edge_radius,
             )
             breakdown = _loss_breakdown(
                 current_structures,
@@ -276,6 +285,7 @@ def optimize_cases(
         positions=best_positions,
         roles=initial_structures.roles.detach().clone(),
         adjacency=best_adjacency,
+        edge_radius=initial_edge_radius.detach().clone(),
     )
     best_breakdown = _loss_breakdown(
         best_structures,
@@ -341,6 +351,7 @@ def optimize_scaffolds(
             edge_twist_start=scaffolds.edge_twist_start,
             edge_twist_end=scaffolds.edge_twist_end,
             edge_sweep_phase=scaffolds.edge_sweep_phase,
+            edge_radius=scaffolds.edge_radius,
         )
 
     writer = SummaryWriter(log_dir=str(logdir)) if logdir is not None else None
@@ -352,6 +363,7 @@ def optimize_scaffolds(
         positions=initial_structures.positions,
         roles=initial_structures.roles,
         adjacency=initial_structures.adjacency,
+        edge_radius=initial_structures.edge_radius,
         frame_config=config.mechanics,
         penalty_config=config.geometry,
     )
@@ -368,6 +380,11 @@ def optimize_scaffolds(
         positions=initial_structures.positions.detach(),
         roles=initial_structures.roles.detach(),
         adjacency=initial_structures.adjacency.detach(),
+        edge_radius=(
+            None
+            if initial_structures.edge_radius is None
+            else initial_structures.edge_radius.detach()
+        ),
     )
     try:
         for step in range(config.scaffold_num_steps):
@@ -402,6 +419,11 @@ def optimize_scaffolds(
                     positions=current_structures.positions.detach(),
                     roles=current_structures.roles.detach(),
                     adjacency=current_structures.adjacency.detach(),
+                    edge_radius=(
+                        None
+                        if current_structures.edge_radius is None
+                        else current_structures.edge_radius.detach()
+                    ),
                 )
 
             if writer is not None and (

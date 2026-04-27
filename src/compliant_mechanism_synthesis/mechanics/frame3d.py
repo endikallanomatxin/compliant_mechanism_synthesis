@@ -6,6 +6,7 @@ import math
 
 import torch
 
+from compliant_mechanism_synthesis.adjacency import split_legacy_adjacency
 from compliant_mechanism_synthesis.roles import NodeRole, role_masks
 from compliant_mechanism_synthesis.tensor_ops import (
     symmetrize_matrix,
@@ -18,10 +19,17 @@ class Frame3DConfig:
     young_modulus: float = 210e9
     poisson_ratio: float = 0.30
     workspace_size: float = 0.2
+    radius_min: float = 2.0e-4
     radius_max: float = 1.5e-3
     global_regularization: float = 1e-8
     free_dof_regularization: float = 1e-7
     minimum_length: float = 1e-4
+
+    def __post_init__(self) -> None:
+        if self.radius_min <= 0.0:
+            raise ValueError("radius_min must be positive")
+        if self.radius_max <= self.radius_min:
+            raise ValueError("radius_max must be greater than radius_min")
 
     @property
     def shear_modulus(self) -> float:
@@ -71,8 +79,24 @@ def denormalize_generalized_stiffness(
     return matrix * energy_scale / scale_matrix
 
 
-def beam_radii(adjacency: torch.Tensor, config: Frame3DConfig) -> torch.Tensor:
-    return adjacency.clamp_min(0.0) * config.radius_max
+def _resolve_edge_presence_and_radius(
+    adjacency: torch.Tensor,
+    edge_radius: torch.Tensor | None,
+    config: Frame3DConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    adjacency = symmetrize_matrix(adjacency.float().clamp(0.0, 1.0))
+    diagonal = torch.arange(adjacency.shape[-1], device=adjacency.device)
+    adjacency[:, diagonal, diagonal] = 0.0
+    if edge_radius is None:
+        presence, normalized_radius = split_legacy_adjacency(adjacency)
+    else:
+        presence = adjacency
+        normalized_radius = symmetrize_matrix(edge_radius.float().clamp(0.0, 1.0))
+        normalized_radius[:, diagonal, diagonal] = 0.0
+    radius = config.radius_min + normalized_radius * (
+        config.radius_max - config.radius_min
+    )
+    return presence, normalized_radius, radius
 
 
 def _section_properties(
@@ -216,10 +240,15 @@ def _element_dofs(
 def assemble_global_stiffness(
     positions: torch.Tensor,
     adjacency: torch.Tensor,
+    edge_radius: torch.Tensor | None = None,
     config: Frame3DConfig | None = None,
 ) -> torch.Tensor:
     config = config or Frame3DConfig()
-    adjacency = symmetrize_matrix(adjacency.float().clamp_min(0.0))
+    presence, _, radius_matrix = _resolve_edge_presence_and_radius(
+        adjacency,
+        edge_radius,
+        config,
+    )
     batch_size, num_nodes, spatial_dim = positions.shape
     if spatial_dim != 3:
         raise ValueError("assemble_global_stiffness expects 3D positions")
@@ -227,8 +256,13 @@ def assemble_global_stiffness(
     edge_i, edge_j, dofs = _element_dofs(num_nodes, positions.device)
     delta = (positions[:, edge_j] - positions[:, edge_i]) * config.workspace_size
     length = torch.linalg.vector_norm(delta, dim=-1).clamp_min(config.minimum_length)
-    radius = beam_radii(adjacency[:, edge_i, edge_j], config)
+    edge_presence = presence[:, edge_i, edge_j]
+    radius = radius_matrix[:, edge_i, edge_j]
     area, iy, iz, polar_inertia = _section_properties(radius)
+    area = edge_presence * area
+    iy = edge_presence * iy
+    iz = edge_presence * iz
+    polar_inertia = edge_presence * polar_inertia
     local = _frame_local_stiffness(length, area, iy, iz, polar_inertia, config)
     rotation = _local_axes(delta, length)
     transform = _frame_transform(rotation)
@@ -405,6 +439,7 @@ def _canonical_generalized_loads(
 def _edge_von_mises_matrix(
     positions: torch.Tensor,
     adjacency: torch.Tensor,
+    edge_radius: torch.Tensor | None,
     full_response: torch.Tensor,
     config: Frame3DConfig,
 ) -> torch.Tensor:
@@ -412,9 +447,26 @@ def _edge_von_mises_matrix(
     edge_i, edge_j, dofs = _element_dofs(num_nodes, positions.device)
     delta = (positions[:, edge_j] - positions[:, edge_i]) * config.workspace_size
     length = torch.linalg.vector_norm(delta, dim=-1).clamp_min(config.minimum_length)
-    radius = beam_radii(adjacency[:, edge_i, edge_j], config)
+    presence, _, radius_matrix = _resolve_edge_presence_and_radius(
+        adjacency,
+        edge_radius,
+        config,
+    )
+    edge_presence = presence[:, edge_i, edge_j]
+    radius = radius_matrix[:, edge_i, edge_j]
     area, iy, iz, polar_inertia = _section_properties(radius)
-    local = _frame_local_stiffness(length, area, iy, iz, polar_inertia, config)
+    area_eff = edge_presence * area
+    iy_eff = edge_presence * iy
+    iz_eff = edge_presence * iz
+    polar_inertia_eff = edge_presence * polar_inertia
+    local = _frame_local_stiffness(
+        length,
+        area_eff,
+        iy_eff,
+        iz_eff,
+        polar_inertia_eff,
+        config,
+    )
     rotation = _local_axes(delta, length)
     transform = _frame_transform(rotation)
 
@@ -427,7 +479,6 @@ def _edge_von_mises_matrix(
     area = area.clamp_min(1e-12)
     polar_inertia = polar_inertia.clamp_min(1e-12)
     bending_inertia = iy.clamp_min(1e-12)
-    radius = radius.clamp_min(1e-12)
 
     axial_a = local_forces[..., 0, :].abs() / area.unsqueeze(-1)
     axial_b = local_forces[..., 6, :].abs() / area.unsqueeze(-1)
@@ -467,6 +518,7 @@ def _edge_von_mises_matrix(
         (axial_b + bending_b).square() + 3.0 * torsion_b.square() + sqrt_eps
     )
     edge_von_mises = torch.maximum(von_mises_a, von_mises_b)
+    edge_von_mises = edge_von_mises * edge_presence.unsqueeze(-1)
 
     edge_matrix = torch.zeros(
         (batch_size, num_nodes, num_nodes, 6),
@@ -482,13 +534,19 @@ def _output_response_summary(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
+    edge_radius: torch.Tensor | None,
     config: Frame3DConfig,
     profile: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if positions.device.type == "cuda":
         torch.cuda.synchronize(positions.device)
     assemble_start_time = time.perf_counter()
-    full = assemble_global_stiffness(positions, adjacency, config=config)
+    full = assemble_global_stiffness(
+        positions,
+        adjacency,
+        edge_radius=edge_radius,
+        config=config,
+    )
     if positions.device.type == "cuda":
         torch.cuda.synchronize(positions.device)
     transform_start_time = time.perf_counter()
@@ -554,6 +612,7 @@ def _output_response_summary(
     edge_von_mises = _edge_von_mises_matrix(
         positions=positions,
         adjacency=adjacency,
+        edge_radius=edge_radius,
         full_response=full_response,
         config=config,
     )
@@ -568,6 +627,7 @@ def effective_output_stiffness(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
+    edge_radius: torch.Tensor | None = None,
     config: Frame3DConfig | None = None,
     profile: dict[str, float] | None = None,
 ) -> torch.Tensor:
@@ -576,6 +636,7 @@ def effective_output_stiffness(
         positions,
         roles,
         adjacency,
+        edge_radius,
         config=config,
         profile=profile,
     )
@@ -585,36 +646,47 @@ def effective_output_stiffness(
 def material_usage(
     positions: torch.Tensor,
     adjacency: torch.Tensor,
+    edge_radius: torch.Tensor | None = None,
     config: Frame3DConfig | None = None,
 ) -> torch.Tensor:
     config = config or Frame3DConfig()
-    adjacency = symmetrize_matrix(adjacency.float().clamp_min(0.0))
+    presence, _, radius_matrix = _resolve_edge_presence_and_radius(
+        adjacency,
+        edge_radius,
+        config,
+    )
     _, num_nodes, _ = positions.shape
     edge_i, edge_j = upper_triangle_edge_index(num_nodes, positions.device)
     delta = (positions[:, edge_j] - positions[:, edge_i]) * config.workspace_size
     length = torch.linalg.vector_norm(delta, dim=-1)
-    radius = beam_radii(adjacency[:, edge_i, edge_j], config)
+    edge_presence = presence[:, edge_i, edge_j]
+    radius = radius_matrix[:, edge_i, edge_j]
     area, _, _, _ = _section_properties(radius)
-    return (length * area).sum(dim=-1)
+    return (length * edge_presence * area).sum(dim=-1)
 
 
 def geometry_penalties(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
+    edge_radius: torch.Tensor | None = None,
     penalty_config: GeometryPenaltyConfig | None = None,
     frame_config: Frame3DConfig | None = None,
 ) -> dict[str, torch.Tensor]:
     penalty_config = penalty_config or GeometryPenaltyConfig()
     frame_config = frame_config or Frame3DConfig()
-    adjacency = symmetrize_matrix(adjacency.float().clamp_min(0.0))
+    presence, _, radius_matrix = _resolve_edge_presence_and_radius(
+        adjacency,
+        edge_radius,
+        frame_config,
+    )
     _, num_nodes, _ = positions.shape
     edge_i, edge_j = upper_triangle_edge_index(num_nodes, positions.device)
     delta = (positions[:, edge_j] - positions[:, edge_i]) * frame_config.workspace_size
     length = torch.linalg.vector_norm(delta, dim=-1)
-    edge_activation = adjacency[:, edge_i, edge_j]
+    edge_activation = presence[:, edge_i, edge_j]
     active_mask = edge_activation > 1e-6
-    radius = beam_radii(edge_activation, frame_config)
+    radius = radius_matrix[:, edge_i, edge_j]
 
     safe_active_count = active_mask.sum(dim=-1).clamp_min(1)
     short_penalty = (
@@ -681,6 +753,7 @@ def mechanical_terms(
     positions: torch.Tensor,
     roles: torch.Tensor,
     adjacency: torch.Tensor,
+    edge_radius: torch.Tensor | None = None,
     frame_config: Frame3DConfig | None = None,
     penalty_config: GeometryPenaltyConfig | None = None,
     profile: dict[str, float] | None = None,
@@ -693,6 +766,7 @@ def mechanical_terms(
         positions=positions,
         roles=roles,
         adjacency=adjacency,
+        edge_radius=edge_radius,
         config=frame_config,
         profile=profile,
     )
@@ -703,13 +777,19 @@ def mechanical_terms(
         positions=positions,
         roles=roles,
         adjacency=adjacency,
+        edge_radius=edge_radius,
         penalty_config=penalty_config,
         frame_config=frame_config,
     )
     if positions.device.type == "cuda":
         torch.cuda.synchronize(positions.device)
     material_start_time = time.perf_counter()
-    usage = material_usage(positions, adjacency, config=frame_config)
+    usage = material_usage(
+        positions,
+        adjacency,
+        edge_radius=edge_radius,
+        config=frame_config,
+    )
     if positions.device.type == "cuda":
         torch.cuda.synchronize(positions.device)
     end_time = time.perf_counter()

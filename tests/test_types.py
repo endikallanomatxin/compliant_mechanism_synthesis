@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from compliant_mechanism_synthesis.adjacency import split_legacy_adjacency
 from compliant_mechanism_synthesis.dataset.types import Structures
 from compliant_mechanism_synthesis.roles import NodeRole
 
@@ -38,6 +39,7 @@ def test_structures_accept_valid_batched_state() -> None:
             dtype=torch.long,
         ),
         adjacency=torch.zeros((1, 7, 7), dtype=torch.float32),
+        edge_radius=torch.zeros((1, 7, 7), dtype=torch.float32),
     )
 
     structures.validate()
@@ -52,3 +54,28 @@ def test_structures_reject_non_batched_positions() -> None:
 
     with pytest.raises(ValueError, match="rank 3"):
         structures.validate()
+
+
+def test_split_legacy_adjacency_separates_presence_and_radius() -> None:
+    adjacency = torch.tensor(
+        [[[0.0, 0.10, 0.40], [0.10, 0.0, 1.30], [0.40, 1.30, 0.0]]],
+        dtype=torch.float32,
+    )
+
+    presence, edge_radius = split_legacy_adjacency(adjacency, threshold=0.15)
+
+    assert torch.equal(
+        presence,
+        torch.tensor(
+            [[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0]]],
+            dtype=torch.float32,
+        ),
+    )
+    assert torch.allclose(
+        edge_radius,
+        torch.tensor(
+            [[[0.0, 0.10, 0.40], [0.10, 0.0, 1.0], [0.40, 1.0, 0.0]]],
+            dtype=torch.float32,
+        ),
+    )
+    assert float(edge_radius[0, 0, 1].item()) > 0.0

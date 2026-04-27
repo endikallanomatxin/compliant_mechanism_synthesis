@@ -184,9 +184,9 @@ def test_train_main_uses_default_curriculum_config(tmp_path: Path) -> None:
     assert checkpoint["train_config"]["min_learning_rate"] == 1e-6
     assert checkpoint["train_config"]["physical_grad_clip_norm"] == 1.0
     assert checkpoint["train_config"]["physical_weight_start"] == 0.0
-    assert checkpoint["train_config"]["physical_weight_end"] == 0.01
+    assert checkpoint["train_config"]["physical_weight_end"] == 1.0
     assert checkpoint["train_config"]["supervised_weight_start"] == 1.0
-    assert checkpoint["train_config"]["supervised_weight_end"] == 0.05
+    assert checkpoint["train_config"]["supervised_weight_end"] == 0.01
     assert checkpoint["train_config"]["stress_loss_weight"] == 0.01
     assert "style_sample_dropout" not in checkpoint["train_config"]
 
@@ -307,6 +307,8 @@ def test_sample_supervised_main_writes_comparison_outputs(tmp_path: Path) -> Non
             str(checkpoint_path),
             "--output-dir",
             str(output_dir),
+            "--device",
+            "cpu",
             "--max-cases",
             "1",
         ]

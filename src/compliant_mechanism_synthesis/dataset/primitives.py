@@ -1582,12 +1582,17 @@ def materialize_scaffold(
                 positions=positions.unsqueeze(0).clamp(0.02, 0.98),
                 roles=roles.unsqueeze(0),
                 adjacency=symmetrize_matrix(dense_adjacency).unsqueeze(0),
+                edge_radius=symmetrize_matrix(dense_adjacency).unsqueeze(0),
             )
         )
     design = Structures(
         positions=torch.cat([item.positions for item in designs], dim=0),
         roles=torch.cat([item.roles for item in designs], dim=0),
         adjacency=torch.cat([item.adjacency for item in designs], dim=0),
+        edge_radius=torch.cat(
+            [item.edge_radius for item in designs if item.edge_radius is not None],
+            dim=0,
+        ),
     )
     design.validate()
     return design
@@ -1626,6 +1631,7 @@ def _sample_primitive_case(
         positions=positions.unsqueeze(0).clamp(0.02, 0.98),
         roles=roles.unsqueeze(0),
         adjacency=symmetrize_matrix(adjacency).unsqueeze(0),
+        edge_radius=symmetrize_matrix(adjacency).unsqueeze(0),
     )
     assignment_tensors = _build_scaffold_assignment_tensors(
         scaffold_adjacency,
@@ -1661,6 +1667,7 @@ def _sample_primitive_case(
         edge_twist_start=assignment_tensors["edge_twist_start"].unsqueeze(0),
         edge_twist_end=assignment_tensors["edge_twist_end"].unsqueeze(0),
         edge_sweep_phase=assignment_tensors["edge_sweep_phase"].unsqueeze(0),
+        edge_radius=symmetrize_matrix(scaffold_adjacency).unsqueeze(0),
     )
     design.validate()
     scaffold.validate()
