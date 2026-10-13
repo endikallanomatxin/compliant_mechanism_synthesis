@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="es">
+ <head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width,initial-scale=1" name="viewport"/>
+  <title>
+   CMS · Síntesis de mecanismos
+  </title>
+  <link href="/style.css" rel="stylesheet"/>
+ </head>
+ <body>
+  <header>
+   <a class="brand" href="#">
+    <span class="mark">
+     C
+    </span>
+    <span>
+     Mechanism Studio
+     <small>
+      Compliant mechanism synthesis
+     </small>
+    </span>
+   </a>
+   <nav aria-label="Flujo de trabajo">
+    <button id="navSpec">
+     <span>
+      Especificación
+     </span>
+    </button>
+    <button class="active" id="navSynthesis">
+     <span>
+      Síntesis
+     </span>
+    </button>
+   </nav>
+   <span class="local">
+    ● Local
+   </span>
+  </header>
+  <div class="statusbar">
+   <span id="status" role="status">
+    Preparando el diseño inicial…
+   </span>
+  </div>
+  <main hidden id="specScreen" aria-labelledby="specTitle">
+   <div class="page-heading">
+    <div>
+     <span class="eyebrow">
+      01 / DEFINIR EL PROBLEMA
+     </span>
+     <h1 id="specTitle">
+      ¿Qué debe hacer el mecanismo?
+     </h1>
+     <p>
+      Define los sólidos fijo y móvil, sus conexiones y el movimiento que quieres permitir.
+     </p>
+    </div>
+    <button class="secondary" id="defaults">
+     Restaurar ejemplo
+    </button>
+   </div>
+   <div class="spec-layout">
+    <div class="spec-form">
+     <section class="card">
+      <div class="card-heading">
+       <h2>
+        Estructura inicial
+       </h2>
+       <select aria-label="Dimensión" id="dimension">
+        <option value="2">
+         2D · plano
+        </option>
+        <option value="3">
+         3D · espacial
+        </option>
+       </select>
+      </div>
+      <p>
+       Edita coordenadas en metros. Los nodos móviles pertenecen a un único sólido rígido.
+      </p>
+      <div class="scroll">
+       <table>
+        <thead id="nodeHead">
+        </thead>
+        <tbody id="nodeRows">
+        </tbody>
+       </table>
+      </div>
+      <button class="secondary" id="addNode">
+       + Añadir nodo libre
+      </button>
+      <details>
+       <summary>
+        Vigas y radios
+        <span id="beamCount">
+        </span>
+       </summary>
+       <p>
+        Uniones biempotradas. Radios en milímetros.
+       </p>
+       <div class="beam-grid" id="beamRows">
+       </div>
+      </details>
+     </section>
+     <section class="card">
+      <div class="card-heading">
+       <h2>
+        Trayectoria deseada
+       </h2>
+       <button class="secondary" id="addWaypoint">
+        + Punto
+       </button>
+      </div>
+      <p>
+       Poses relativas al reposo. Traslaciones en mm y giros en grados. Interpolación cúbica suave entre puntos.
+      </p>
+      <label>Progreso del reposo (0–1)<input id="restFactor" type="number" min="0" max="1" step="0.05" value="0"/></label>
+      <button class="secondary" id="bidirectionalExample">Ejemplo con reposo en el centro</button>
+      <p>El punto de reposo debe figurar en la tabla con pose cero. El movimiento natural se sigue desde el reposo hacia ambos extremos, eligiendo el sentido según la consigna.</p>
+      <div class="scroll">
+       <table>
+        <thead id="pathHead">
+        </thead>
+        <tbody id="pathRows">
+        </tbody>
+       </table>
+      </div>
+     </section>
+    </div>
+    <aside class="spec-preview card">
+     <span class="eyebrow">
+      VISTA PREVIA
+     </span>
+     <h2>
+      Tu especificación
+     </h2>
+     <svg aria-label="Vista previa de estructura y trayectoria" id="specPreview" viewbox="0 0 600 420">
+     </svg>
+     <div class="legend">
+      <span>
+       ■ Fijo
+      </span>
+      <span>
+       ■ Móvil
+      </span>
+      <span>
+       ● Libre
+      </span>
+      <span class="target-key">
+       — Objetivo
+      </span>
+     </div>
+     <p id="specSummary">
+     </p>
+     <h2>
+      Detalle del recorrido objetivo
+     </h2>
+     <svg aria-label="Detalle ampliado de trayectoria objetivo" id="pathPreview" viewbox="0 0 600 220">
+     </svg>
+     <div class="preview-note">
+      La curva violeta es la consigna. La estructura determina la dirección menos rígida; la consigna elige su sentido y la longitud del recorrido.
+     </div>
+     <button class="primary" id="startSynthesis">
+      Aplicar e iniciar síntesis →
+     </button>
+     <p id="specError" role="alert">
+     </p>
+    </aside>
+   </div>
+  </main>
+  <main id="synthesisScreen">
+   <div class="page-heading">
+    <div>
+     <span class="eyebrow">
+      02 / EXPLORAR SOLUCIONES
+     </span>
+     <h1>
+      Síntesis del mecanismo
+     </h1>
+     <p id="specDigest">
+     </p>
+    </div>
+    <button class="secondary" id="editSpec">
+     Editar especificación
+    </button>
+   </div>
+   <div class="synthesis-layout">
+    <div class="synthesis-main">
+    <section class="card scene-card">
+     <div class="card-heading">
+      <h2>
+       Estructura y movimiento
+      </h2>
+      <button class="secondary" id="export">
+       Exportar JSON
+      </button>
+     </div>
+     <div class="viewport">
+      <canvas aria-label="Estructura deformada" id="view">
+      </canvas>
+      <svg aria-hidden="true" id="labels" viewbox="0 0 900 600">
+      </svg>
+      <svg id="orientationCompare" viewBox="0 0 200 170" aria-label="Comparación de orientación real y objetivo"></svg>
+     </div>
+     <div class="playback">
+      <button class="secondary" id="play">
+       Animar
+      </button>
+      <label>
+       Recorrido
+       <input id="frame" max="12" min="0" type="range" value="12"/>
+      </label>
+      <label>
+       Amplificación
+       <output id="scaleValue">
+        ×1
+       </output>
+       <input aria-label="Amplificación visual" id="scale" max="400" min="0" type="range" value="0"/>
+      </label>
+      <button class="secondary" id="autoScale">
+       Auto
+      </button>
+     </div>
+     <div class="toggles" id="cameraControls" hidden>
+      <label><input id="autoRotate" type="checkbox"/>Rotación automática 3D</label>
+      <label>Velocidad <input id="orbitSpeed" type="range" min="5" max="60" value="20" aria-label="Velocidad de rotación en grados por segundo"/><output id="orbitSpeedValue">20°/s</output></label>
+     </div>
+     <div class="toggles">
+      <label><input checked id="targetBody" type="checkbox"/>Sólido objetivo</label>
+      <label>
+       <input checked="" id="frames" type="checkbox"/>
+       Ejes
+      </label>
+      <label>
+       <input checked="" id="trajectories" type="checkbox"/>
+       Trayectorias
+      </label>
+      <label>
+       <input id="compare" type="checkbox"/>
+       Alternativas
+      </label>
+      <span>
+       Objetivo
+       <b class="target-key">
+        —
+       </b>
+       · Real
+       <b class="real-key">
+        —
+       </b>
+      </span>
+     </div>
+     <p id="poseComparison" class="note" role="status"></p>
+    </section>
+    <section class="card analysis">
+     <div class="card-heading">
+      <h2>
+       Movimiento real frente al objetivo
+      </h2>
+      <select aria-label="Coordenada del sólido" id="coordinate">
+      </select>
+     </div>
+     <div class="plots">
+      <svg aria-label="Comparación de trayectorias" id="plot" viewbox="0 0 650 220">
+      </svg>
+      <details>
+       <summary>
+        Estado y diagnóstico
+       </summary>
+       <div id="state">
+       </div>
+      </details>
+     </div>
+     <p class="note">
+      Verde: real · violeta: objetivo, al mismo progreso. La animación interpola entre estados calculados y conserva el sólido rígido; no añade equilibrios FEM. La amplificación afecta a las traslaciones de ambos sólidos por igual. En 3D, arrastra para girar la cámara.
+     </p>
+    </section>
+    <section class="card numerical-diagnostics">
+     <h2>Resolución y tamaño de paso</h2>
+     <details open><summary>Descenso del gradiente</summary>
+      <p id="learningSummary" class="note">Da un paso de gradiente para ver su aceptación y mejora.</p>
+      <svg id="learningPlot" viewBox="0 0 650 220" aria-label="Historial del tamaño de paso solicitado y aceptado"></svg>
+      <svg id="improvementPlot" viewBox="0 0 650 220" aria-label="Mejora porcentual del coste por paso de gradiente"></svg>
+      <div id="learningTrials"></div>
+      <p class="note">La tasa escala direcciones normalizadas por grupo de parámetros. Muchos recortes sugieren un paso demasiado grande. Una mejora pequeña también puede indicar un óptimo local; por sí sola no demuestra que el paso sea pequeño. La aceptación se mide antes de seleccionar supervivientes.</p>
+     </details>
+     <details open><summary>Deformación no lineal</summary>
+      <svg id="stiffnessPlot" viewBox="0 0 650 220" aria-label="Rigidez del modo permitido y del siguiente modo"></svg>
+      <p id="stiffnessSummary" class="note"></p>
+      <svg id="newtonPlot" viewBox="0 0 650 220" aria-label="Iteraciones de relajación de nodos libres"></svg>
+      <p id="newtonSummary" class="note"></p>
+      <button id="checkResolution" class="secondary">Comparar con el doble de incrementos</button>
+      <p id="resolutionSummary" role="status" class="note">Comprueba la estructura seleccionada sin cambiar la búsqueda.</p>
+      <svg id="resolutionPlot" viewBox="0 0 650 220" aria-label="Trayectoria actual y trayectoria con el doble de incrementos" hidden></svg>
+      <svg id="resolutionErrorPlot" viewBox="0 0 650 220" aria-label="Diferencia de trayectoria al duplicar los incrementos" hidden></svg>
+      <p class="note">Newton equilibra los nodos libres con el sólido móvil en cada pose, pero no comprueba la resolución del recorrido natural. La comparación mide el cambio de trayectoria y de coste de seguimiento al refinar; usa interpolación lineal de los estados calculados. Valora los errores en mm y grados según tu precisión requerida. Una sola comparación no garantiza convergencia ni detecta todas las ramas de equilibrio.</p>
+     </details>
+    </section>
+    </div>
+    <aside class="search-panel">
+     <section class="card">
+      <div class="search-heading">
+       <span class="eyebrow">BÚSQUEDA</span>
+       <button class="settings-trigger" id="openSearchSettings" aria-label="Abrir ajustes de síntesis" aria-haspopup="dialog" aria-controls="searchSettings">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3" fill="var(--panel)"/><circle cx="15" cy="17" r="3" fill="var(--panel)"/></svg>
+        Ajustes
+       </button>
+      </div>
+      <h2>
+       Mejorar la población
+      </h2>
+      <label>
+       Método
+       <select id="method">
+        <option value="hybrid">Ciclo · gradiente y evolución</option>
+        <option value="evolution">
+         Evolución · conexiones y geometría
+        </option>
+        <option value="gradient">
+         Gradiente · refinamiento
+        </option>
+       </select>
+      </label>
+      <button class="primary" id="run">
+       Iniciar búsqueda
+      </button>
+      <div class="field-row">
+       <button class="secondary" id="evolution">
+        Una generación
+       </button>
+       <button class="secondary" id="gradient">
+        Un paso de gradiente
+       </button>
+      </div>
+      <p id="cycleStatus"></p>
+      <dl id="stats">
+      </dl>
+      <button class="text-button" id="reset">
+       Reiniciar búsqueda
+      </button>
+     </section>
+     <section class="card">
+      <div class="card-heading">
+       <h2>
+        Alternativas
+       </h2>
+       <span class="eyebrow">
+        POBLACIÓN
+       </span>
+      </div>
+      <p id="evolutionSummary">
+      </p>
+      <p id="batchStatus">
+      </p>
+      <div class="population" id="population">
+      </div>
+     </section>
+    </aside>
+   </div>
+  </main>
+  <dialog id="searchSettings" aria-labelledby="searchSettingsTitle">
+   <div class="dialog-toolbar"><h2 id="searchSettingsTitle">Configuración de síntesis</h2><button class="secondary" id="closeSearchSettings">Cerrar ×</button></div>
+   <p>Controla la búsqueda, el coste y la resolución del análisis. La estructura y la consigna se editan en Especificación.</p>
+   <div class="settings-layout">
+    <div id="settingsTabs" role="tablist" aria-label="Secciones de configuración">
+     <button id="settingsTab0" role="tab" aria-controls="settingsPanel0">Población</button>
+     <button id="settingsTab1" role="tab" aria-controls="settingsPanel1">Gradiente</button>
+     <button id="settingsTab2" role="tab" aria-controls="settingsPanel2">Mutaciones</button>
+     <button id="settingsTab3" role="tab" aria-controls="settingsPanel3">Diversidad</button>
+     <button id="settingsTab4" role="tab" aria-controls="settingsPanel4">Coste</button>
+     <button id="settingsTab5" role="tab" aria-controls="settingsPanel5">Análisis</button>
+    </div>
+    <div class="settings-content">
+     <div id="liveParameters"></div>
+     <section id="settingsPanel5" class="synthesis-setting-panel" role="tabpanel" aria-labelledby="settingsTab5" hidden>
+      <div id="liveContinuation"></div>
+   <label>Dispositivo de cálculo<select id="computeDevice"><option value="cpu">CPU · menor consumo de RAM</option><option value="xpu">Intel XPU · GPU de cálculo</option><option value="auto">Auto · medir CPU y XPU</option></select></label>
+   <p class="note">Cambiar de dispositivo requiere reiniciar la búsqueda desde la especificación aplicada.</p>
+     </section>
+    </div>
+   </div>
+   <p id="searchSettingsError" role="alert"></p>
+   <div class="field-row"><button class="primary" id="applySearch">Aplicar sin reiniciar</button><button class="secondary" id="restartSearch">Aplicar y reiniciar</button></div>
+  </dialog>
+  <script src="/renderer.js">
+  </script>
+  <script src="/motion.js"></script>
+  <script src="/app.js">
+  </script>
+  <script src="/configure.js">
+  </script>
+  <script src="/numerics.js"></script>
+ </body>
+</html>
