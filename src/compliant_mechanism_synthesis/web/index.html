@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="es">
+ <head>
+  <meta charset="utf-8"/>
+  <meta content="width=device-width,initial-scale=1" name="viewport"/>
+  <title>
+   CMS · Síntesis de mecanismos
+  </title>
+  <link href="/style.css" rel="stylesheet"/>
+ </head>
+ <body>
+  <header class="app-header">
+   <span class="brand">
+    Mechanism Studio
+   </span>
+   <nav aria-label="Flujo de trabajo">
+    <button id="navSpec">
+     Especificación
+    </button>
+    <button class="active" id="navSynthesis">
+     Síntesis
+    </button>
+   </nav>
+   <span id="status" role="status">
+    Preparando el diseño inicial…
+   </span>
+  </header>
+  <main aria-labelledby="specTitle" hidden="" id="specScreen">
+   <div class="page-heading">
+    <div>
+     <span class="eyebrow">
+      01 / DEFINIR EL PROBLEMA
+     </span>
+     <h1 id="specTitle">
+      ¿Qué debe hacer el mecanismo?
+     </h1>
+     <p>
+      Define el sólido fijo, el activo y el pasivo, y la relación entrada–salida que quieres obtener.
+     </p>
+    </div>
+    <label class="seed-neighbours">
+     Vecinos por nodo
+     <input id="initialNeighbours" max="32" min="1" step="1" type="number" value="4"/>
+    </label>
+    <button class="secondary" id="defaults">
+     Restaurar ejemplo
+    </button>
+   </div>
+   <div class="spec-layout">
+    <section class="card">
+     <div class="card-heading">
+      <h2>
+       Estructura inicial
+      </h2>
+     </div>
+     <p>
+      Edita coordenadas en metros. Los nodos activos y pasivos pertenecen a dos sólidos rígidos independientes.
+     </p>
+     <div class="scroll">
+      <table>
+       <thead id="nodeHead">
+       </thead>
+       <tbody id="nodeRows">
+       </tbody>
+      </table>
+     </div>
+     <button class="secondary" id="addNode">
+      + Añadir nodo libre
+     </button>
+     <details>
+      <summary>
+       Vigas y radios
+       <span id="beamCount">
+       </span>
+      </summary>
+      <p>
+       Uniones biempotradas. Radios en milímetros.
+      </p>
+      <div class="beam-grid" id="beamRows">
+      </div>
+     </details>
+    </section>
+    <section class="card">
+     <div class="card-heading">
+      <h2>
+       Entrada activa y salida deseada
+      </h2>
+      <button class="secondary" id="addWaypoint">
+       + Punto
+      </button>
+     </div>
+     <p>
+      Poses relativas al reposo. Traslaciones en mm y giros en grados. Interpolación cúbica suave entre puntos.
+     </p>
+     <label>
+      Progreso del reposo (0–1)
+      <input id="restFactor" max="1" min="0" step="0.05" type="number" value="0"/>
+     </label>
+     <button class="secondary" id="bidirectionalExample">
+      Ejemplo con reposo en el centro
+     </button>
+     <p>
+      Incluye un punto de reposo con ambas poses cero. La entrada se impone al activo; el pasivo y los nodos libres se equilibran en cada paso de deformación.
+     </p>
+     <div class="scroll">
+      <table>
+       <thead id="pathHead">
+       </thead>
+       <tbody id="pathRows">
+       </tbody>
+      </table>
+     </div>
+    </section>
+    <section class="spec-preview card">
+     <span class="eyebrow">
+      VISTA PREVIA
+     </span>
+     <h2>
+      Tu especificación
+     </h2>
+     <button aria-pressed="false" class="secondary" id="previewAutoRotate">
+      Rotación automática
+     </button>
+     <div class="preview-graphics">
+      <figure class="preview-figure">
+       <figcaption>
+        Estructura y cuerpos rígidos
+       </figcaption>
+       <svg aria-label="Vista previa de estructura y trayectoria" id="specPreview" viewbox="0 0 600 420">
+       </svg>
+      </figure>
+      <figure class="preview-figure">
+       <figcaption>
+        Salida deseada del pasivo
+       </figcaption>
+       <svg aria-label="Detalle ampliado de trayectoria objetivo" id="pathPreview" viewbox="0 0 600 220">
+       </svg>
+      </figure>
+     </div>
+     <div class="legend">
+      <span>
+       ■ Fijo
+      </span>
+      <span>
+       ■ Pasivo · naranja: activo
+      </span>
+      <span>
+       ● Libre
+      </span>
+      <span class="target-key">
+       — Objetivo
+      </span>
+     </div>
+     <p id="specSummary">
+     </p>
+     <div class="preview-note">
+      La curva violeta es la salida deseada del pasivo. La entrada del activo está prescrita; el movimiento real del pasivo surge del equilibrio de la estructura deformada.
+     </div>
+     <button class="primary" id="startSynthesis">
+      Aplicar e iniciar síntesis →
+     </button>
+     <p id="specError" role="alert">
+     </p>
+    </section>
+   </div>
+  </main>
+  <main id="synthesisScreen">
+   <div class="synthesis-heading">
+    <p id="specDigest">
+    </p>
+   </div>
+   <div class="synthesis-layout">
+    <section aria-labelledby="searchSectionTitle" class="card search-section" id="searchSection">
+     <div class="section-heading">
+      <div class="section-title">
+       <h2 id="searchSectionTitle">
+        Búsqueda
+       </h2>
+       <p>
+        Refina la población; cada ciclo termina con una generación de evolución.
+       </p>
+      </div>
+      <button class="text-button" id="reset">
+       Reiniciar búsqueda
+      </button>
+     </div>
+     <div class="search-controls">
+      <label>
+       Método
+       <select id="method">
+        <option value="hybrid">
+         Ciclo · gradiente y evolución
+        </option>
+        <option value="evolution">
+         Evolución · conexiones y geometría
+        </option>
+        <option value="gradient">
+         Gradiente · refinamiento
+        </option>
+       </select>
+      </label>
+      <button class="primary" id="run">
+       Iniciar búsqueda
+      </button>
+      <div class="context-settings" id="cycleSettings">
+      </div>
+     </div>
+     <p id="cycleStatus">
+     </p>
+     <dl id="stats">
+     </dl>
+    </section>
+    <section aria-labelledby="sceneSectionTitle" class="card scene-card" id="sceneSection">
+     <div class="section-heading">
+      <div class="section-title">
+       <h2 id="sceneSectionTitle">
+        Estructura y movimiento
+       </h2>
+       <p>
+        Explora el recorrido de los sólidos activo y pasivo.
+       </p>
+      </div>
+      <button class="secondary" id="export">
+       Exportar JSON
+      </button>
+     </div>
+     <div class="viewport">
+      <canvas aria-label="Estructura deformada" id="view">
+      </canvas>
+      <svg aria-hidden="true" id="labels" viewbox="0 0 900 600">
+      </svg>
+      <svg aria-label="Comparación de orientación real y objetivo" id="orientationCompare" viewbox="0 0 200 170">
+      </svg>
+     </div>
+     <div class="playback">
+      <button class="secondary" id="play">
+       Animar
+      </button>
+      <label>
+       Recorrido
+       <input id="frame" max="12" min="0" type="range" value="12"/>
+      </label>
+      <label>
+       Amplificación
+       <output id="scaleValue">
+        ×1
+       </output>
+       <input aria-label="Amplificación visual" id="scale" max="400" min="0" type="range" value="0"/>
+      </label>
+      <button class="secondary" id="autoScale">
+       Auto
+      </button>
+     </div>
+     <div class="toggles" id="cameraControls">
+      <button aria-pressed="false" class="secondary" id="autoRotate">
+       Rotación automática
+      </button>
+      <label>
+       Velocidad
+       <input aria-label="Velocidad de rotación en grados por segundo" id="orbitSpeed" max="60" min="5" type="range" value="20"/>
+       <output id="orbitSpeedValue">
+        20°/s
+       </output>
+      </label>
+     </div>
+     <div class="toggles">
+      <label>
+       <input checked="" id="targetBody" type="checkbox"/>
+       Sólido objetivo
+      </label>
+      <label>
+       <input checked="" id="frames" type="checkbox"/>
+       Ejes
+      </label>
+      <label>
+       <input checked="" id="trajectories" type="checkbox"/>
+       Trayectorias de centros
+      </label>
+      <label>
+       <input id="compare" type="checkbox"/>
+       Alternativas
+      </label>
+      <span>
+       Objetivo
+       <b class="target-key">
+        —
+       </b>
+       · Real
+       <b class="real-key">
+        —
+       </b>
+      </span>
+     </div>
+     <p class="note" id="poseComparison" role="status">
+     </p>
+     <div class="structural-controls">
+      <div class="context-settings" id="collisionSettings">
+      </div>
+      <div class="context-settings" id="beamLengthSettings">
+      </div>
+     </div>
+     <p class="note" id="geometrySummary" role="status">
+     </p>
+     <p class="note">
+      Colisiones entre vigas con sus radios, a lo largo del recorrido. Se permite el contacto en la zona de una unión compartida. Los límites de longitud son preferencias de diseño, no un criterio de pandeo.
+     </p>
+    </section>
+    <section aria-labelledby="alternativesSectionTitle" class="card" id="alternativesSection">
+     <div class="section-heading">
+      <div class="section-title">
+       <h2 id="alternativesSectionTitle">
+        Alternativas
+       </h2>
+       <p>
+        Compara soluciones y conserva variedad en la población.
+       </p>
+      </div>
+     </div>
+     <div class="population-controls">
+      <div class="context-settings" id="populationSettings">
+      </div>
+      <div class="context-settings" id="diversitySettings">
+      </div>
+     </div>
+     <p id="evolutionSummary">
+     </p>
+     <p id="batchStatus">
+     </p>
+     <div class="population" id="population">
+     </div>
+    </section>
+    <section aria-labelledby="objectiveSectionTitle" class="card analysis" id="objectiveSection">
+     <div class="section-heading">
+      <div class="section-title">
+       <h2 id="objectiveSectionTitle">
+        Movimiento frente al objetivo
+       </h2>
+       <p>
+        Compara la salida pasiva con la consigna y ajusta su valoración.
+       </p>
+      </div>
+     </div>
+     <div class="section-body">
+      <div class="context-settings" id="costSettings">
+      </div>
+      <div class="section-results">
+       <figure aria-labelledby="trajectoryOverviewTitle" class="trajectory-overview">
+        <div class="trajectory-toolbar">
+         <h3 id="trajectoryOverviewTitle">
+          Recorrido completo
+         </h3>
+         <div class="trajectory-tools">
+          <label>
+           Marcos
+           <select aria-label="Número de sistemas de referencia" id="trajectoryFrameCount">
+            <option selected="" value="5">
+             5
+            </option>
+            <option value="9">
+             9
+            </option>
+            <option value="13">
+             13
+            </option>
+           </select>
+          </label>
+          <label id="trajectoryViewControl">
+           Vista
+           <select aria-label="Proyección de la trayectoria 3D" id="trajectoryView">
+            <option value="orbit">
+             3D libre
+            </option>
+            <option value="xy">
+             XY
+            </option>
+            <option value="xz">
+             XZ
+            </option>
+            <option value="yz">
+             YZ
+            </option>
+           </select>
+          </label>
+          <button aria-pressed="false" class="secondary" id="trajectoryAutoRotate">
+           Rotación automática
+          </button>
+         </div>
+        </div>
+        <div class="trajectory-legend">
+         <span class="trajectory-real">
+          Real
+         </span>
+         <span class="trajectory-target">
+          Deseada
+         </span>
+         <span id="trajectoryProgress">
+          Progreso
+         </span>
+        </div>
+        <svg aria-label="Trayectorias del centro del sólido pasivo, real y deseada, con orientaciones a lo largo del recorrido" id="trajectoryOverview" role="img" viewbox="0 0 800 420">
+         <g id="trajectoryOverviewBase">
+         </g>
+         <g id="trajectoryOverviewCurrent">
+         </g>
+        </svg>
+        <figcaption id="trajectoryOverviewCaption">
+         Centro del pasivo respecto al reposo, en mm. Los marcos muestran la orientación al mismo progreso.
+        </figcaption>
+       </figure>
+       <div class="plots">
+        <div class="trajectory-toolbar coordinate-toolbar">
+         <h3>
+          Por coordenada
+         </h3>
+         <label>
+          Componente
+          <select aria-label="Coordenada del sólido" id="coordinate">
+          </select>
+         </label>
+        </div>
+        <svg aria-label="Comparación de trayectorias" id="plot" viewbox="0 0 650 220">
+        </svg>
+        <details>
+         <summary>
+          Estado y diagnóstico
+         </summary>
+         <div id="state">
+         </div>
+        </details>
+       </div>
+       <p class="note">
+        La trayectoria real interpola los estados FEM calculados; no añade equilibrios. La vista conjunta usa desplazamientos físicos y no la amplificación del visor.
+       </p>
+      </div>
+     </div>
+    </section>
+    <section aria-labelledby="gradientSectionTitle" class="card numerical-diagnostics" id="gradientSection">
+     <div class="section-heading">
+      <div class="section-title">
+       <h2 id="gradientSectionTitle">
+        Descenso del gradiente
+       </h2>
+       <p>
+        Adapta el paso según la proporción de propuestas que mejora el coste.
+       </p>
+      </div>
+      <button class="secondary section-action" id="gradient">
+       Un paso de gradiente
+      </button>
+     </div>
+     <div class="section-body">
+      <div class="context-settings" id="gradientSettings">
+      </div>
+      <div class="section-results">
+       <p class="note" id="learningRateStatus" role="status">
+       </p>
+       <p class="note" id="learningSummary">
+        Da un paso de gradiente para ver su aceptación y mejora.
+       </p>
+       <div class="diagnostic-plots">
+        <figure class="chart-figure">
+         <svg aria-label="Historial del tamaño de paso solicitado y aceptado" id="learningPlot" viewbox="0 0 650 220">
+         </svg>
+        </figure>
+        <figure class="chart-figure">
+         <svg aria-label="Mejora porcentual del coste por paso de gradiente" id="improvementPlot" viewbox="0 0 650 220">
+         </svg>
+        </figure>
+        <figure class="chart-figure">
+         <svg aria-label="Porcentaje de propuestas que mejoran antes del backtracking y objetivo de mejora" id="monotonicityPlot" viewbox="0 0 650 220">
+         </svg>
+        </figure>
+       </div>
+       <div id="learningTrials">
+       </div>
+       <p class="note">
+        La adaptación mide las propuestas que reducen el coste antes del backtracking. Si la fracción supera el objetivo, aumenta la siguiente tasa; si queda por debajo, la reduce. Los recortes por diseño siguen evitando aceptar un coste peor. Un coste igual no cuenta como mejora.
+       </p>
+      </div>
+     </div>
+    </section>
+    <section aria-labelledby="evolutionSectionTitle" class="card" id="evolutionSection">
+     <div class="section-heading">
+      <div class="section-title">
+       <h2 id="evolutionSectionTitle">
+        Evolución
+       </h2>
+       <p>
+        Cambia conexiones y geometría; refina los descendientes antes de seleccionar.
+       </p>
+      </div>
+      <button class="secondary section-action" id="evolution">
+       Una generación
+      </button>
+     </div>
+     <div class="context-settings" id="evolutionSettings">
+     </div>
+    </section>
+    <section aria-labelledby="mechanicsSectionTitle" class="card numerical-diagnostics" id="mechanicsSection">
+     <div class="section-heading">
+      <div class="section-title">
+       <h2 id="mechanicsSectionTitle">
+        Deformación no lineal
+       </h2>
+       <p>
+        Controla la discretización y comprueba el equilibrio a lo largo del recorrido.
+       </p>
+      </div>
+      <button class="secondary section-action" id="checkResolution">
+       Comparar con el doble de incrementos
+      </button>
+     </div>
+     <div class="section-body">
+      <div class="context-settings" id="analysisSettings">
+      </div>
+      <div class="section-results">
+       <div class="diagnostic-plots">
+        <figure class="chart-figure">
+         <svg aria-label="Rigidez del modo permitido y del siguiente modo" id="stiffnessPlot" viewbox="0 0 650 220">
+         </svg>
+         <p class="note" id="stiffnessSummary">
+         </p>
+        </figure>
+        <figure class="chart-figure">
+         <svg aria-label="Iteraciones de relajación de nodos libres" id="newtonPlot" viewbox="0 0 650 220">
+         </svg>
+         <p class="note" id="newtonSummary">
+         </p>
+        </figure>
+       </div>
+       <p class="note" id="resolutionSummary" role="status">
+        Comprueba la estructura seleccionada sin cambiar la búsqueda.
+       </p>
+       <div class="diagnostic-plots">
+        <svg aria-label="Trayectoria actual y trayectoria con el doble de incrementos" hidden="" id="resolutionPlot" viewbox="0 0 650 220">
+        </svg>
+        <svg aria-label="Diferencia de trayectoria al duplicar los incrementos" hidden="" id="resolutionErrorPlot" viewbox="0 0 650 220">
+        </svg>
+       </div>
+       <p class="note">
+        Newton equilibra el sólido pasivo y los nodos libres con el activo en su pose prescrita. Refinar la entrada comprueba la resolución del recorrido no lineal. La comparación mide el cambio de trayectoria y de coste de seguimiento al refinar; usa interpolación lineal de los estados calculados. Valora los errores en mm y grados según tu precisión requerida. Una sola comparación no garantiza convergencia ni detecta todas las ramas de equilibrio.
+       </p>
+      </div>
+     </div>
+    </section>
+    <section aria-labelledby="computeSectionTitle" class="card" id="computeSection">
+     <div class="section-heading">
+      <div class="section-title">
+       <h2 id="computeSectionTitle">
+        Cálculo
+       </h2>
+       <p>
+        Selecciona el dispositivo que resuelve la mecánica.
+       </p>
+      </div>
+     </div>
+     <p class="note" id="batchEfficiency"></p>
+     <div class="context-settings" id="computeSettings">
+     </div>
+    </section>
+   </div>
+  </main>
+  <script src="/renderer.js">
+  </script>
+  <script src="/motion.js">
+  </script>
+  <script src="/trajectory-view.js">
+  </script>
+  <script src="/app.js">
+  </script>
+  <script src="/configure.js">
+  </script>
+  <script src="/numerics.js">
+  </script>
+ </body>
+</html>

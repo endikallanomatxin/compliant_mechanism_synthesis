@@ -1,0 +1,33 @@
+[project]
+name = "compliant-mechanism-synthesis"
+version = "0.1.0"
+description = "Differentiable frame mechanics and direct structure optimization"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.3", "tensorboard>=2.16"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+
+[project.scripts]
+cms-view = "compliant_mechanism_synthesis.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+compliant_mechanism_synthesis = ["web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-xpu" }
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = false
