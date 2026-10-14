@@ -13,7 +13,7 @@ from compliant_mechanism_synthesis.optimization import (
 from compliant_mechanism_synthesis.trajectory import Trajectory
 
 
-def test_pose_weights_and_scales_are_independent(tmp_path):
+def test_pose_tolerances_determine_loss_and_gradient(tmp_path):
     from dataclasses import replace
 
     search = Search(
@@ -21,19 +21,22 @@ def test_pose_weights_and_scales_are_independent(tmp_path):
         ContinuationConfig(steps=1),
     )
     try:
-        actual = torch.tensor([[0.01, 0, 0, 0, 0, 0.1]], dtype=torch.float64)
+        actual = torch.tensor(
+            [[0.01, 0, 0, 0, 0, 0.1]], dtype=torch.float64, requires_grad=True
+        )
         target = torch.zeros_like(actual)
-        search.config = replace(search.config, position_weight=1, orientation_weight=0)
+        position, orientation = search.pose_loss_components(actual, target)
+        torch.testing.assert_close(position, actual.new_tensor([1 / 3]))
+        torch.testing.assert_close(orientation, actual.new_tensor([1 / 3]))
+        search.config = replace(search.config, orientation_tolerance=0.2)
         torch.testing.assert_close(
-            search.pose_loss(actual, target), actual.new_tensor([1 / 3])
+            search.pose_loss(actual, target), actual.new_tensor([1 / 3 + 1 / 12])
         )
-        search.config = replace(search.config, position_weight=0, orientation_weight=1)
+        gradient = torch.autograd.grad(search.pose_loss(actual, target).sum(), actual)[
+            0
+        ]
         torch.testing.assert_close(
-            search.pose_loss(actual, target), actual.new_tensor([1 / 3])
-        )
-        search.config = replace(search.config, orientation_scale=0.2)
-        torch.testing.assert_close(
-            search.pose_loss(actual, target), actual.new_tensor([1 / 12])
+            gradient[0, 5], actual.new_tensor(2 * 0.1 / (3 * 0.2**2))
         )
     finally:
         search.writer.close()
@@ -146,8 +149,8 @@ def test_live_tuning_reuses_physics_and_resizes_population(tmp_path, monkeypatch
             patch.setattr(batching, "equilibria", forbidden)
             search.tune(
                 {
-                    "position_weight": 4,
-                    "orientation_weight": 0.25,
+                    "position_tolerance": 0.005,
+                    "orientation_tolerance": 0.2,
                     "learning_rate": 0.01,
                 }
             )
@@ -161,8 +164,8 @@ def test_live_tuning_reuses_physics_and_resizes_population(tmp_path, monkeypatch
         assert search.population.size == 3
         assert len(search.path_cache) <= 3
         with pytest.raises(ValueError):
-            search.tune({"position_weight": 0, "orientation_weight": 0})
-        assert search.config.position_weight == 4
+            search.tune({"position_tolerance": 0})
+        assert search.config.position_tolerance == 0.005
     finally:
         search.writer.close()
 

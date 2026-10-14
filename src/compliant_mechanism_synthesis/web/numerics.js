@@ -1,16 +1,24 @@
 /* These plots update with snapshots, independently of camera animation. */
 let resolutionReport = null;
-function numericalChart(id, xs, series, xLabel) {
+function numericalChart(id, xs, series, xLabel, bounds=null) {
     const svg = $(id);
     if (!xs.length) { svg.innerHTML = ''; return; }
     const values = series.flatMap(s => s.values);
-    const low = Math.min(0, ...values), high = Math.max(...values, 1e-12);
+    const low = bounds?.[0] ?? Math.min(0, ...values), high = bounds?.[1] ?? Math.max(...values, 1e-12);
     const xmin = Math.min(...xs), xmax = Math.max(...xs);
     const xy = (x, y) => [55 + (x - xmin) / Math.max(xmax - xmin, 1e-12) * 560, 165 - (y - low) / Math.max(high - low, 1e-12) * 125];
     const path = s => s.values.map((v, i) => xy(xs[i], v).join(',')).join(' ');
     svg.innerHTML = `<line x1="55" y1="165" x2="615" y2="165" stroke="#cfd6d0"/><text x="8" y="42" fill="#6b756f" font-size="11">${number(high)}</text><text x="8" y="165" fill="#6b756f" font-size="11">${number(low)}</text>` + series.map((s, i) => `<text x="${55+i*(series.length>2?185:260)}" y="20" fill="${s.color}" font-size="12">${s.label}</text><polyline points="${path(s)}" fill="none" stroke="${s.color}" stroke-width="2"/>${s.values.map((v,j)=>{const p=xy(xs[j],v);return `<circle cx="${p[0]}" cy="${p[1]}" r="2" fill="${s.color}"/>`;}).join('')}`).join('') + `<text x="55" y="188" fill="#6b756f" font-size="11">${number(xmin)}</text><text x="580" y="188" fill="#6b756f" font-size="11">${number(xmax)}</text><text x="260" y="212" fill="#6b756f" font-size="12">${xLabel}</text>`;
 }
 window.syncNumerics = function(state) {
+    const losses=state.loss_history||[];
+    const keys=['total','position','orientation','support','material','collisions','lengths','node_spacing'];
+    const maximum=Math.max(1e-12,...losses.flatMap(row=>keys.map(key=>row[key])));
+    keys.forEach(key=>numericalChart('loss'+key, losses.map(r=>r.sequence), [{label:'Contribución ponderada',color:'#23786c',values:losses.map(r=>r[key])}], 'Evaluaciones registradas', [0,maximum]));
+    const transitions=losses.filter((row,i)=>i>0&&(row.model!==losses[i-1].model||row.segments!==losses[i-1].segments||row.objective_revision!==losses[i-1].objective_revision));
+    keys.forEach(key=>{const svg=$('loss'+key);const first=losses[0]?.sequence??0,last=losses.at(-1)?.sequence??first;transitions.forEach(row=>{const x=55+(row.sequence-first)/Math.max(last-first,1)*560;svg.insertAdjacentHTML('beforeend',`<line x1="${x}" x2="${x}" y1="40" y2="165" stroke="#aa7022" stroke-dasharray="4 4"><title>Iteración ${row.iteration}: ${row.model}, ${row.segments} segmentos</title></line>`);});});
+    $('lossSummary').textContent='Todas las contribuciones comparten escala vertical y suman el total. Las líneas discontinuas marcan cambios de modelo, malla o configuración del objetivo. Se muestran hasta 300 registros; la mejor estructura puede cambiar entre iteraciones.';
+
     resolutionReport = null;
     $('resolutionPlot').setAttribute('hidden', '');
     $('resolutionErrorPlot').setAttribute('hidden', '');
@@ -46,15 +54,21 @@ function drawResolution() {
     const names = ['Ux','Uy','Uz','Rx','Ry','Rz'];
     $('resolutionPlot').removeAttribute('hidden');
     $('resolutionErrorPlot').removeAttribute('hidden');
+    const normalized=[...r.coarse,...r.fine].flatMap(p=>p.map((v,i)=>v*lossCoordinateScale(i)));
+    const bounds=[Math.min(0,...normalized),Math.max(1e-12,...normalized)];
+    const deltas=r.fine.flatMap((p,j)=>p.map((v,i)=>(v-r.coarse[j][i])*lossCoordinateScale(i)));
+    const differenceBounds=[Math.min(0,...deltas),Math.max(1e-12,...deltas)];
     names.forEach((name,index) => {
-        const multiplier = index < 3 ? 1000 : 180/Math.PI;
+        const multiplier = lossCoordinateScale(index);
+        $('resolutionCoordinate'+index).closest('figure').querySelector('figcaption').textContent=`${name} · normalizada por la loss`;
+        $('resolutionDifference'+index).closest('figure').querySelector('figcaption').textContent=`${name} · diferencia ponderada`;
         numericalChart('resolutionCoordinate'+index, r.samples, [
             {label:'Actual',color:'#aa7022',values:r.coarse.map(p=>p[index]*multiplier)},
             {label:r.coarse_model==='linear'?'No lineal':'Recorrido refinado',color:'#23786c',values:r.fine.map(p=>p[index]*multiplier)}
-        ], 'Progreso del recorrido');
+        ], 'Progreso del recorrido', bounds);
         numericalChart('resolutionDifference'+index, r.samples, [
-            {label:`Diferencia · ${name} (${index<3?'mm':'°'})`,color:'#456f9b',values:r.fine.map((p,i)=>(p[index]-r.coarse[i][index])*multiplier)}
-        ], 'Progreso del recorrido');
+            {label:`Diferencia · ${name}`,color:'#456f9b',values:r.fine.map((p,i)=>(p[index]-r.coarse[i][index])*multiplier)}
+        ], 'Progreso del recorrido', differenceBounds);
     });
 }
 $('checkResolution').onclick = async () => {

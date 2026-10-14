@@ -266,21 +266,28 @@ function render() {
     drawTrajectoryOverview(state);
 }
 
+function lossCoordinateScale(index) {
+    const c = data.search_config;
+    const tolerance = index < 3 ? c.position_tolerance : c.orientation_tolerance;
+    return 1 / (Math.sqrt(3) * tolerance);
+}
 let coordinatePlotsFor = null;
 let coordinatePlotScales = [];
 function plot(state, names) {
     if (coordinatePlotsFor !== data) {
+        const normalized = [...data.states, ...data.target_path].flatMap(s=>s.output.map((v,i)=>v*lossCoordinateScale(i)));
+        const minimum = Math.min(0, ...normalized);
+        const maximum = Math.max(0, ...normalized);
+        const range = Math.max(maximum-minimum, 1e-8);
         coordinatePlotScales = names.map((name, index) => {
-            const multiplier = index < 3 ? 1000 : 180 / Math.PI;
-            const values = data.states.map(s => s.output[index]);
-            const targets = data.target_path.map(s => s.output[index]);
-            const minimum = Math.min(0, ...values, ...targets);
-            const maximum = Math.max(0, ...values, ...targets);
-            const range = Math.max(maximum - minimum, 1e-8);
-            const xy = (factor, value) => [50 + factor * 550, 170 - (value - minimum) / range * 130];
+            const multiplier = lossCoordinateScale(index);
+            const xy = (factor, value) => [50 + factor * 550, 170 - (value*multiplier - minimum) / range * 130];
             const zero = xy(0, 0)[1];
             const svg = $('coordinatePlot' + index);
-            svg.innerHTML = `<text x="50" y="24" fill="#6b756f" font-size="16">${number(minimum*multiplier)} a ${number(maximum*multiplier)}</text><line x1="50" y1="${zero}" x2="600" y2="${zero}" stroke="#cfd6d0"/><polyline points="${data.target_path.map(s=>xy(s.factor,s.output[index]).join(',')).join(' ')}" fill="none" stroke="#8b629b" stroke-width="2" stroke-dasharray="6 4"/><polyline points="${data.states.map(s=>xy(s.factor,s.output[index]).join(',')).join(' ')}" fill="none" stroke="#23786c" stroke-width="2"/><line class="coordinate-progress" y1="40" y2="170" stroke="#bac5be" stroke-dasharray="3 4"/><circle class="coordinate-marker" r="5" fill="#23786c"/><text x="50" y="205" fill="#23786c" font-size="16">Real</text><text x="110" y="205" fill="#8b629b" font-size="16">Objetivo</text><text x="390" y="205" fill="#6b756f" font-size="16">Progreso 0 → 1</text>`;
+            svg.closest('figure').querySelector('figcaption').textContent = `${name} · normalizada por la tolerancia`;
+            svg.dataset.lossScale=multiplier;
+            svg.dataset.minimum=minimum; svg.dataset.maximum=maximum;
+            svg.innerHTML = `<text x="50" y="24" fill="#6b756f" font-size="16">${number(minimum)} a ${number(maximum)}</text><line x1="50" y1="${zero}" x2="600" y2="${zero}" stroke="#cfd6d0"/><polyline points="${data.target_path.map(s=>xy(s.factor,s.output[index]).join(',')).join(' ')}" fill="none" stroke="#8b629b" stroke-width="2" stroke-dasharray="6 4"/><polyline points="${data.states.map(s=>xy(s.factor,s.output[index]).join(',')).join(' ')}" fill="none" stroke="#23786c" stroke-width="2"/><line class="coordinate-progress" y1="40" y2="170" stroke="#bac5be" stroke-dasharray="3 4"/><circle class="coordinate-marker" r="5" fill="#23786c"/><text x="50" y="205" fill="#23786c" font-size="16">Real</text><text x="110" y="205" fill="#8b629b" font-size="16">Objetivo</text><text x="390" y="205" fill="#6b756f" font-size="16">Progreso 0 → 1</text>`;
             return {xy, marker:svg.querySelector('.coordinate-marker'), progress:svg.querySelector('.coordinate-progress')};
         });
         coordinatePlotsFor = data;

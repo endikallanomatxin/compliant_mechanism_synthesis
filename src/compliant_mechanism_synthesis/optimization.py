@@ -91,10 +91,8 @@ class SearchConfig:
     initial_radius: float = 0.001
     radius_min: float = 0.0003
     radius_max: float = 0.002
-    position_weight: float = 1.0
-    orientation_weight: float = 1.0
-    position_scale: float = 0.01
-    orientation_scale: float = 0.1
+    position_tolerance: float = 0.01
+    orientation_tolerance: float = 0.1
     diversity_weight: float = 0.2
     diversity_radius: float = 0.25
     diversity_geometry_weight: float = 1.0
@@ -187,15 +185,15 @@ class SearchConfig:
         ):
             raise ValueError("Gradient rates must be nonnegative")
         if (
-            min(self.position_weight, self.orientation_weight) < 0
-            or self.position_weight + self.orientation_weight <= 0
-        ):
-            raise ValueError("At least one pose weight must be positive")
-        if (
-            min(self.position_scale, self.orientation_scale, self.diversity_radius) <= 0
+            min(
+                self.position_tolerance,
+                self.orientation_tolerance,
+                self.diversity_radius,
+            )
+            <= 0
             or self.diversity_weight < 0
         ):
-            raise ValueError("Invalid objective scale or diversity weight")
+            raise ValueError("Invalid tracking tolerance or diversity settings")
         if (
             min(
                 self.diversity_geometry_weight,
@@ -577,6 +575,9 @@ class Search:
         self.linear_best_motion = float("inf")
         self.linear_motion_stagnation = 0
         self.motion_scores = {}
+        self.loss_components = {}
+        self.loss_history = []
+        self.loss_revision = 0
         self.path_cache = {}
         self.parent_paths = {}
         self.linearization_cache = {}
@@ -976,6 +977,9 @@ class Search:
         self.motion_scores = {
             key: value for key, value in self.motion_scores.items() if key in keys
         }
+        self.loss_components = {
+            key: value for key, value in self.loss_components.items() if key in keys
+        }
 
     def _evaluation_groups(self, population, limit):
         """Group similar binary graphs; limit union padding outside mechanics."""
@@ -1174,14 +1178,21 @@ class Search:
                 }
                 return scores
             dof = len(self.target)
-            losses = torch.stack(
-                [
-                    self.pose_loss(s.q[:, -2 * dof : -dof], self.target_at(s.factors))
-                    for j, s in enumerate(path.states)
-                ]
+            pose_components = [
+                self.pose_loss_components(
+                    state.q[:, -2 * dof : -dof], self.target_at(state.factors)
+                )
+                for state in path.states
+            ]
+            factors = torch.stack([state.factors for state in path.states])
+            position_cost = torch.trapezoid(
+                torch.stack([value[0] for value in pose_components]), factors, dim=0
             )
-            factors = torch.stack([s.factors for s in path.states])
-            objective = torch.trapezoid(losses, factors, dim=0)
+            orientation_cost = torch.trapezoid(
+                torch.stack([value[1] for value in pose_components]), factors, dim=0
+            )
+            objective = position_cost + orientation_cost
+            components = {"position": position_cost, "orientation": orientation_cost}
             if not differentiating:
                 for key, value in zip(
                     design_keys, objective.detach().cpu().tolist(), strict=True
@@ -1194,11 +1205,10 @@ class Search:
                 .clamp_min(0)
                 .square()
             )
-            objective = objective + torch.trapezoid(
-                self.config.passive_support_weight * support,
-                factors,
-                dim=0,
+            components["support"] = torch.trapezoid(
+                self.config.passive_support_weight * support, factors, dim=0
             )
+            objective = objective + components["support"]
             length = (
                 design.positions[:, design.edges[:, 1]]
                 - design.positions[:, design.edges[:, 0]]
@@ -1212,7 +1222,11 @@ class Search:
             )
             distances = (design.positions[:, i] - design.positions[:, j]).norm(dim=-1)
             geometry = ((0.008 - distances).clamp_min(0) / 0.008).square().sum(-1)
-            objective = objective + self.config.material_weight * material + geometry
+            components["material"] = self.config.material_weight * material
+            components["node_spacing"] = geometry
+            components["collisions"] = torch.zeros_like(objective)
+            components["lengths"] = torch.zeros_like(objective)
+            objective = objective + components["material"] + geometry
             if self.config.collision_weight > 0 or self.config.beam_length_weight > 0:
                 from .geometry_losses import collision_loss, length_loss, path_curves
 
@@ -1240,11 +1254,26 @@ class Search:
                     collisions, _, _ = collision_loss(
                         curves, geometry_design, self.config
                     )
-                    objective = objective + self.config.collision_weight * collisions
+                    components["collisions"] = self.config.collision_weight * collisions
+                    objective = objective + components["collisions"]
                 if self.config.beam_length_weight > 0:
                     lengths, _, _ = length_loss(curves, geometry_design, self.config)
-                    objective = objective + self.config.beam_length_weight * lengths
+                    components["lengths"] = self.config.beam_length_weight * lengths
+                    objective = objective + components["lengths"]
 
+            if not differentiating:
+                names = list(components)
+                values = (
+                    torch.stack([components[name] for name in names], -1)
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                for key, row, ok in zip(
+                    design_keys, values, path.completed.cpu().tolist(), strict=True
+                ):
+                    if ok:
+                        self.loss_components[key] = dict(zip(names, row, strict=True))
             objective = torch.where(
                 path.completed, objective, torch.full_like(objective, float("inf"))
             )
@@ -1262,19 +1291,57 @@ class Search:
         }
         return scores
 
-    def pose_loss(self, actual, target):
+    def _record_loss(self):
+        if self.scores is None or not bool(torch.isfinite(self.scores).any()):
+            return
+        key = self._path_keys(self.batch_design(self.population))[0]
+        components = self.loss_components.get(key)
+        if components is None:
+            return
+        record = {
+            "sequence": len(self.loss_history),
+            "iteration": self.iteration,
+            "model": self.analysis_level,
+            "objective_revision": self.loss_revision,
+            "segments": 1
+            if self.analysis_level == "linear"
+            else self.continuation.beam_segments,
+            "total": float(self.scores[0]),
+            **components,
+        }
+        if self.loss_history and all(
+            self.loss_history[-1].get(k) == v
+            for k, v in record.items()
+            if k != "sequence"
+        ):
+            return
+        record["sequence"] = (
+            self.loss_history[-1]["sequence"] + 1 if self.loss_history else 0
+        )
+        self.loss_history.append(record)
+        self.loss_history = self.loss_history[-300:]
+        for name in (*components, "total"):
+            self.writer.add_scalar(
+                "loss_components/" + name, record[name], record["sequence"]
+            )
+
+    def pose_loss_components(self, actual, target):
         c = self.config
         d = c.dimension
         position = (
-            ((actual[..., :d] - target[..., :d]) / c.position_scale).square().mean(-1)
+            ((actual[..., :d] - target[..., :d]) / c.position_tolerance)
+            .square()
+            .mean(-1)
         )
         angles = rotation_vector(
             rotation(target[..., 3:]) @ rotation(actual[..., 3:]).transpose(-1, -2)
         )
-        orientation = (angles / c.orientation_scale).square().mean(-1)
-        return (c.position_weight * position + c.orientation_weight * orientation) / (
-            c.position_weight + c.orientation_weight
-        )
+        orientation = (angles / c.orientation_tolerance).square().mean(-1)
+        return position, orientation
+
+    def pose_loss(self, actual, target):
+        position, orientation = self.pose_loss_components(actual, target)
+        return position + orientation
 
     def similarity(self, a, b=None):
         """Pairwise similarity with O(N² + N·features) memory, no N²·features arrays."""
@@ -1972,6 +2039,7 @@ class Search:
             )
         self._advance_fidelity()
         self._refine_beams()
+        self._record_loss()
         self.writer.flush()
         return self.snapshot()
 
@@ -2036,10 +2104,8 @@ class Search:
             self.linearization_cache.clear()
         self.continuation = mechanics
         objective_fields = (
-            "position_weight",
-            "orientation_weight",
-            "position_scale",
-            "orientation_scale",
+            "position_tolerance",
+            "orientation_tolerance",
             "material_weight",
             "collision_weight",
             "collision_clearance",
@@ -2052,13 +2118,16 @@ class Search:
             "passive_support_weight",
             "minimum_passive_support",
         )
+        objective_changed = any(
+            getattr(config, name) != getattr(previous, name)
+            for name in objective_fields
+        )
+        if objective_changed:
+            self.loss_revision += 1
         if (
             config.population != previous.population
             or mechanics_changed
-            or any(
-                getattr(config, name) != getattr(previous, name)
-                for name in objective_fields
-            )
+            or objective_changed
         ):
             self.scores = None
         self.snapshot_cache.clear()
@@ -2079,6 +2148,7 @@ class Search:
         trajectory.validate()
         if trajectory.poses.shape[1] != len(self.target):
             raise ValueError("Incorrect pose dimension")
+        self.loss_revision += 1
         self.trajectory = trajectory
         self.target = trajectory.poses[-1].clone()
         self.evaluated_target = self.target.clone()
@@ -2091,6 +2161,7 @@ class Search:
         trajectory.validate()
         if trajectory.poses.shape[1] != len(self.target):
             raise ValueError("Incorrect active pose dimension")
+        self.loss_revision += 1
         self.input_trajectory = trajectory
         self.mesh_report = {}
         self.mesh_level_iteration = self.iteration
@@ -2099,6 +2170,7 @@ class Search:
 
     def snapshot(self, index=0):
         self.ensure_evaluated()
+        self._record_loss()
         if not 0 <= index < self.population.size:
             raise ValueError("Invalid population index")
         if index in self.snapshot_cache:
@@ -2238,6 +2310,7 @@ class Search:
                 factor_cache_mb=self.linearization_cache_bytes / 1024**2,
             ),
             "gradient_history": self.gradient_history,
+            "loss_history": list(self.loss_history),
             "current_learning_rate": self.current_learning_rate,
             "population": [
                 {

@@ -343,6 +343,7 @@
      <div class="section-body">
       <div class="context-settings" id="costSettings">
       </div>
+      <p class="note">Una tolerancia menor exige más precisión y aumenta la influencia del error en la loss. Los términos de posición y orientación se suman tras normalizar por sus tolerancias.</p>
       <div class="section-results">
        <figure aria-labelledby="trajectoryOverviewTitle" class="trajectory-overview">
         <div class="trajectory-toolbar">
@@ -410,9 +411,10 @@
        <div class="plots">
         <div class="trajectory-toolbar coordinate-toolbar">
          <h3>
-          Por coordenada
+          Por coordenada · escala común ponderada
          </h3>
         </div>
+        <p class="note">Eje vertical normalizado según las tolerancias de posición y orientación. La misma separación vertical equivale al mismo error cuadrático de posición; en los giros es una aproximación local, porque la loss compara orientaciones mediante rotaciones relativas.</p>
         <div class="coordinate-grid" id="coordinatePlots">
          <figure class="coordinate-chart"><figcaption>Ux (mm)</figcaption><svg id="coordinatePlot0" aria-label="Ux: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
          <figure class="coordinate-chart"><figcaption>Uy (mm)</figcaption><svg id="coordinatePlot1" aria-label="Uy: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
@@ -433,6 +435,20 @@
         La trayectoria real interpola los estados FEM calculados; no añade equilibrios. La vista conjunta usa desplazamientos físicos y no la amplificación del visor.
        </p>
       </div>
+     </div>
+    </section>
+    <section class="card numerical-diagnostics" aria-labelledby="lossTitle">
+     <div class="section-heading"><div class="section-title"><h2 id="lossTitle">Evolución de la loss</h2><p>Contribuciones ponderadas de la mejor alternativa en cada iteración.</p></div></div>
+     <p class="note" id="lossSummary"></p>
+     <div class="coordinate-grid" id="lossPlots">
+      <figure class="coordinate-chart"><figcaption>Total</figcaption><svg id="losstotal" viewBox="0 0 650 220" role="img" aria-label="Historial de Total"></svg></figure>
+      <figure class="coordinate-chart"><figcaption>Posición</figcaption><svg id="lossposition" viewBox="0 0 650 220" role="img" aria-label="Historial de Posición"></svg></figure>
+      <figure class="coordinate-chart"><figcaption>Orientación</figcaption><svg id="lossorientation" viewBox="0 0 650 220" role="img" aria-label="Historial de Orientación"></svg></figure>
+      <figure class="coordinate-chart"><figcaption>Soporte del pasivo</figcaption><svg id="losssupport" viewBox="0 0 650 220" role="img" aria-label="Historial de Soporte del pasivo"></svg></figure>
+      <figure class="coordinate-chart"><figcaption>Material</figcaption><svg id="lossmaterial" viewBox="0 0 650 220" role="img" aria-label="Historial de Material"></svg></figure>
+      <figure class="coordinate-chart"><figcaption>Colisiones</figcaption><svg id="losscollisions" viewBox="0 0 650 220" role="img" aria-label="Historial de Colisiones"></svg></figure>
+      <figure class="coordinate-chart"><figcaption>Longitudes</figcaption><svg id="losslengths" viewBox="0 0 650 220" role="img" aria-label="Historial de Longitudes"></svg></figure>
+      <figure class="coordinate-chart"><figcaption>Separación de nodos</figcaption><svg id="lossnode_spacing" viewBox="0 0 650 220" role="img" aria-label="Historial de Separación de nodos"></svg></figure>
      </div>
     </section>
     <section aria-labelledby="gradientSectionTitle" class="card numerical-diagnostics" id="gradientSection">
