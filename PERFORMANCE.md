@@ -308,3 +308,23 @@ uv run python -m compliant_mechanism_synthesis.beam_scaling
 ```
 
 `--mode condensed|full|single` mide un solo método; el modo por defecto compara procesos aislados. `beam_scaling` guarda sus resultados en `runs/diagnostics/beam-scaling.json`. Las pruebas de integración comparan recorrido y gradientes de posiciones/radios con mallas sin condensar en CPU/XPU, caché sin Newton, topologías distintas en un lote y precarga a ambos lados del reposo. La comprobación web incluye cambio de resolución, gradiente, evolución y paso a 3D.
+
+## Linear exploration before nonlinear synthesis
+
+CPU measurements on the default 3D graph, four retained alternatives, four requested input increments, one segment per beam, one gradient step plus one evolution step (including descendant gradient refinement), one warmup and median of three repeats, excluding viewer diagnostics:
+
+| Model | Initial evaluation | Gradient | Evolution | Cycle |
+| --- | ---: | ---: | ---: | ---: |
+| Linear exploration | 0.254 s | 1.179 s | 1.026 s | 2.204 s |
+| Nonlinear continuation | 2.577 s | 2.773 s | 3.828 s | 6.600 s |
+
+The early cycle is about 3× faster in this measurement. The linear gradient step assembles/factors two rest systems (gradient evaluation and trial), versus 30 new nonlinear tangents/factors and 32 cached factor reuses. Linear exploration stores no nonlinear factor cache. The compared final losses (0.7714 linear, 0.7507 nonlinear) evaluate different physical approximations and do not establish equal solution quality. Periodic nonlinear checks and the full-population transition cost are outside these first two linear iterations; speedup is not an end-to-end convergence claim. Other applications were running on the workstation, so absolute timings vary.
+
+Reproduce each model with:
+
+```sh
+uv run python -m compliant_mechanism_synthesis.search_benchmark --device cpu --population 4 --steps 4 --repeats 3 --warmups 1 --staged-analysis 1 --output runs/diagnostics/linear-start-benchmark.json
+uv run python -m compliant_mechanism_synthesis.search_benchmark --device cpu --population 4 --steps 4 --repeats 3 --warmups 1 --staged-analysis 0 --output runs/diagnostics/nonlinear-start-benchmark.json
+```
+
+Each result records `analysis_level`; a run that transitioned during timing cannot be interpreted as a purely linear cycle. The benchmark defaults to non-staged analysis to keep previous nonlinear measurements comparable.

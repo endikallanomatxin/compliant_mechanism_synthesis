@@ -137,7 +137,13 @@ def test_nonconvergence_is_explicit():
 @pytest.mark.parametrize("method", ["gradient", "evolution"])
 def test_search_is_elitist_and_keeps_anchors(tmp_path, method):
     search = Search(
-        SearchConfig(log_dir=str(tmp_path), population=4, elites=1, device="cpu"),
+        SearchConfig(
+            staged_analysis=0,
+            log_dir=str(tmp_path),
+            population=4,
+            elites=1,
+            device="cpu",
+        ),
         ContinuationConfig(steps=2),
     )
     before = search.snapshot()["objective"]

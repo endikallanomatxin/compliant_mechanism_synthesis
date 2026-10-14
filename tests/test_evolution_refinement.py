@@ -5,7 +5,9 @@ from compliant_mechanism_synthesis.optimization import Search, SearchConfig
 
 
 def test_distance_prior_favors_short_additions_and_long_removals(tmp_path):
-    search = Search(SearchConfig(population=2, elites=1, log_dir=str(tmp_path)))
+    search = Search(
+        SearchConfig(staged_analysis=0, population=2, elites=1, log_dir=str(tmp_path))
+    )
     try:
         add, remove = search.topology_weights(search.population.positions)
         edges = search.initial.edges
@@ -31,7 +33,11 @@ def test_children_are_refined_before_survival_and_parents_stay_unchanged(
 ):
     search = Search(
         SearchConfig(
-            population=2, elites=1, offspring_gradient_steps=2, log_dir=str(tmp_path)
+            staged_analysis=0,
+            population=2,
+            elites=1,
+            offspring_gradient_steps=2,
+            log_dir=str(tmp_path),
         )
     )
     try:
@@ -100,7 +106,7 @@ def test_children_are_refined_before_survival_and_parents_stay_unchanged(
 )
 def test_new_controls_are_validated(values):
     with pytest.raises(ValueError):
-        SearchConfig(**values)
+        SearchConfig(staged_analysis=0, **values)
 
 
 def test_bounded_topology_edits_do_not_drift_toward_dense_graphs(tmp_path):
@@ -108,6 +114,7 @@ def test_bounded_topology_edits_do_not_drift_toward_dense_graphs(tmp_path):
 
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             population=2,
             elites=1,
             topology_mutation_probability=1,
@@ -140,6 +147,7 @@ def test_topology_batches_limit_padding_and_restore_score_gradient_order(
 
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             population=4,
             elites=1,
             topology_batch_union_ratio=1,

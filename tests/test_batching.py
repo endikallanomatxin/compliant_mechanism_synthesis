@@ -56,7 +56,13 @@ def test_independent_failure_does_not_poison_batch():
 
 def test_population_persists_and_evolves_in_batches(tmp_path):
     s = Search(
-        SearchConfig(device="cpu", population=8, elites=2, log_dir=str(tmp_path)),
+        SearchConfig(
+            staged_analysis=0,
+            device="cpu",
+            population=8,
+            elites=2,
+            log_dir=str(tmp_path),
+        ),
         ContinuationConfig(steps=2),
     )
     s.ensure_evaluated()
@@ -84,7 +90,13 @@ def test_population_persists_and_evolves_in_batches(tmp_path):
 
 def test_richer_example_and_cached_view(tmp_path, monkeypatch):
     search = Search(
-        SearchConfig(device="cpu", population=4, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(
+            staged_analysis=0,
+            device="cpu",
+            population=4,
+            elites=1,
+            log_dir=str(tmp_path),
+        ),
         ContinuationConfig(steps=3),
     )
     assert len(search.initial.positions) == 33
@@ -108,6 +120,7 @@ def test_richer_example_and_cached_view(tmp_path, monkeypatch):
 def test_evolution_mutates_topology_but_gradient_keeps_it(tmp_path):
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             device="cpu",
             population=4,
             elites=1,
@@ -142,7 +155,13 @@ def test_custom_seed_keeps_geometry_topology_and_radii(tmp_path):
     seed = replace(seed, positions=seed.positions.clone(), radii=seed.radii * 0.85)
     seed.positions[4, 0] += 0.002
     search = Search(
-        SearchConfig(device="cpu", population=4, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(
+            staged_analysis=0,
+            device="cpu",
+            population=4,
+            elites=1,
+            log_dir=str(tmp_path),
+        ),
         ContinuationConfig(steps=2),
         seed,
     )
@@ -159,6 +178,7 @@ def test_custom_seed_keeps_geometry_topology_and_radii(tmp_path):
 def test_focused_offspring_uses_only_leading_parent_pool(tmp_path):
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             device="cpu",
             population=16,
             elites=4,
@@ -185,6 +205,7 @@ def test_focused_offspring_uses_only_leading_parent_pool(tmp_path):
 def test_mutation_probabilities_can_disable_each_operator(tmp_path):
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             device="cpu",
             population=4,
             elites=1,
@@ -209,6 +230,7 @@ def test_bounded_batches_preserve_objectives_and_gradients(tmp_path):
 
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             device="cpu",
             population=4,
             elites=1,

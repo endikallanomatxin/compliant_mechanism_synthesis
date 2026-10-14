@@ -122,7 +122,13 @@ def test_exact_cache_reuses_factors_and_enforces_memory_budget(tmp_path, monkeyp
 
     torch.set_num_threads(1)
     s = Search(
-        SearchConfig(population=2, elites=1, input_y=0.00005, log_dir=str(tmp_path)),
+        SearchConfig(
+            staged_analysis=0,
+            population=2,
+            elites=1,
+            input_y=0.00005,
+            log_dir=str(tmp_path),
+        ),
         ContinuationConfig(steps=2),
     )
     try:
@@ -161,6 +167,7 @@ def test_work_caches_remain_bounded_across_iterations(tmp_path, monkeypatch):
     torch.set_num_threads(1)
     s = Search(
         SearchConfig(
+            staged_analysis=0,
             population=2,
             elites=1,
             input_y=0.00005,

@@ -22,6 +22,7 @@ class BenchmarkConfig:
     repeats: int = 3
     warmups: int = 1
     steps: int = DEFAULT_CONTINUATION.steps
+    staged_analysis: int = 0
     beam_segments: int = DEFAULT_CONTINUATION.beam_segments
     gradient_steps: int = 1
     gradient_backtracks: int = 1
@@ -40,6 +41,7 @@ def run(config):
         search = Search(
             SearchConfig(
                 device=config.device,
+                staged_analysis=config.staged_analysis,
                 population=config.population,
                 elites=config.elites,
                 gradient_steps_per_evolution=config.gradient_steps,
@@ -76,6 +78,7 @@ def run(config):
             row["evolution_seconds"] = time.perf_counter() - start
             row["cycle_seconds"] = row["gradient_seconds"] + row["evolution_seconds"]
             row["best_loss"] = float(search.scores.min())
+            row["analysis_level"] = search.analysis_level
             row["factor_cache_bytes"] = search.linearization_cache_bytes
             if repetition >= 0:
                 rows.append(row)

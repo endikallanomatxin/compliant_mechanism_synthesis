@@ -108,6 +108,7 @@ def test_cached_subdivision_keeps_interiors_and_skips_newton(
 
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             device=device,
             population=2,
             elites=1,
@@ -184,10 +185,12 @@ def test_subdivided_path_can_start_before_rest():
 
 def test_synthesis_exposes_spatial_designs_only(tmp_path):
     with pytest.raises(TypeError):
-        SearchConfig(dimension=2)
+        SearchConfig(staged_analysis=0, dimension=2)
     with pytest.raises(ValueError, match="dimension"):
         Search(
-            SearchConfig(population=2, elites=1, log_dir=str(tmp_path)),
+            SearchConfig(
+                staged_analysis=0, population=2, elites=1, log_dir=str(tmp_path)
+            ),
             initial_design=example(2),
         )
 
@@ -242,7 +245,9 @@ def test_synthesis_requires_spatial_body_geometry(tmp_path, role, invalid):
         d = replace(d, positions=positions)
     with pytest.raises(ValueError, match="non-collinear"):
         Search(
-            SearchConfig(population=2, elites=1, log_dir=str(tmp_path)),
+            SearchConfig(
+                staged_analysis=0, population=2, elites=1, log_dir=str(tmp_path)
+            ),
             initial_design=d,
         )
 
@@ -309,6 +314,7 @@ def test_support_gradient_guard_preserves_scores_and_derivatives(
     torch.set_num_threads(1)
     s = Search(
         SearchConfig(
+            staged_analysis=0,
             population=2,
             elites=1,
             input_y=0.00005,

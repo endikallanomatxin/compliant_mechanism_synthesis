@@ -295,6 +295,7 @@ const localGroups=[
  ['evolutionSettings','Variación y selección',[...parameterGroups[0][1],...['focused_fraction','parent_pool_fraction','local_mutation_factor','crossover_probability','tournament_size','offspring_gradient_steps'].map(field)]],
  ['diversitySettings','Diversidad',parameterGroups[1][1].filter(f=>f[0].startsWith('diversity_'))],
  ['costSettings','Criterio de ajuste',parameterGroups[2][1]],
+ ['fidelitySettings','Inicio lineal y transición',[['staged_analysis','Inicio lineal al reiniciar (0 = no lineal)',0,1,1],['linear_max_iterations','Máximo de iteraciones lineales',1,200,1],['linear_stagnation_iterations','Iteraciones sin mejora para avanzar',1,100,1],['linear_motion_loss_target','Error de movimiento para avanzar',.000001,10,.01],['fidelity_check_interval','Comprobar no lineal cada N iteraciones',1,100,1],['fidelity_check_candidates','Alternativas por comprobación',1,32,1],['fidelity_pose_error_limit','Discrepancia normalizada máxima',.000001,10,.01]]],
  ['analysisSettings','Resolución FEM',continuationFields,'continuation'],
  ['collisionSettings','Colisiones',['collision_weight','collision_clearance','collision_subdivisions','collision_path_substeps','collision_joint_allowance'].map(field)],
  ['beamLengthSettings','Longitudes',['beam_length_weight','beam_length_min','beam_length_max'].map(field)],
@@ -302,6 +303,8 @@ const localGroups=[
 ];
 const localSignatures=new Map();
 window.syncLiveSearch=function(state){
+ document.getElementById("checkResolution").textContent=state.analysis_level==='linear' ? 'Contrastar con equilibrio no lineal' : 'Comparar con el doble de incrementos';
+ document.getElementById("analysisFidelity").textContent=state.analysis_level==='linear' ? 'Exploración lineal aproximada · un elemento por viga. La transición comprueba el recorrido no lineal y reevalúa toda la población.' : 'Equilibrio no lineal · continuación a lo largo del recorrido. La resolución espacial se configura abajo.';
  for(const [id,title,fields,attribute='parameter'] of localGroups){
   const config=attribute==='continuation'?state.continuation_config:state.search_config;
   const signature=JSON.stringify([fields.map(([key])=>config[key]),id==='analysisSettings'?[state.dimension,config.newton_batch_mode]:null,id==='computeSettings'?config.device:null]);

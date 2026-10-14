@@ -10,7 +10,7 @@ from compliant_mechanism_synthesis.optimization import Population, Search, Searc
 @pytest.mark.parametrize("improving", [0, 8, 9, 10])
 def test_rate_targets_first_attempt_improvement(tmp_path, monkeypatch, improving):
     search = Search(
-        SearchConfig(population=10, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(staged_analysis=0, population=10, elites=1, log_dir=str(tmp_path)),
         ContinuationConfig(steps=1),
     )
     try:
@@ -61,6 +61,7 @@ def test_flat_cost_does_not_grow_rate_and_manual_mode_is_fixed(
 ):
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             population=2,
             elites=1,
             adaptive_learning_rate=adaptive,
@@ -100,7 +101,11 @@ def test_flat_cost_does_not_grow_rate_and_manual_mode_is_fixed(
 def test_upper_rate_limit_and_next_proposal_use_adapted_rate(tmp_path, monkeypatch):
     search = Search(
         SearchConfig(
-            population=2, elites=1, learning_rate_max=0.0201, log_dir=str(tmp_path)
+            staged_analysis=0,
+            population=2,
+            elites=1,
+            learning_rate_max=0.0201,
+            log_dir=str(tmp_path),
         ),
         ContinuationConfig(steps=1),
     )

@@ -17,7 +17,7 @@ def test_pose_weights_and_scales_are_independent(tmp_path):
     from dataclasses import replace
 
     search = Search(
-        SearchConfig(population=2, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(staged_analysis=0, population=2, elites=1, log_dir=str(tmp_path)),
         ContinuationConfig(steps=1),
     )
     try:
@@ -42,6 +42,7 @@ def test_pose_weights_and_scales_are_independent(tmp_path):
 def test_selection_preserves_a_different_structure_over_a_clone(tmp_path):
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             population=2,
             elites=1,
             diversity_weight=1,
@@ -130,7 +131,7 @@ def test_rest_waypoint_can_be_in_the_middle():
 
 def test_live_tuning_reuses_physics_and_resizes_population(tmp_path, monkeypatch):
     search = Search(
-        SearchConfig(population=4, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(staged_analysis=0, population=4, elites=1, log_dir=str(tmp_path)),
         ContinuationConfig(steps=2),
     )
     try:
@@ -170,6 +171,7 @@ def test_live_tuning_reuses_physics_and_resizes_population(tmp_path, monkeypatch
 def test_hybrid_cycle_ends_with_one_evolution(tmp_path, gradient_steps):
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             population=2,
             elites=1,
             gradient_steps_per_evolution=gradient_steps,
@@ -190,7 +192,7 @@ def test_hybrid_cycle_ends_with_one_evolution(tmp_path, gradient_steps):
 
 def test_signed_cached_derivatives_and_rest_invalidation(tmp_path, monkeypatch):
     search = Search(
-        SearchConfig(population=2, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(staged_analysis=0, population=2, elites=1, log_dir=str(tmp_path)),
         ContinuationConfig(steps=3),
     )
     try:
@@ -230,7 +232,9 @@ def test_signed_cached_derivatives_and_rest_invalidation(tmp_path, monkeypatch):
 def test_inactive_beam_parameters_do_not_create_novelty_or_repeat_physics(tmp_path):
     from compliant_mechanism_synthesis.nonlinear import energy
 
-    search = Search(SearchConfig(population=2, elites=1, log_dir=str(tmp_path)))
+    search = Search(
+        SearchConfig(staged_analysis=0, population=2, elites=1, log_dir=str(tmp_path))
+    )
     try:
         parent = search.population.take(slice(0, 1)).detached()
         altered = parent.detached()

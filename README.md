@@ -99,3 +99,13 @@ uv run python -m compliant_mechanism_synthesis.beam_scaling
 ```
 
 This checks CPU/XPU agreement and writes `runs/diagnostics/beam-scaling.json`; it does not measure global equilibrium or a complete synthesis iteration.
+
+## Progressive analysis
+
+New searches start with a small-displacement **linear** model and one element per beam. The rest tangent is assembled once per design batch, and all prescribed active poses share one factorization with multiple right-hand sides. Fixed nodes remain clamped and active/passive bodies retain independent rigid reductions. First-order design gradients differentiate the linear equilibrium; analytical stiffness, finite differences and small-amplitude nonlinear paths check this approximation on CPU/XPU.
+
+The search advances once to nonlinear equilibrium continuation when the best integrated motion loss reaches `linear_motion_loss_target` (default 0.02), motion improvement stalls for `linear_stagnation_iterations` (5), or `linear_max_iterations` (20) expires. Stagnation ignores improvements below 0.1% and uses motion loss, separately from material/collision costs. Every `fidelity_check_interval` iterations (5), the best and dissimilar alternatives (2 by default) also undergo nonlinear continuation. Excess normalized passive pose discrepancy (`fidelity_pose_error_limit`, 0.1) or failed continuation advances the search. These checks are also performed before a planned transition.
+
+At transition, the entire retained population is reevaluated, old path/factor caches are cleared and the adaptive learning rate is reset. Linear and nonlinear scores are never compared in selection. TensorBoard records motion loss, checked pose discrepancy and the transition. The viewer labels linear paths as approximate; a completed nonlinear path is required for `trajectory_validated`. The resolution comparison button checks linear versus nonlinear motion during exploration, and doubled nonlinear path increments afterwards.
+
+Controls live under **Modelo y recorrido → Inicio lineal y transición**. Setting `staged_analysis=0` switches a current linear search immediately to nonlinear; enabling it again affects the next restart. CLI: `uv run cms-view --staged-analysis 0` starts directly with nonlinear analysis. Automatic progression currently has two levels: linear and nonlinear, both with one element per beam. More spatial segments can be configured after transition, or from startup with staged analysis disabled. Automatic spatial refinement is not implemented; geometric nonlinearity and spatial resolution remain separate choices.

@@ -31,12 +31,16 @@ def compare_resolution(search, index=0):
         raise ValueError("Select a structure with a complete converged path")
     started = time.perf_counter()
     config = replace(search.continuation, steps=search.continuation.steps * 2)
+    if search.analysis_level == "linear":
+        config = replace(config, beam_segments=1)
     batch = search.batch_design(
         search.population.take(slice(index, index + 1))
     ).detached()
     fine = trace_motion(batch, search.input_trajectory, config)
     base = {
         "index": index,
+        "coarse_model": search.analysis_level,
+        "fine_model": "nonlinear",
         "coarse_steps": search.continuation.steps,
         "fine_steps": config.steps,
         "coarse_states": len(entry[1]),

@@ -99,7 +99,7 @@ def test_stabilization_is_device_local_and_descending(monkeypatch, device):
 
 def test_viewer_reuses_all_retained_paths_and_cache_is_bounded(tmp_path, monkeypatch):
     search = Search(
-        SearchConfig(population=4, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(staged_analysis=0, population=4, elites=1, log_dir=str(tmp_path)),
         ContinuationConfig(steps=2),
     )
     try:
@@ -140,7 +140,7 @@ def test_viewer_reuses_all_retained_paths_and_cache_is_bounded(tmp_path, monkeyp
 
 def test_gradient_backtracking_stops_per_parent(tmp_path, monkeypatch):
     search = Search(
-        SearchConfig(population=4, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(staged_analysis=0, population=4, elites=1, log_dir=str(tmp_path)),
         ContinuationConfig(steps=1),
     )
     try:
@@ -182,6 +182,7 @@ def test_cached_implicit_derivatives_match_fresh_equilibria(
         pytest.skip("XPU unavailable")
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             device=device,
             population=2,
             elites=1,
@@ -223,7 +224,7 @@ def test_synthesis_prunes_only_masked_edges_without_changing_gradients(
     from compliant_mechanism_synthesis import prescribed_motion
 
     search = Search(
-        SearchConfig(population=2, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(staged_analysis=0, population=2, elites=1, log_dir=str(tmp_path)),
         ContinuationConfig(steps=1),
     )
     try:

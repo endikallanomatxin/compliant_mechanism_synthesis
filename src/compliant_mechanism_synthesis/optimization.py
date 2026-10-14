@@ -30,6 +30,13 @@ class SearchConfig:
     dimension: ClassVar[int] = 3
     device: str = "cpu"
     seed: int = 7
+    staged_analysis: int = 1
+    linear_max_iterations: int = 20
+    linear_stagnation_iterations: int = 5
+    fidelity_check_interval: int = 5
+    fidelity_check_candidates: int = 2
+    linear_motion_loss_target: float = 0.02
+    fidelity_pose_error_limit: float = 0.1
     initial_neighbours: int = 4
     input_y: float = 0.003
     input_rotation: float = 0.0
@@ -103,6 +110,11 @@ class SearchConfig:
                 raise ValueError(f"{name} must be finite")
         for name in (
             "population",
+            "staged_analysis",
+            "linear_max_iterations",
+            "linear_stagnation_iterations",
+            "fidelity_check_interval",
+            "fidelity_check_candidates",
             "initial_neighbours",
             "collision_subdivisions",
             "collision_path_substeps",
@@ -119,6 +131,18 @@ class SearchConfig:
         ):
             if type(getattr(self, name)) is not int:
                 raise ValueError(f"{name} must be an integer")
+        if (
+            self.staged_analysis not in (0, 1)
+            or min(
+                self.linear_max_iterations,
+                self.linear_stagnation_iterations,
+                self.fidelity_check_interval,
+                self.fidelity_check_candidates,
+            )
+            < 1
+            or min(self.linear_motion_loss_target, self.fidelity_pose_error_limit) <= 0
+        ):
+            raise ValueError("Invalid analysis fidelity settings")
         if self.gradient_steps_per_evolution < 0 or self.offspring_gradient_steps < 1:
             raise ValueError("Invalid hybrid cycle counts")
         if (
@@ -512,6 +536,11 @@ class Search:
         self.iteration = 0
         self.scores = None
         self.snapshot_cache = {}
+        self.analysis_level = "linear" if config.staged_analysis else "nonlinear"
+        self.fidelity_report = {}
+        self.linear_best_motion = float("inf")
+        self.linear_motion_stagnation = 0
+        self.motion_scores = {}
         self.path_cache = {}
         self.parent_paths = {}
         self.linearization_cache = {}
@@ -739,10 +768,11 @@ class Search:
             # Contexts use the union graph solved for this batch; keep that
             # metadata to repack private systems on later regrouping.
             union_ids = torch.nonzero((design.presence != 0).any(0)).flatten()
-            self.linearization_cache[self._path_key(cpu.item(i))] = (
-                union_ids,
-                linearizations[i],
-            )
+            if any(c is not None for c in linearizations[i]):
+                self.linearization_cache[self._path_key(cpu.item(i))] = (
+                    union_ids,
+                    linearizations[i],
+                )
 
         self._trim_linearizations()
 
@@ -907,6 +937,9 @@ class Search:
             key: value for key, value in self.parent_paths.items() if key in keys
         }
         self._trim_linearizations()
+        self.motion_scores = {
+            key: value for key, value in self.motion_scores.items() if key in keys
+        }
 
     def _evaluation_groups(self, population, limit):
         """Group similar binary graphs; limit union padding outside mechanics."""
@@ -1056,7 +1089,16 @@ class Search:
                     for i, entry in enumerate(stored_linearizations)
                 )
             )
-            if aligned and (not differentiating or linearized):
+            if self.analysis_level == "linear":
+                from .linear_motion import trace_linear
+
+                path = trace_linear(
+                    design,
+                    self.input_trajectory,
+                    replace(self.continuation, beam_segments=1),
+                )
+                self._store_paths(design, path)
+            elif aligned and (not differentiating or linearized):
                 from .cached_equilibrium import replay_path
 
                 path = replay_path(
@@ -1104,6 +1146,11 @@ class Search:
             )
             factors = torch.stack([s.factors for s in path.states])
             objective = torch.trapezoid(losses, factors, dim=0)
+            if not differentiating:
+                for key, value in zip(
+                    design_keys, objective.detach().cpu().tolist(), strict=True
+                ):
+                    self.motion_scores[key] = value
             spectra = torch.stack([s.stiffness for s in path.states])
             weakest_support = spectra[..., 0].clamp_min(1e-12)
             support = (
@@ -1563,6 +1610,115 @@ class Search:
         )
         return chosen, scores
 
+    def _advance_fidelity(self):
+        if self.analysis_level != "linear":
+            return
+        keys = self._path_keys(self.batch_design(self.population))
+        motion = min(
+            (self.motion_scores.get(key, float("inf")) for key in keys),
+            default=float("inf"),
+        )
+        if self.linear_best_motion == float(
+            "inf"
+        ) or motion < self.linear_best_motion - max(
+            1e-10, abs(self.linear_best_motion) * 1e-3
+        ):
+            self.linear_best_motion = motion
+            self.linear_motion_stagnation = 0
+        else:
+            self.linear_motion_stagnation += 1
+        if math.isfinite(motion):
+            self.writer.add_scalar("fidelity/motion_loss", motion, self.iteration)
+        verified = []
+        reason = None
+        if not self.config.staged_analysis:
+            reason = "manual"
+        elif self.iteration >= self.config.linear_max_iterations:
+            reason = "iteration_budget"
+        elif self.linear_motion_stagnation >= self.config.linear_stagnation_iterations:
+            reason = "stagnation"
+        elif motion <= self.config.linear_motion_loss_target:
+            reason = "motion_loss"
+        if (
+            self.iteration % self.config.fidelity_check_interval == 0
+            or reason is not None
+        ):
+            # Check the best plus alternatives least similar to those checked.
+            n = min(self.config.fidelity_check_candidates, self.population.size)
+            similarity = self.similarity(self.population).detach()
+            selected = [0]
+            for _ in range(1, n):
+                closeness = similarity[:, selected].amax(-1)
+                closeness[selected] = float("inf")
+                selected.append(int(closeness.argmin()))
+            ids = torch.tensor(selected, device=self.device)
+            discrepancies = []
+            failures = 0
+            for index in ids.cpu().tolist():
+                design = self.batch_design(
+                    self.population.take(slice(index, index + 1))
+                ).detached()
+                coarse = self.path_cache.get(keys[index])
+                fine = trace_motion(
+                    design,
+                    self.input_trajectory,
+                    replace(self.continuation, beam_segments=1),
+                )
+                if not bool(fine.completed.all()):
+                    failures += 1
+                    continue
+                verified.append((design, fine))
+                if coarse is None or not coarse[0]:
+                    failures += 1
+                    continue
+                records = coarse[1]
+                for state in fine.states:
+                    f = float(state.factors[0])
+                    upper = next(
+                        (j for j, r in enumerate(records) if r[0] >= f),
+                        len(records) - 1,
+                    )
+                    lower = max(0, upper - 1)
+                    a, b = records[lower], records[upper]
+                    t = 0.0 if a[0] == b[0] else (f - a[0]) / (b[0] - a[0])
+                    q = (a[1] * (1 - t) + b[1] * t).to(self.device)
+                    discrepancies.append(
+                        float(
+                            self.pose_loss(state.q[:, -12:-6], q[None, -12:-6])
+                            .sqrt()
+                            .max()
+                        )
+                    )
+            error = max(discrepancies, default=0.0)
+            self.fidelity_report = {
+                "checked_iteration": self.iteration,
+                "candidates": len(ids),
+                "nonlinear_failures": failures,
+                "pose_discrepancy": error,
+                "motion_loss": motion if math.isfinite(motion) else None,
+            }
+            self.writer.add_scalar("fidelity/pose_discrepancy", error, self.iteration)
+            if failures or error > self.config.fidelity_pose_error_limit:
+                reason = "model_discrepancy"
+        if reason is not None:
+            self.analysis_level = "nonlinear"
+            self.continuation = replace(self.continuation, beam_segments=1)
+            self.path_cache.clear()
+            self.linearization_cache.clear()
+            self.parent_paths.clear()
+            self.motion_scores.clear()
+            self.snapshot_cache.clear()
+            self.scores = None
+            self.stagnation = 0
+            self.current_learning_rate = self.config.learning_rate
+            self.fidelity_report["transition_reason"] = reason
+            # Reuse equilibria already verified with the new model, but score
+            # every retained design again under that model.
+            for design, path in verified:
+                self._store_paths(design, path)
+            self.ensure_evaluated()
+            self.writer.add_scalar("fidelity/nonlinear", 1, self.iteration)
+
     def step(self, method):
         scheduled = method == "hybrid"
         if scheduled:
@@ -1689,6 +1845,7 @@ class Search:
                 diagnostics["topology_padding_ratio"],
                 self.iteration,
             )
+        self._advance_fidelity()
         self.writer.flush()
         return self.snapshot()
 
@@ -1779,6 +1936,8 @@ class Search:
         self.hybrid_phase = 0
         self.writer.add_text("search/parameters", str(asdict(config)), self.iteration)
         self.ensure_evaluated()
+        if not config.staged_analysis:
+            self._advance_fidelity()
         self._prune_paths()
 
     def target_at(self, factors):
@@ -1888,6 +2047,10 @@ class Search:
                 "radii": self.specification.radii.tolist(),
             },
             "analysis": "active_passive",
+            "analysis_level": self.analysis_level,
+            "trajectory_validated": self.analysis_level == "nonlinear"
+            and path.converged,
+            "fidelity": dict(self.fidelity_report),
             "dimension": design.dimension,
             "device": self.device,
             "device_timings": self.device_timings,

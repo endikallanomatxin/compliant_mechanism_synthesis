@@ -132,7 +132,7 @@ def test_output_sensitivity_matches_finite_differences(dimension, field):
 
 def test_passive_target_does_not_impose_passive_motion_and_input_invalidates(tmp_path):
     search = Search(
-        SearchConfig(population=2, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(staged_analysis=0, population=2, elites=1, log_dir=str(tmp_path)),
         ContinuationConfig(steps=2),
     )
     try:

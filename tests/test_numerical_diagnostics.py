@@ -22,7 +22,11 @@ def test_interpolation_detects_unresolved_curvature():
 def test_gradient_reports_actual_backtracking(tmp_path, monkeypatch):
     search = Search(
         SearchConfig(
-            population=2, elites=1, gradient_backtracks=2, log_dir=str(tmp_path)
+            staged_analysis=0,
+            population=2,
+            elites=1,
+            gradient_backtracks=2,
+            log_dir=str(tmp_path),
         )
     )
     try:
@@ -66,6 +70,7 @@ def test_gradient_reports_actual_backtracking(tmp_path, monkeypatch):
 def test_resolution_check_is_finite_and_does_not_change_search(tmp_path):
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             population=2,
             elites=1,
             log_dir=str(tmp_path),

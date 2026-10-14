@@ -86,7 +86,7 @@ async function action(path, body) {
     if (busy) return;
     busy = true;
     document.querySelectorAll('button').forEach(b => b.disabled = b.id !== 'run');
-    $('status').textContent = 'Calculando recorrido no lineal…';
+    $('status').textContent = 'Calculando recorrido…';
     try {
         data = await request(path, body);
         window.syncSpecification?.(data);
@@ -101,7 +101,7 @@ async function action(path, body) {
         window.syncLiveSearch?.(data);
         window.syncNumerics?.(data);
         render();
-        $('status').textContent = data.converged ? 'Recorrido convergente · carga final alcanzada' : data.message;
+        $('status').textContent = data.converged ? (data.analysis_level==='linear' ? 'Exploración lineal · recorrido aproximado' : 'Recorrido no lineal convergente · carga final alcanzada') : data.message;
         if (!data.converged) running = false;
     } catch (e) {
         running = false;

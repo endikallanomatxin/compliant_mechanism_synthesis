@@ -10,6 +10,7 @@ from compliant_mechanism_synthesis.optimization import Search, SearchConfig, exa
 def test_only_evolution_changes_binary_beam_presence(tmp_path):
     search = Search(
         SearchConfig(
+            staged_analysis=0,
             population=2,
             elites=1,
             gradient_backtracks=1,
@@ -62,7 +63,7 @@ def test_binary_topology_is_pruned_once_for_the_whole_path(tmp_path, monkeypatch
     from compliant_mechanism_synthesis.trajectory import Trajectory
 
     search = Search(
-        SearchConfig(population=2, elites=1, log_dir=str(tmp_path)),
+        SearchConfig(staged_analysis=0, population=2, elites=1, log_dir=str(tmp_path)),
         ContinuationConfig(steps=3),
     )
     try:
