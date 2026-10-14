@@ -2,6 +2,7 @@
 
 import torch
 
+from .equilibrium_system import scaled_descent
 from .mechanics import rigid_roles
 from .nonlinear import rotation
 from .spectral import positive_definite
@@ -13,7 +14,6 @@ from .subdivided import (
     initial_nodes,
     reference_nodes,
 )
-from .tangents import descent_step
 
 
 def nodal_nodes(batch, q):
@@ -96,6 +96,9 @@ def nodal_map(batch, q):
 
 def evaluate(batch, q, interior, segments, material, detached_tangent=False):
     """Condense before global assembly, including nonlinear map curvature."""
+    from .mechanics_work import record
+
+    record("tangent_assemblies")
     nodes, jac, arms = nodal_map(batch, q)
     dof, dimension = nodes.shape[-1], batch.dimension
     ref = reference_nodes(batch.positions[:, batch.edges], BeamMesh(segments))
@@ -243,7 +246,14 @@ def trial_energy(batch, q, interior, segments, material):
 
 
 def relax_condensed(
-    batch, body, initial, config, interior=None, cached=False, material=None
+    batch,
+    body,
+    initial,
+    config,
+    interior=None,
+    cached=False,
+    material=None,
+    differentiate_stiffness=True,
 ):
     """Global Newton on graph/body DOFs; private mesh corrections in batch."""
     from .mechanics import DEFAULT_MATERIAL
@@ -282,9 +292,11 @@ def relax_condensed(
                 break
             eye = torch.eye(base, dtype=q.dtype, device=q.device)
             hh = torch.where(pending[:, None, None], h[..., :base, :base], eye)
-            step = descent_step(
+            step = scaled_descent(
                 hh,
                 torch.where(pending[:, None], g[..., :base], 0),
+                dof,
+                config.characteristic_length,
                 material.regularization,
             )
             full_step = torch.cat((step, torch.zeros_like(body)), -1)
@@ -332,43 +344,55 @@ def relax_condensed(
             pending &= ~waiting
         ok &= ~pending
     q = torch.cat((q[..., :base], body), -1)
-    # One primal cleanup suffices when no design/input derivative is requested.
-    # Keep both implicit corrections for graph and private-node sensitivities.
-    differentiating = any(t.requires_grad for t in (batch.positions, batch.radii, body))
-    for _ in range(2 if differentiating else 1):
-        _, g, h, blocks, _, edge_j, stable, _ = evaluate(
-            batch, q, interior, config.beam_segments, material, detached_tangent=True
-        )
-        valid = ok & stable & positive_definite(h[..., :base, :base])
-        eye = torch.eye(base, dtype=q.dtype, device=q.device)
-        matrix = torch.where(valid[:, None, None], h[..., :base, :base].detach(), eye)
-        step = torch.linalg.solve(
-            matrix, -torch.where(valid[:, None], g[..., :base], 0)
-        )
-        full_step = torch.cat((step, torch.zeros_like(body)), -1)
-        endpoint_step = apply_endpoint_step(edge_j, full_step, detach=True)
-        correction = blocks.recover(endpoint_step).reshape_as(interior)
-        interior = interior + torch.where(valid[:, None, None, None], correction, 0)
-        q = q + full_step
-        ok &= valid
-    value, g, h, _, chains, _, stable, local_g = evaluate(
-        batch, q, interior, config.beam_segments, material
-    )
+    from .implicit_equilibrium import attach_equilibrium, prepare_adjoint
+
+    evaluated = evaluate(primal, q.detach(), interior, config.beam_segments, material)
+    _, g, h, blocks, _, edge_j, stable, _ = evaluated
+    context = prepare_adjoint(primal, q, interior, config, material, evaluated)
+    valid = ok & stable & context.system.valid
+    context.system.valid &= valid
+    step = -context.system.solve(g[..., :base])
+    full_step = torch.cat((step, torch.zeros_like(body)), -1)
+    endpoint_step = apply_endpoint_step(edge_j, full_step)
+    correction = blocks.recover(endpoint_step).reshape_as(interior)
+    interior = interior + torch.where(valid[:, None, None, None], correction, 0)
+    q = torch.cat((q[..., :base].detach() + step, body.detach()), -1)
+    ok &= valid
+    evaluated = evaluate(primal, q, interior, config.beam_segments, material)
+    _, g, h, blocks, chains, _, stable, local_g = evaluated
     residual = torch.maximum(
         g[..., :base].norm(dim=-1), local_g[..., dof:-dof].flatten(1).norm(dim=-1)
     )
+    context = prepare_adjoint(primal, q, interior, config, material, evaluated)
     ok &= (
         stable
-        & positive_definite(h[..., :base, :base])
+        & context.system.valid
         & torch.isfinite(residual)
         & (
-            residual.detach()
-            <= config.tolerance
-            * g[..., base:].detach().norm(dim=-1).clamp_min(1)
-            * 1.01
+            residual
+            <= config.tolerance * g[..., base:].norm(dim=-1).clamp_min(1) * 1.01
         )
     )
-    return q, ok, residual.detach(), counts, g, h, chains
+    context.system.valid &= ok
+    if any(t.requires_grad for t in (batch.positions, batch.radii, body)):
+        q, interior = attach_equilibrium(
+            batch, body, q, interior, config, context, material
+        )
+        if differentiate_stiffness:
+            _, g, h, _, chains, *_ = evaluate(
+                batch, q, interior, config.beam_segments, material
+            )
+        else:
+            nodal = nodal_nodes(batch, q)
+            chains = torch.cat(
+                (
+                    nodal[:, batch.edges[:, 0], None],
+                    interior,
+                    nodal[:, batch.edges[:, 1], None],
+                ),
+                -2,
+            )
+    return q, ok, residual.detach(), counts, g, h, chains, context
 
 
 def predict_interiors(batch, q, previous_beams, segments, material):

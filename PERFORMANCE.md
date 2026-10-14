@@ -2,6 +2,36 @@
 
 Las comparaciones de condensación del ejemplo canónico se realizaron con la distribución regular de 30 nodos y 88 vigas, antes de sustituirlo por la distribución aleatoria reproducible. La aplicación actual usa únicamente 3D y conexiones iniciales por vecinos próximos. Los comandos actuales usan el nuevo ejemplo; sus tiempos y recorridos pueden diferir aunque se conserve el número de nodos y vigas.
 
+## Solver reutilizable y adjunto explícito
+
+El equilibrio 3D usa un backward adjunto explícito, con recuperación de los nodos privados de cada viga. Las factorizaciones se conservan en una caché separada de los resultados del recorrido, limitada a 256 MiB por defecto y a las alternativas vivas. El gradiente de un recorrido exacto almacenado evita Newton y nuevas factorizaciones. La CPU usa Cholesky nativo; XPU conserva LU y comprobación de positividad en dispositivo. Los solves normalizan traslaciones mediante la longitud característica; se conserva el criterio físico de residuo para mantener comparable la precisión.
+
+Las propuestas de gradiente y los hijos locales pueden partir del recorrido de su padre si no cambia la topología y los cambios de geometría/radio son pequeños. Son aproximaciones iniciales: Newton y estabilidad siguen siendo obligatorios. Las correcciones ambiguas se repiten desde el predictor del hijo. Los controles permiten desactivar esta reutilización y modificar sus límites. No hay garantía global de identidad de rama para estructuras multestables.
+
+Comparación antes/después sobre la misma población inicial y semilla: CPU float64, un hilo, cuatro alternativas, 33 nodos, 85 vigas iniciales, recorrido predeterminado de 12 incrementos más waypoints, un segmento por viga; ciclo de un paso de gradiente y una evolución con un paso de refinamiento por hijo, un intento de paso. Medianas de tres repeticiones en el mismo proceso tras cargar los kernels; había servidor y pruebas activos. Los tiempos excluyen los diagnósticos del visor seleccionado de forma idéntica en ambas versiones.
+
+| Operación | Antes | Después |
+|---|---:|---:|
+| Evaluación inicial | 5,43 s | 3,52 s |
+| Paso de gradiente completo | 8,74 s | 5,55 s |
+| Evolución con refinamiento | 11,54 s | 7,95 s |
+| Ciclo completo | 20,95 s | 13,10 s |
+
+El ciclo medido baja 37,5%; el gradiente, 36,5%. La mejor pérdida final es 0,7424682343561566 frente a 0,7424682343561565. El gradiente reutilizó 64 sistemas almacenados y resolvió 16 adjuntos batched; la evaluación del paso nuevo hizo 62 ensamblajes/factorizaciones y aceptó los 64 intentos de aproximación del padre sin fallbacks. Se preservaron trayectoria, discretización, componentes del objetivo y tamaño de población. Esto no es una medida del ciclo predeterminado de 32 alternativas y tres pasos de gradiente ni una promesa de aceleración uniforme.
+
+En otra ejecución de la versión nueva, con dos alternativas y dos incrementos más waypoints, calentamiento separado y tres repeticiones, el ciclo CPU fue 5,49 s y XPU 23,49 s. Las poblaciones mutadas se inicializaron por dispositivo, por lo que no son diseños idénticos ni una comparación controlada de hardware. Confirma que XPU todavía no es la elección rápida en ese escenario pequeño. Se comprobó que `cholesky_ex` en XPU hace fallback a CPU en esta instalación; el backend de producción evita esa operación y usa LU en dispositivo. Las pruebas de soluciones y gradientes sí comparan problemas idénticos en CPU/XPU.
+
+El contador RSS de ese proceso es un máximo acumulado que incluye ambas versiones; no demuestra reducción de memoria. Las pruebas verifican que la caché contiene tensores separados del grafo, respeta su presupuesto y conserva la evaluación cuando se evictan las factorizaciones.
+
+Benchmark reproducible de la versión actual, con calentamiento separado, mediana de tres repeticiones y TensorBoard:
+
+```bash
+uv run python -m compliant_mechanism_synthesis.search_benchmark --device cpu
+uv run python -m compliant_mechanism_synthesis.search_benchmark --device xpu --population 2 --elites 1 --steps 2
+```
+
+El JSON se guarda en `runs/diagnostics/search-benchmark.json`; usa `--output` para conservar comparaciones distintas. Los parámetros de búsqueda y resolución se registran, y los snapshots se excluyen explícitamente. Los dos comandos anteriores tienen tamaños diferentes y no constituyen por sí mismos una comparación CPU/XPU.
+
 ## Paso de gradiente: ruta predeterminada 3D
 
 Los registros de una sesión real mostraron 82,3 s por paso de gradiente con 32 alternativas. El perfil de cuatro alternativas localizó reconstrucciones de rigidez en la ruta de una sola división por viga, que aún utilizaba ensamblaje y derivadas de 12 coordenadas. Esa ruta ahora comparte el kernel de nueve coordenadas y ensamblaje local de las vigas subdivididas. La tangente usada como inversa implícita se construye con datos separados del grafo de gradiente; una corrección basta para la primera derivada espacial del equilibrio. La rigidez final sigue siendo diferenciable si la pérdida de soporte la necesita. Si todos los estados de un recorrido almacenado superan el mínimo de soporte, se omite su grafo de derivadas, pues la penalización es localmente cero. La geometría de colisiones y longitudes se interpola solo para la unión de vigas presentes, en lugar de las 519 conexiones admisibles.

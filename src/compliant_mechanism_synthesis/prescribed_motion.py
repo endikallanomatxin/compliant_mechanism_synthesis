@@ -9,10 +9,10 @@ from dataclasses import dataclass
 import torch
 
 from .batching import active_beams, kernels
+from .equilibrium_system import scaled_descent
 from .mechanics import DEFAULT_MATERIAL
 from .nonlinear import rotation, rotation_vector
 from .spectral import Spectrum, positive_definite
-from .tangents import descent_step
 
 
 def spatial_stiffness(stiffness, body, force, dimension, length):
@@ -84,7 +84,9 @@ def newton_compact(primal, body, initial, config):
         g = g[work]
         h = h[work]
         indices = indices[work]
-        step = descent_step(h, g, DEFAULT_MATERIAL.regularization)
+        step = scaled_descent(
+            h, g, dof, config.characteristic_length, DEFAULT_MATERIAL.regularization
+        )
         baseline = value(p.positions, p.radii, p.presence, x)
         slope = (g * step).sum(-1)
         waiting = torch.ones(len(indices), dtype=torch.bool, device=q.device)
@@ -167,7 +169,17 @@ def newton_masked(primal, body, initial, config):
         finite = torch.isfinite(h).all(dim=(-2, -1))
         ok &= ~pending | finite
         pending &= finite
-        step = masked_descent(h, g, pending)
+        step = scaled_descent(
+            torch.where(
+                pending[:, None, None],
+                h,
+                torch.eye(base, dtype=q.dtype, device=q.device),
+            ),
+            torch.where(pending[:, None], g, 0),
+            dof,
+            config.characteristic_length,
+            DEFAULT_MATERIAL.regularization,
+        )
         slope = (torch.where(pending[:, None], g, 0) * step).sum(-1)
         baseline = value(primal.positions, primal.radii, primal.presence, q)
         waiting = pending.clone()
@@ -202,6 +214,12 @@ def relax_equilibrium(
     batch, body, initial, config, cached=None, differentiate_stiffness=True
 ):
     """Prescribed rigid-body pose; free-node equilibrium and implicit derivative."""
+    if batch.dimension == 3:
+        from .implicit_equilibrium import relax_spatial
+
+        return relax_spatial(
+            batch, body, initial, config, cached, differentiate_stiffness
+        )
     dof = body.shape[-1]
     base = initial.shape[-1] - dof
     q = torch.cat((initial[..., :base].detach(), body.detach()), -1)
@@ -261,7 +279,7 @@ def relax_equilibrium(
                 batch.presence,
                 q.detach(),
             )
-    return q, ok, residual.detach(), counts, g, h
+    return q, ok, residual.detach(), counts, g, h, None
 
 
 @dataclass
@@ -274,6 +292,7 @@ class MotionState:
     accepted: torch.Tensor
     stiffness: torch.Tensor
     beam_nodes: torch.Tensor | None = None
+    linearization: object = None
 
 
 @dataclass
@@ -313,16 +332,34 @@ def predictor_error(result, guess, dimension, config):
 
 
 def trace_motion(
-    batch, input_trajectory, config, cached=None, differentiate_stiffness=True
+    batch,
+    input_trajectory,
+    config,
+    cached=None,
+    differentiate_stiffness=True,
+    initial_path=None,
 ):
     if "active" not in batch.roles or "passive" not in batch.roles:
         raise ValueError("Provide separate active and passive rigid bodies")
     # Binary topology is fixed throughout a path, including its derivatives.
     # Prune its edge union once; each equilibrium reuses this graph.
+    from .mechanics_work import record
+
     original_batch = batch
+    hints = (
+        [
+            None if hint is None else hint.to(batch.positions.device)
+            for hint in initial_path
+        ]
+        if initial_path is not None and cached is None
+        else None
+    )
     edge_indices = torch.nonzero((batch.presence != 0).any(dim=0)).flatten()
     batch = active_beams(batch)
     dof = input_trajectory.poses.shape[-1]
+    retain_linearization = not any(
+        t.requires_grad for t in (batch.positions, batch.radii, input_trajectory.poses)
+    )
     free = sum(r == "free" for r in batch.roles) * dof
     q = batch.positions.new_zeros(batch.size, free + 2 * dof)
     beam_state = None
@@ -336,19 +373,19 @@ def trace_motion(
         nodes, _, _ = nodal_map(batch, q)
         beam_state = initial_nodes(ref, nodes[:, batch.edges])
 
+    hint_private_valid = torch.zeros(batch.size, dtype=torch.bool, device=q.device)
+
     def solve(part, body, guess, indices, records=None, cached_interiors=None):
         if config.beam_segments == 1:
-            return (
-                *relax_equilibrium(
-                    part,
-                    body,
-                    guess,
-                    config,
-                    records,
-                    differentiate_stiffness=differentiate_stiffness,
-                ),
-                None,
+            result = relax_equilibrium(
+                part,
+                body,
+                guess,
+                config,
+                records,
+                differentiate_stiffness=differentiate_stiffness,
             )
+            return (*result[:-1], None, result[-1])
         interior = (
             beam_state[indices, :, 1:-1, :]
             if cached_interiors is None
@@ -358,15 +395,30 @@ def trace_motion(
             from .condensed_mechanics import predict_interiors
 
             current_q = torch.cat((guess[..., :-dof], body), -1)
-            interior = predict_interiors(
+            predicted_inner = predict_interiors(
                 part,
                 current_q,
                 beam_state[indices],
                 config.beam_segments,
                 DEFAULT_MATERIAL,
             )
+            interior = (
+                torch.where(
+                    hint_private_valid[indices, None, None, None],
+                    interior,
+                    predicted_inner,
+                )
+                if cached_interiors is not None
+                else predicted_inner
+            )
         return relax_condensed(
-            part, body, guess, config, interior, cached=records is not None
+            part,
+            body,
+            guess,
+            config,
+            interior,
+            cached=records is not None,
+            differentiate_stiffness=differentiate_stiffness,
         )
 
     active = torch.ones(batch.size, dtype=torch.bool, device=q.device)
@@ -409,7 +461,7 @@ def trace_motion(
                 .detach()
                 .expand(len(indices), -1)
             )
-            result, ok, _, _, _, _, local_beams = solve(
+            result, ok, _, _, _, _, local_beams, _ = solve(
                 batch.take(indices).detached(), body, q[indices], indices
             )
             evaluations += 1
@@ -448,7 +500,56 @@ def trace_motion(
         predicted = record_maps is None and config.predictor and sensitivity is not None
         if predicted:
             guess = predict_equilibrium(guess, sensitivity[indices], body)
+        continuation_guess = guess
+        hint_private_valid.zero_()
+        hint_used = torch.zeros(batch.size, dtype=torch.bool, device=q.device)
         cached_interiors = None
+        if hints is not None:
+            # Only guesses close to the child's own continuation predictor are
+            # eligible; a parent solution cannot replace Newton or preloading.
+            rows = range(batch.size)
+            full_guess = q.clone().index_copy(0, indices, guess)
+            candidate_guesses = []
+            candidate_interiors = []
+            for i in rows:
+                candidate, private = (
+                    (None, None)
+                    if hints[i] is None
+                    else hints[i].at(
+                        factor, original_batch.positions[i], original_batch.edges
+                    )
+                )
+                eligible = q.new_tensor(False, dtype=torch.bool)
+                if candidate is not None:
+                    difference = (candidate - full_guess[i]).reshape(-1, dof)
+                    eligible = (
+                        difference[:, :3].norm(dim=-1).max()
+                        <= config.path_position_tolerance
+                    ) & (
+                        difference[:, 3:].norm(dim=-1).max()
+                        <= config.path_orientation_tolerance
+                    )
+                hint_used[i] = eligible
+                candidate_guesses.append(
+                    full_guess[i]
+                    if candidate is None
+                    else torch.where(eligible, candidate, full_guess[i])
+                )
+                if beam_state is not None:
+                    fallback = q.new_zeros(
+                        len(original_batch.edges), config.beam_segments - 1, dof
+                    ).index_copy(0, edge_indices, beam_state[i, :, 1:-1, :])
+                    hint_private_valid[i] = eligible & (private is not None)
+                    candidate_interiors.append(
+                        fallback
+                        if private is None
+                        else torch.where(eligible, private, fallback)
+                    )
+            record("parent_hint_trials", len(indices))
+            record("parent_hint_used", int(hint_used[indices].sum()))
+            guess = torch.stack(candidate_guesses)[indices]
+            if candidate_interiors:
+                cached_interiors = torch.stack(candidate_interiors)[indices]
         if record_maps is not None and beam_state is not None:
             meshes = []
             for i in indices.detach().cpu().tolist():
@@ -459,13 +560,31 @@ def trace_motion(
                     ).index_copy(0, cached_edge_ids[i], compact)
                 )
             cached_interiors = torch.stack(meshes).to(q.device)
-        result, ok, residual, counts, _g, h, local_beams = solve(
+        result, ok, residual, counts, _g, h, local_beams, linearization = solve(
             part, body, guess, indices, record_maps, cached_interiors
         )
         evaluations += int(record_maps is None)
+        if hints is not None and bool(hint_used[indices].any()):
+            correction = (result - continuation_guess).reshape(len(indices), -1, dof)
+            ambiguous = (
+                correction[..., :3].norm(dim=-1).amax(-1)
+                > config.path_position_tolerance
+            ) | (
+                correction[..., 3:].norm(dim=-1).amax(-1)
+                > config.path_orientation_tolerance
+            )
+            if bool((hint_used[indices] & (~ok | ambiguous)).any()):
+                record("parent_hint_fallbacks", len(indices))
+                hint_private_valid.zero_()
+                old_counts = counts
+                result, ok, residual, counts, _g, h, local_beams, linearization = solve(
+                    part, body, continuation_guess, indices
+                )
+                counts = counts + old_counts
+                evaluations += 1
         inaccurate = False
         if predicted:
-            error = predictor_error(result, guess, batch.dimension, config)
+            error = predictor_error(result, continuation_guess, batch.dimension, config)
             inaccurate = bool(((error > 1) & ok).any())
         # Failed Newton steps are retried with smaller input-progress increments.
         # A common grid keeps batch continuation and cached replay consistent.
@@ -483,6 +602,8 @@ def trace_motion(
             continue
         indices = indices[good]
         result = result[good]
+        if linearization is not None and retain_linearization:
+            linearization = linearization.take(good)
         if local_beams is not None:
             local_beams = local_beams[good]
         h = h[good]
@@ -512,6 +633,8 @@ def trace_motion(
             continue
         indices = indices[good]
         result = result[good]
+        if linearization is not None and retain_linearization:
+            linearization = linearization.take(good)
         if record_maps is None and config.predictor:
             tangent = h[good].detach()
             local_sensitivity = -torch.linalg.solve(
@@ -545,6 +668,9 @@ def trace_motion(
                 accepted,
                 q.new_zeros(batch.size, dof).index_copy(0, indices, spectrum),
                 stored_beams,
+                None
+                if linearization is None or not retain_linearization
+                else (linearization, indices),
             )
         )
         previous = factor

@@ -235,6 +235,7 @@ function render() {
     $('labels').innerHTML = labels;
     if (window.populationRenderedFor !== data) {
     $('batchEfficiency').textContent=data.batch.present_beam_slots ? `${data.batch.evaluation_groups} lotes · ${number(100/data.batch.topology_padding_ratio)} % de las vigas calculadas se utilizan. El resto corresponde a conexiones ausentes en algunas alternativas.` : '';
+    if(data.batch.factor_cache_mb!==undefined) $('batchEfficiency').textContent+=` Caché de factorizaciones: ${number(data.batch.factor_cache_mb)} MiB. Sistemas reutilizados: ${data.batch.cached_factorizations_reused||0}.`;
     $('batchStatus').textContent = `${data.population.length} individuos · lote ${data.batch.batch_size} · ${data.batch.converged} convergentes · ${data.batch.rejected} rechazados · ${number(data.batch.seconds)} s`;
     $('population').innerHTML = data.population.map(p => {
         const points = p.positions.map(v => [Math.cos(.5)*v[0]-Math.sin(.5)*v[2],Math.cos(.3)*v[1]-Math.sin(.3)*(Math.sin(.5)*v[0]+Math.cos(.5)*v[2])]),

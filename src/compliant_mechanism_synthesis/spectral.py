@@ -66,11 +66,17 @@ class Spectrum(torch.autograd.Function):
 
 
 def positive_definite(matrix):
-    """Unpivoted LDL positivity check with O(n) device-local Schur updates.
+    """Device-local positivity: native CPU Cholesky and Intel XPU LDL pivots.
 
-    Avoid a full XPU eigensolve or a CPU-fallback Cholesky in the hot path.
-    Only positive pivots are used; an invalid matrix is rejected, not repaired.
+    The physical matrix is never regularized for this check. Unsupported XPU
+    factorizations cannot trigger a CPU fallback in the mechanics hot path.
     """
+    if matrix.device.type == "cpu":
+        finite = torch.isfinite(matrix).all((-2, -1))
+        eye = torch.eye(matrix.shape[-1], dtype=matrix.dtype, device=matrix.device)
+        safe = torch.where(finite[..., None, None], matrix.detach(), eye)
+        _, info = torch.linalg.cholesky_ex(safe, check_errors=False)
+        return finite & info.eq(0)
     a = matrix.detach().clone()
     valid = torch.isfinite(a).all(dim=(-2, -1))
     for k in range(a.shape[-1]):

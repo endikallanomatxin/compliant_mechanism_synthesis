@@ -1,6 +1,6 @@
 # Equilibrio reutilizable para síntesis no lineal 3D
 
-Estado: especificación propuesta; pendiente de revisión del usuario.
+Estado: aprobada por el usuario e implementada; resultados y límites en PERFORMANCE.md.
 
 ## Objetivo y alcance
 
@@ -18,7 +18,7 @@ Primera entrega: solver normalizado, factorizaciones nativas por dispositivo, ba
 
 - El kernel elemental produce energía, residuo y tangente; conserva la condensación exacta de interiores y los términos de curvatura de las transformaciones rígidas.
 - El solver primal obtiene equilibrio, verifica estabilidad y entrega datos separados del grafo de autograd.
-- Un contexto de sensibilidad conserva la factorización final válida y los estados privados necesarios. Su vida está limitada a una evaluación de gradiente; no se almacenan todas las factorizaciones de toda la historia evolutiva.
+- Un contexto de sensibilidad conserva la factorización final válida y los estados privados necesarios. El contexto de autograd vive durante una evaluación de gradiente. Sus factorizaciones separadas del grafo se pueden conservar para recorridos exactos de alternativas vivas, con presupuesto configurable de 256 MiB; no se almacenan todas las factorizaciones de toda la historia evolutiva.
 - El backward usa el contexto para resolver el adjunto y obtiene los productos de derivadas respecto al diseño mediante PyTorch.
 - La continuación controla rama, precisión y recuperación de fallos; la búsqueda proporciona parentesco y aproximaciones iniciales. La UI recibe resultados y diagnósticos, sin dependencia del núcleo numérico.
 

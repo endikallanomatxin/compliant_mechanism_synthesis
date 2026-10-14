@@ -10,6 +10,7 @@ import torch
 
 from .batching import DesignBatch
 from .mechanics import DEFAULT_MATERIAL, Design
+from .mechanics_work import measured
 from .nonlinear import (
     DEFAULT_CONTINUATION,
     PathResult,
@@ -52,6 +53,10 @@ class SearchConfig:
     evaluation_batch_size: int = 16
     gradient_batch_size: int = 4
     topology_batch_union_ratio: float = 2.0
+    linearization_cache_mb: float = 256.0
+    reuse_parent_paths: int = 1
+    parent_path_position_limit: float = 0.0005
+    parent_path_radius_limit: float = 0.05
     elites: int = 4
     tournament_size: int = 3
     focused_fraction: float = 0.8
@@ -108,6 +113,7 @@ class SearchConfig:
             "tournament_size",
             "gradient_backtracks",
             "adaptive_learning_rate",
+            "reuse_parent_paths",
             "gradient_steps_per_evolution",
             "offspring_gradient_steps",
         ):
@@ -168,6 +174,13 @@ class SearchConfig:
             raise ValueError("Invalid mutation probability or geometry scale")
         if self.topology_distance_scale <= 0 or self.topology_distance_power < 0:
             raise ValueError("Invalid topology distance parameters")
+        if self.linearization_cache_mb <= 0:
+            raise ValueError("Linearization cache budget must be positive")
+        if (
+            self.reuse_parent_paths not in (0, 1)
+            or min(self.parent_path_position_limit, self.parent_path_radius_limit) <= 0
+        ):
+            raise ValueError("Invalid parent path reuse settings")
         if self.topology_mutation_edits < 1 or self.topology_batch_union_ratio < 1:
             raise ValueError("Invalid topology edit budget or batch union ratio")
         if min(self.evaluation_batch_size, self.gradient_batch_size) < 1:
@@ -500,6 +513,9 @@ class Search:
         self.scores = None
         self.snapshot_cache = {}
         self.path_cache = {}
+        self.parent_paths = {}
+        self.linearization_cache = {}
+        self.linearization_cache_bytes = 0
         self.evaluated_factors = None
         self.evaluated_target = None
         self.last_diagnostics = {}
@@ -683,7 +699,15 @@ class Search:
         )
         completed = path.completed.cpu().tolist()
         records = [[] for _ in range(design.size)]
+        linearizations = [[] for _ in range(design.size)]
         for state in path.states:
+            local_linearizations = {}
+            if state.linearization is not None:
+                context, selected = state.linearization
+                for local, index in enumerate(selected.cpu().tolist()):
+                    local_linearizations[index] = context.take(
+                        torch.tensor([local], device=design.positions.device)
+                    )
             q = state.q.detach().cpu()
             factors = state.factors.cpu().tolist()
             accepted = state.accepted.cpu().tolist()
@@ -696,6 +720,7 @@ class Search:
             )
             for i, ok in enumerate(accepted):
                 if ok:
+                    linearizations[i].append(local_linearizations.get(i))
                     records[i].append(
                         (
                             factors[i],
@@ -711,6 +736,56 @@ class Search:
                     )
         for i in range(design.size):
             self.path_cache[self._path_key(cpu.item(i))] = (completed[i], records[i])
+            # Contexts use the union graph solved for this batch; keep that
+            # metadata to repack private systems on later regrouping.
+            union_ids = torch.nonzero((design.presence != 0).any(0)).flatten()
+            self.linearization_cache[self._path_key(cpu.item(i))] = (
+                union_ids,
+                linearizations[i],
+            )
+
+        self._trim_linearizations()
+
+    def _trim_linearizations(self):
+        def size(entry):
+            total = entry[0].numel() * entry[0].element_size()
+            for c in entry[1]:
+                if c is None:
+                    continue
+                tensors = [
+                    c.response,
+                    c.system.factor,
+                    c.system.valid,
+                    c.system.scale,
+                ]
+                if c.system.pivots is not None:
+                    tensors.append(c.system.pivots)
+                if c.private_system is not None:
+                    tensors.extend(
+                        [
+                            c.private_system.factor,
+                            c.private_system.valid,
+                            c.private_system.scale,
+                        ]
+                    )
+                    if c.private_system.pivots is not None:
+                        tensors.append(c.private_system.pivots)
+                tensors.extend(
+                    c.edge_map if isinstance(c.edge_map, tuple) else [c.edge_map]
+                )
+                total += sum(t.numel() * t.element_size() for t in tensors)
+            return total
+
+        sizes = {key: size(entry) for key, entry in self.linearization_cache.items()}
+        total = sum(sizes.values())
+        while (
+            total > self.config.linearization_cache_mb * 1024**2
+            and self.linearization_cache
+        ):
+            key = next(iter(self.linearization_cache))
+            del self.linearization_cache[key]
+            total -= sizes[key]
+        self.linearization_cache_bytes = total
 
     def _cached_path(self, design):
         completed, records = self.path_cache[self._path_key(design)]
@@ -785,6 +860,39 @@ class Search:
         )
         return PathResult(states, completed, message)
 
+    def _register_parent_paths(self, children, parents):
+        from .path_hint import PathHint
+
+        if not self.config.reuse_parent_paths:
+            return
+        child = self.batch_design(children).detached()
+        parent = self.batch_design(parents).detached()
+        # Transfer metadata once outside mechanics, retaining only detached parent records.
+        child_keys = self._path_keys(child)
+        parent_keys = self._path_keys(parent)
+        for i, (key, parent_key) in enumerate(
+            zip(child_keys, parent_keys, strict=True)
+        ):
+            entry = self.path_cache.get(parent_key)
+            if entry is None or not entry[0]:
+                continue
+            hint = PathHint(
+                parent.positions[i].cpu(),
+                parent.presence[i].cpu(),
+                entry[1],
+                self.continuation.beam_segments,
+                parent.radii[i].cpu(),
+            )
+            if hint.compatible(
+                child.positions[i].cpu(),
+                child.presence[i].cpu(),
+                self.continuation.beam_segments,
+                self.config.parent_path_position_limit,
+                child.radii[i].cpu(),
+                self.config.parent_path_radius_limit,
+            ):
+                self.parent_paths[key] = hint
+
     def _prune_paths(self, extra=None):
         keys = set(self._path_keys(self.batch_design(self.population)))
         if extra is not None:
@@ -792,6 +900,13 @@ class Search:
         self.path_cache = {
             key: value for key, value in self.path_cache.items() if key in keys
         }
+        self.linearization_cache = {
+            key: value for key, value in self.linearization_cache.items() if key in keys
+        }
+        self.parent_paths = {
+            key: value for key, value in self.parent_paths.items() if key in keys
+        }
+        self._trim_linearizations()
 
     def _evaluation_groups(self, population, limit):
         """Group similar binary graphs; limit union padding outside mechanics."""
@@ -833,6 +948,7 @@ class Search:
             groups.append(torch.tensor(group, dtype=torch.long, device=self.device))
         return groups
 
+    @measured
     def _score(self, population):
         chunks = []
         diagnostics = []
@@ -870,7 +986,20 @@ class Search:
     def _batch_work(diagnostics):
         slots = sum(d.get("beam_slots", 0) for d in diagnostics)
         present = sum(d.get("present_beam_slots", 0) for d in diagnostics)
+        mechanical = {
+            key: sum(d.get(key, 0) for d in diagnostics)
+            for key in (
+                "factorizations",
+                "cached_factorizations_reused",
+                "adjoint_solves",
+                "tangent_assemblies",
+                "parent_hint_trials",
+                "parent_hint_used",
+                "parent_hint_fallbacks",
+            )
+        }
         return {
+            **mechanical,
             "evaluation_groups": sum(
                 d.get("evaluation_groups", 0) for d in diagnostics
             ),
@@ -892,7 +1021,13 @@ class Search:
             differentiating = any(
                 t.requires_grad for t in (design.positions, design.radii)
             )
-            cached = [self.path_cache.get(key) for key in self._path_keys(design)]
+            design_keys = self._path_keys(design)
+            cached = [self.path_cache.get(key) for key in design_keys]
+            hints = (
+                [self.parent_paths.get(key) for key in design_keys]
+                if self.config.reuse_parent_paths
+                else []
+            )
             complete = all(entry is not None and entry[0] for entry in cached)
             aligned = complete and all(
                 tuple(r[0] for r in entry[1]) == tuple(r[0] for r in cached[0][1])
@@ -908,71 +1043,31 @@ class Search:
                     for record in entry[1]
                 )
 
-            if aligned and not differentiating:
-                # Detached cached states need no tangent or Newton evaluation.
-                from .prescribed_motion import MotionPath, MotionState
+            stored_linearizations = [
+                self.linearization_cache.get(key) for key in design_keys
+            ]
+            linearized = (
+                aligned
+                and differentiating
+                and all(
+                    entry is not None
+                    and len(entry[1]) == len(cached[i][1])
+                    and all(c is not None for c in entry[1])
+                    for i, entry in enumerate(stored_linearizations)
+                )
+            )
+            if aligned and (not differentiating or linearized):
+                from .cached_equilibrium import replay_path
 
-                records = [entry[1] for entry in cached]
-                need_mesh = self.continuation.beam_segments > 1 and (
+                path = replay_path(
+                    design,
+                    [entry[1] for entry in cached],
+                    stored_linearizations if linearized else None,
+                    self.continuation,
+                    self.input_trajectory,
+                    differentiate_stiffness,
                     self.config.collision_weight > 0
-                    or self.config.beam_length_weight > 0
-                )
-                present_ids = (
-                    [
-                        torch.nonzero(mask != 0).flatten()
-                        for mask in design.presence.detach().cpu()
-                    ]
-                    if need_mesh
-                    else []
-                )
-                cached_states = []
-                for j in range(len(records[0])):
-                    q = torch.stack([r[j][1] for r in records]).to(self.device)
-                    mesh = None
-                    if need_mesh:
-                        from .condensed_mechanics import nodal_nodes
-
-                        interior = torch.stack(
-                            [
-                                r[j][6]
-                                .new_zeros(
-                                    len(design.edges),
-                                    self.continuation.beam_segments - 1,
-                                    6,
-                                )
-                                .index_copy(0, present_ids[i], r[j][6])
-                                for i, r in enumerate(records)
-                            ]
-                        ).to(self.device)
-                        nodal = nodal_nodes(design, q)
-                        mesh = torch.cat(
-                            (
-                                nodal[:, design.edges[:, 0], None],
-                                interior,
-                                nodal[:, design.edges[:, 1], None],
-                            ),
-                            -2,
-                        )
-                    cached_states.append(
-                        MotionState(
-                            design.positions.new_tensor([r[j][0] for r in records]),
-                            q,
-                            design.positions.new_tensor([r[j][2] for r in records]),
-                            torch.tensor(
-                                [r[j][3] for r in records], device=self.device
-                            ),
-                            design.positions.new_tensor([r[j][4] for r in records]),
-                            torch.ones(
-                                design.size, dtype=torch.bool, device=self.device
-                            ),
-                            torch.stack([r[j][5] for r in records]).to(self.device),
-                            mesh,
-                        )
-                    )
-                path = MotionPath(
-                    cached_states,
-                    torch.ones(design.size, dtype=torch.bool, device=self.device),
-                    0,
+                    or self.config.beam_length_weight > 0,
                 )
             else:
                 # Binary topology excludes absent beams from design derivatives.
@@ -984,6 +1079,9 @@ class Search:
                     self.continuation,
                     cached=[entry[1] for entry in cached] if aligned else None,
                     differentiate_stiffness=differentiate_stiffness,
+                    initial_path=hints
+                    if any(hint is not None for hint in hints)
+                    else None,
                 )
                 self._store_paths(design, path)
             evaluations = path.evaluations
@@ -1207,6 +1305,8 @@ class Search:
                 or self.evaluated_rest_factor != self.input_trajectory.rest_factor
             ):
                 self.path_cache.clear()
+                self.parent_paths.clear()
+                self.linearization_cache.clear()
             scores = self._score(self.population)
             if bool(torch.isfinite(scores).any()):
                 self.population, self.scores = self._select(
@@ -1248,6 +1348,7 @@ class Search:
         local = self._mutate(
             self.population.take(parents), self.config.local_mutation_factor
         )
+        self._register_parent_paths(local, self.population.take(parents))
         self.parent_diagnostics = {
             "focused_children": focused,
             "exploratory_children": count,
@@ -1334,8 +1435,13 @@ class Search:
                     population.topology,
                 )
             )
-        return Population.concatenate(*proposals)
+        combined = Population.concatenate(*proposals)
+        self._register_parent_paths(
+            combined, Population.concatenate(*([population] * len(proposals)))
+        )
+        return combined
 
+    @measured
     def _adaptive_gradient(
         self, population=None, baseline_scores=None, phase="population"
     ):
@@ -1613,6 +1719,7 @@ class Search:
         mechanics_changed = mechanics != self.continuation
         previous = self.config
         self.config = config
+        self._trim_linearizations()
         if (
             config.learning_rate != previous.learning_rate
             or config.adaptive_learning_rate != previous.adaptive_learning_rate
@@ -1639,6 +1746,8 @@ class Search:
             )
         if mechanics_changed:
             self.path_cache.clear()
+            self.parent_paths.clear()
+            self.linearization_cache.clear()
         self.continuation = mechanics
         objective_fields = (
             "position_weight",
@@ -1828,7 +1937,10 @@ class Search:
             "geometry_diagnostics": geometry_report,
             "converged": path.converged,
             "message": path.message,
-            "batch": self.last_diagnostics,
+            "batch": dict(
+                self.last_diagnostics,
+                factor_cache_mb=self.linearization_cache_bytes / 1024**2,
+            ),
             "gradient_history": self.gradient_history,
             "current_learning_rate": self.current_learning_rate,
             "population": [

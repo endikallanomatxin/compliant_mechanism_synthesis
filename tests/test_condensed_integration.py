@@ -130,21 +130,13 @@ def test_cached_subdivision_keeps_interiors_and_skips_newton(
             scores = search._score(Population(p, r, search.population.topology))
             return scores.detach(), torch.autograd.grad(scores.sum(), (p, r))
 
-        original = condensed_mechanics.relax_condensed
-        calls = []
-
-        def checked(*args, **kwargs):
-            assert kwargs.get("cached")
-            assert args[4] is not None
-            calls.append(True)
-            result = original(*args, **kwargs)
-            assert result[3].eq(0).all()
-            return result
+        def forbidden(*args, **kwargs):
+            raise AssertionError("Exact cached gradient repeated equilibrium solve")
 
         with monkeypatch.context() as patch:
-            patch.setattr(condensed_mechanics, "relax_condensed", checked)
+            patch.setattr(condensed_mechanics, "relax_condensed", forbidden)
             cached, gc = evaluate()
-        assert calls
+        assert search.last_diagnostics["cached_factorizations_reused"] > 0
         for _, records in search.path_cache.values():
             for record in records:
                 assert record[6].shape[-2:] == (1, 6)
@@ -346,7 +338,9 @@ def test_support_gradient_guard_preserves_scores_and_derivatives(
 
         monkeypatch.setattr(optimization, "trace_motion", checked)
         fast, gfast = evaluate()
-        assert requested and all(bool(x) == (floor > 1000) for x in requested)
+        assert not requested
+        assert s.last_diagnostics["cached_factorizations_reused"] > 0
+        s.linearization_cache.clear()
 
         def full(*args, **kwargs):
             kwargs["differentiate_stiffness"] = True

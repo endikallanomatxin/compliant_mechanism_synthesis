@@ -156,6 +156,7 @@ class CondensedBeam:
     interior_response: torch.Tensor
     interior_offset: torch.Tensor
     info: torch.Tensor
+    interior_matrix: torch.Tensor
 
     def recover(self, endpoint_step):
         """Interior Newton correction after the assembled endpoint solve."""
@@ -190,6 +191,7 @@ def condense(residual, tangent, endpoint_dofs=3):
             hie,
             gi,
             torch.zeros(residual.shape[:-1], dtype=torch.int32, device=residual.device),
+            hii,
         )
     solution, info = torch.linalg.solve_ex(
         hii, torch.cat((hie, gi[..., None]), -1), check_errors=False
@@ -198,7 +200,12 @@ def condense(residual, tangent, endpoint_dofs=3):
     reduced_g = ge - (hei @ offset[..., None]).squeeze(-1)
     reduced_h = hee - hei @ response
     return CondensedBeam(
-        reduced_g, (reduced_h + reduced_h.transpose(-1, -2)) / 2, response, offset, info
+        reduced_g,
+        (reduced_h + reduced_h.transpose(-1, -2)) / 2,
+        response,
+        offset,
+        info,
+        hii,
     )
 
 
