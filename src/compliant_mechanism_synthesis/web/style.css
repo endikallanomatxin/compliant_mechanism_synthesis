@@ -139,7 +139,11 @@ dd { margin: 0; font: 13px var(--mono); font-variant-numeric: tabular-nums; }
 .candidate small { display: block; margin-top: 6px; font-size: 10px; color: var(--muted); }
 .plots { min-width: 0; }
 .plots details { border-top: 1px solid var(--border); margin: 18px 0 0; padding-top: 4px; }
-#plot { display: block; width: 100%; max-height: 340px; }
+.coordinate-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 20px; }
+.coordinate-chart { margin: 0; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 6px; }
+.coordinate-chart figcaption { font: 13px var(--mono); }
+.coordinate-chart svg { display: block; width: 100%; }
+.resolution-coordinate-plots { display: grid; gap: 24px; }
 #state { white-space: pre-line; font: 11px/1.8 var(--mono); color: #52665b; }
 .diagnostic-plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 290px), 1fr)); gap: 20px; }
 .chart-figure { margin: 0; min-width: 0; }

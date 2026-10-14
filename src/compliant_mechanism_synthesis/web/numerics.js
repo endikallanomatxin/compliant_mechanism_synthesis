@@ -42,20 +42,21 @@ window.syncNumerics = function(state) {
 };
 function drawResolution() {
     if (!resolutionReport?.converged) return;
-    const r = resolutionReport, index = Number($('coordinate').value), dim = data.dimension;
-    const multiplier = index < dim ? 1000 : 180/Math.PI;
+    const r = resolutionReport;
     const names = ['Ux','Uy','Uz','Rx','Ry','Rz'];
     $('resolutionPlot').removeAttribute('hidden');
-    numericalChart('resolutionPlot', r.samples, [
-        {label:`Actual · ${names[index]} (${index<dim?'mm':'°'})`,color:'#aa7022',values:r.coarse.map(p=>p[index]*multiplier)},
-        {label:'Doble de incrementos',color:'#23786c',values:r.fine.map(p=>p[index]*multiplier)}
-    ], 'Progreso del recorrido');
     $('resolutionErrorPlot').removeAttribute('hidden');
-    numericalChart('resolutionErrorPlot', r.samples, [
-        {label:`Diferencia · ${names[index]} (${index<dim?'mm':'°'})`,color:'#456f9b',values:r.fine.map((p,i)=>(p[index]-r.coarse[i][index])*multiplier)}
-    ], 'Progreso del recorrido');
+    names.forEach((name,index) => {
+        const multiplier = index < 3 ? 1000 : 180/Math.PI;
+        numericalChart('resolutionCoordinate'+index, r.samples, [
+            {label:'Actual',color:'#aa7022',values:r.coarse.map(p=>p[index]*multiplier)},
+            {label:r.coarse_model==='linear'?'No lineal':'Recorrido refinado',color:'#23786c',values:r.fine.map(p=>p[index]*multiplier)}
+        ], 'Progreso del recorrido');
+        numericalChart('resolutionDifference'+index, r.samples, [
+            {label:`Diferencia · ${name} (${index<3?'mm':'°'})`,color:'#456f9b',values:r.fine.map((p,i)=>(p[index]-r.coarse[i][index])*multiplier)}
+        ], 'Progreso del recorrido');
+    });
 }
-$('coordinate').addEventListener('input', drawResolution);
 $('checkResolution').onclick = async () => {
     if (busy || !data) return;
     running = false;

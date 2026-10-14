@@ -54,7 +54,7 @@ class SearchConfig:
     target_rotation: float = 0.12
     target_z: float = 0.004
     target_rx: float = 0.08
-    learning_rate: float = 0.02
+    learning_rate: float = 0.1
     adaptive_learning_rate: int = 1
     gradient_monotonic_target: float = 0.9
     learning_rate_adaptation: float = 1.0
@@ -79,7 +79,7 @@ class SearchConfig:
     parent_pool_fraction: float = 0.25
     local_mutation_factor: float = 0.5
     crossover_probability: float = 0.8
-    mutation_scale: float = 0.08
+    mutation_scale: float = 0.2
     geometry_mutation_probability: float = 0.8
     radius_mutation_probability: float = 0.8
     geometry_scale: float = 0.01

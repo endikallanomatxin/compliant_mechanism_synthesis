@@ -92,11 +92,6 @@ async function action(path, body) {
         window.syncSpecification?.(data);
         $('frame').max = data.states.length ? Math.round(data.states.at(-1).factor*1000) : 0;
         $('frame').value = $('frame').max;
-        const names = ['Ux', 'Uy', 'Uz', 'Rx', 'Ry', 'Rz'];
-        if ($('coordinate').options.length !== names.length) {
-            $('coordinate').innerHTML = names.map((v, i) => `<option value="${i}">${v}</option>`).join('');
-            $('coordinate').value = '1';
-        }
         if (automaticScale) fitDeformation();
         window.syncLiveSearch?.(data);
         window.syncNumerics?.(data);
@@ -157,7 +152,8 @@ function render() {
 
         $('poseComparison').textContent = '';
         $('orientationCompare').innerHTML = '';
-        $('plot').innerHTML = '';
+        document.querySelectorAll('#coordinatePlots svg').forEach(svg=>svg.replaceChildren());
+        coordinatePlotsFor=null;
         drawTrajectoryOverview(null);
         return;
     }
@@ -270,20 +266,30 @@ function render() {
     drawTrajectoryOverview(state);
 }
 
+let coordinatePlotsFor = null;
+let coordinatePlotScales = [];
 function plot(state, names) {
-    const index = Number($('coordinate').value),
-        multiplier = index < data.dimension ? 1000 : 180 / Math.PI,
-        unit = index < data.dimension ? 'mm' : '°';
-    const values = data.states.map(s => s.output[index]),
-        target = data.target[index],
-        targets = data.target_path.map(s => s.output[index]);
-    const minimum = Math.min(0, ...values, ...targets),
-        maximum = Math.max(0, ...values, ...targets),
-        range = Math.max(maximum - minimum, 1e-8);
-    const xy = (factor, v) => [50 + factor * 550, 170 - (v - minimum) / range * 130];
-    const line = (a, b, color, width = 1) => `<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="${color}" stroke-width="${width}"/>`;
-    const selected = xy(state.factor, state.output[index]);
-    $('plot').innerHTML = `<text x="50" y="20" fill="#6b756f" font-size="12">${names[index]} (${unit}) · ${number(minimum*multiplier)} a ${number(maximum*multiplier)}</text>${line(xy(0,0),xy(1,0),'#cfd6d0')}<polyline points="${data.target_path.map(s=>xy(s.factor,s.output[index]).join(',')).join(' ')}" fill="none" stroke="#8b629b" stroke-width="2"/><polyline points="${data.states.map(s=>xy(s.factor,s.output[index]).join(',')).join(' ')}" fill="none" stroke="#23786c" stroke-width="2"/><circle cx="${selected[0]}" cy="${selected[1]}" r="4" fill="#23786c"/><text x="50" y="205" fill="#23786c" font-size="12">Real</text><text x="100" y="205" fill="#8b629b" font-size="12">Objetivo</text><text x="450" y="205" fill="#6b756f" font-size="12">Progreso del recorrido →</text>`;
+    if (coordinatePlotsFor !== data) {
+        coordinatePlotScales = names.map((name, index) => {
+            const multiplier = index < 3 ? 1000 : 180 / Math.PI;
+            const values = data.states.map(s => s.output[index]);
+            const targets = data.target_path.map(s => s.output[index]);
+            const minimum = Math.min(0, ...values, ...targets);
+            const maximum = Math.max(0, ...values, ...targets);
+            const range = Math.max(maximum - minimum, 1e-8);
+            const xy = (factor, value) => [50 + factor * 550, 170 - (value - minimum) / range * 130];
+            const zero = xy(0, 0)[1];
+            const svg = $('coordinatePlot' + index);
+            svg.innerHTML = `<text x="50" y="24" fill="#6b756f" font-size="16">${number(minimum*multiplier)} a ${number(maximum*multiplier)}</text><line x1="50" y1="${zero}" x2="600" y2="${zero}" stroke="#cfd6d0"/><polyline points="${data.target_path.map(s=>xy(s.factor,s.output[index]).join(',')).join(' ')}" fill="none" stroke="#8b629b" stroke-width="2" stroke-dasharray="6 4"/><polyline points="${data.states.map(s=>xy(s.factor,s.output[index]).join(',')).join(' ')}" fill="none" stroke="#23786c" stroke-width="2"/><line class="coordinate-progress" y1="40" y2="170" stroke="#bac5be" stroke-dasharray="3 4"/><circle class="coordinate-marker" r="5" fill="#23786c"/><text x="50" y="205" fill="#23786c" font-size="16">Real</text><text x="110" y="205" fill="#8b629b" font-size="16">Objetivo</text><text x="390" y="205" fill="#6b756f" font-size="16">Progreso 0 → 1</text>`;
+            return {xy, marker:svg.querySelector('.coordinate-marker'), progress:svg.querySelector('.coordinate-progress')};
+        });
+        coordinatePlotsFor = data;
+    }
+    coordinatePlotScales.forEach(({xy, marker, progress}, index) => {
+        const [x,y] = xy(state.factor, state.output[index]);
+        marker.setAttribute('cx',x); marker.setAttribute('cy',y);
+        progress.setAttribute('x1',x); progress.setAttribute('x2',x);
+    });
 }
 $('gradient').onclick = () => action('/api/step', {
     method: 'gradient'
@@ -316,7 +322,7 @@ function animatePlayback(time){
     requestAnimationFrame(animatePlayback);
 }
 requestAnimationFrame(animatePlayback);
-for (const id of ['frame', 'frames', 'trajectories', 'coordinate', 'compare', 'targetBody']) $(id).oninput = render;
+for (const id of ['frame', 'frames', 'trajectories', 'compare', 'targetBody']) $(id).oninput = render;
 $('scale').oninput = () => {
     automaticScale = false;
     render();

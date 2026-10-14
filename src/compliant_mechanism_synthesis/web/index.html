@@ -412,14 +412,15 @@
          <h3>
           Por coordenada
          </h3>
-         <label>
-          Componente
-          <select aria-label="Coordenada del sólido" id="coordinate">
-          </select>
-         </label>
         </div>
-        <svg aria-label="Comparación de trayectorias" id="plot" viewbox="0 0 650 220">
-        </svg>
+        <div class="coordinate-grid" id="coordinatePlots">
+         <figure class="coordinate-chart"><figcaption>Ux (mm)</figcaption><svg id="coordinatePlot0" aria-label="Ux: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Uy (mm)</figcaption><svg id="coordinatePlot1" aria-label="Uy: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Uz (mm)</figcaption><svg id="coordinatePlot2" aria-label="Uz: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Rx (°)</figcaption><svg id="coordinatePlot3" aria-label="Rx: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Ry (°)</figcaption><svg id="coordinatePlot4" aria-label="Ry: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Rz (°)</figcaption><svg id="coordinatePlot5" aria-label="Rz: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+        </div>
         <details>
          <summary>
           Estado y diagnóstico
@@ -535,11 +536,23 @@
        <p class="note" id="resolutionSummary" role="status">
         Comprueba la estructura seleccionada sin cambiar la búsqueda.
        </p>
-       <div class="diagnostic-plots">
-        <svg aria-label="Trayectoria actual y trayectoria con el doble de incrementos" hidden="" id="resolutionPlot" viewbox="0 0 650 220">
-        </svg>
-        <svg aria-label="Diferencia de trayectoria al duplicar los incrementos" hidden="" id="resolutionErrorPlot" viewbox="0 0 650 220">
-        </svg>
+       <div class="resolution-coordinate-plots">
+        <div class="coordinate-grid" id="resolutionPlot" hidden>
+         <figure class="coordinate-chart"><figcaption>Ux (mm)</figcaption><svg id="resolutionCoordinate0" aria-label="Ux: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Uy (mm)</figcaption><svg id="resolutionCoordinate1" aria-label="Uy: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Uz (mm)</figcaption><svg id="resolutionCoordinate2" aria-label="Uz: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Rx (°)</figcaption><svg id="resolutionCoordinate3" aria-label="Rx: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Ry (°)</figcaption><svg id="resolutionCoordinate4" aria-label="Ry: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Rz (°)</figcaption><svg id="resolutionCoordinate5" aria-label="Rz: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+        </div>
+        <div class="coordinate-grid" id="resolutionErrorPlot" hidden>
+         <figure class="coordinate-chart"><figcaption>Ux (mm)</figcaption><svg id="resolutionDifference0" aria-label="Ux: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Uy (mm)</figcaption><svg id="resolutionDifference1" aria-label="Uy: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Uz (mm)</figcaption><svg id="resolutionDifference2" aria-label="Uz: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Rx (°)</figcaption><svg id="resolutionDifference3" aria-label="Rx: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Ry (°)</figcaption><svg id="resolutionDifference4" aria-label="Ry: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+         <figure class="coordinate-chart"><figcaption>Rz (°)</figcaption><svg id="resolutionDifference5" aria-label="Rz: comparación de recorridos" role="img" viewBox="0 0 650 220"></svg></figure>
+        </div>
        </div>
        <p class="note">
         Newton equilibra el sólido pasivo y los nodos libres con el activo en su pose prescrita. Refinar la entrada comprueba la resolución del recorrido no lineal. La comparación mide el cambio de trayectoria y de coste de seguimiento al refinar; usa interpolación lineal de los estados calculados. Valora los errores en mm y grados según tu precisión requerida. Una sola comparación no garantiza convergencia ni detecta todas las ramas de equilibrio.
