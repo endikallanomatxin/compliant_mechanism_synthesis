@@ -37,6 +37,15 @@ class SearchConfig:
     fidelity_check_candidates: int = 2
     linear_motion_loss_target: float = 0.02
     fidelity_pose_error_limit: float = 0.1
+    adaptive_beam_resolution: int = 1
+    mesh_max_segments: int = 4
+    mesh_check_interval: int = 10
+    mesh_min_iterations: int = 5
+    mesh_stagnation_iterations: int = 5
+    mesh_max_iterations: int = 20
+    mesh_motion_loss_target: float = 0.05
+    mesh_position_tolerance: float = 0.0001
+    mesh_orientation_tolerance: float = 0.002
     initial_neighbours: int = 4
     input_y: float = 0.003
     input_rotation: float = 0.0
@@ -115,6 +124,12 @@ class SearchConfig:
             "linear_stagnation_iterations",
             "fidelity_check_interval",
             "fidelity_check_candidates",
+            "adaptive_beam_resolution",
+            "mesh_max_segments",
+            "mesh_check_interval",
+            "mesh_min_iterations",
+            "mesh_stagnation_iterations",
+            "mesh_max_iterations",
             "initial_neighbours",
             "collision_subdivisions",
             "collision_path_substeps",
@@ -143,6 +158,24 @@ class SearchConfig:
             or min(self.linear_motion_loss_target, self.fidelity_pose_error_limit) <= 0
         ):
             raise ValueError("Invalid analysis fidelity settings")
+        if (
+            self.adaptive_beam_resolution not in (0, 1)
+            or min(
+                self.mesh_max_segments,
+                self.mesh_check_interval,
+                self.mesh_min_iterations,
+                self.mesh_stagnation_iterations,
+            )
+            < 1
+            or self.mesh_max_iterations < self.mesh_min_iterations
+            or min(
+                self.mesh_motion_loss_target,
+                self.mesh_position_tolerance,
+                self.mesh_orientation_tolerance,
+            )
+            <= 0
+        ):
+            raise ValueError("Invalid spatial refinement settings")
         if self.gradient_steps_per_evolution < 0 or self.offspring_gradient_steps < 1:
             raise ValueError("Invalid hybrid cycle counts")
         if (
@@ -538,6 +571,9 @@ class Search:
         self.snapshot_cache = {}
         self.analysis_level = "linear" if config.staged_analysis else "nonlinear"
         self.fidelity_report = {}
+        self.mesh_report = {}
+        self.mesh_level_iteration = 0
+        self.mesh_last_check_iteration = 0
         self.linear_best_motion = float("inf")
         self.linear_motion_stagnation = 0
         self.motion_scores = {}
@@ -1702,6 +1738,8 @@ class Search:
                 reason = "model_discrepancy"
         if reason is not None:
             self.analysis_level = "nonlinear"
+            self.mesh_level_iteration = self.iteration
+            self.mesh_last_check_iteration = self.iteration
             self.continuation = replace(self.continuation, beam_segments=1)
             self.path_cache.clear()
             self.linearization_cache.clear()
@@ -1718,6 +1756,93 @@ class Search:
                 self._store_paths(design, path)
             self.ensure_evaluated()
             self.writer.add_scalar("fidelity/nonlinear", 1, self.iteration)
+
+    def _refine_beams(self):
+        c = self.config
+        age = self.iteration - self.mesh_level_iteration
+        if (
+            self.analysis_level != "nonlinear"
+            or not c.adaptive_beam_resolution
+            or self.continuation.beam_segments >= c.mesh_max_segments
+            or age < c.mesh_min_iterations
+            or self.iteration - self.mesh_last_check_iteration < c.mesh_check_interval
+        ):
+            return
+        keys = self._path_keys(self.batch_design(self.population))
+        motion = min(
+            (self.motion_scores.get(key, float("inf")) for key in keys),
+            default=float("inf"),
+        )
+        if (
+            motion > c.mesh_motion_loss_target
+            and self.stagnation < c.mesh_stagnation_iterations
+            and age < c.mesh_max_iterations
+        ):
+            return
+        from .fidelity import diverse_candidates, mesh_pose_error
+
+        self.mesh_last_check_iteration = self.iteration
+        old = self.continuation.beam_segments
+        new = min(old * 2, c.mesh_max_segments)
+        config = replace(self.continuation, beam_segments=new)
+        ids = torch.tensor(diverse_candidates(self, keys), device=self.device)
+        design = self.batch_design(self.population.take(ids)).detached()
+        started = time.perf_counter()
+        fine = trace_motion(design, self.input_trajectory, config)
+        completed = fine.completed.cpu().tolist()
+        errors, failures, coarse_failures = [], 0, 0
+        for local, index in enumerate(ids.cpu().tolist()):
+            if not completed[local]:
+                failures += 1
+                continue
+            coarse = self.path_cache.get(keys[index])
+            if coarse is None or not coarse[0]:
+                coarse_failures += 1
+                continue
+            error = mesh_pose_error(coarse[1], fine.states, local)
+            if error is None:
+                failures += 1
+            else:
+                errors.append(error)
+        position = max((e[0] for e in errors), default=None)
+        orientation = max((e[1] for e in errors), default=None)
+        promote = coarse_failures > 0 or any(
+            p > c.mesh_position_tolerance or r > c.mesh_orientation_tolerance
+            for p, r, _ in errors
+        )
+        # Failed fine solves alone do not demonstrate a discretization error.
+        self.mesh_report = {
+            "checked_iteration": self.iteration,
+            "coarse_segments": old,
+            "fine_segments": new,
+            "candidates": len(ids),
+            "fine_failures": failures,
+            "coarse_failures": coarse_failures,
+            "position_error": position,
+            "orientation_error": orientation,
+            "common_samples": min((e[2] for e in errors), default=0),
+            "seconds": time.perf_counter() - started,
+            "promoted": promote,
+        }
+        for name in ("position_error", "orientation_error", "seconds", "fine_failures"):
+            value = self.mesh_report[name]
+            if value is not None:
+                self.writer.add_scalar("mesh/" + name, value, self.iteration)
+        self.snapshot_cache.clear()
+        if not promote:
+            return
+        self.continuation = config
+        self.path_cache.clear()
+        self.linearization_cache.clear()
+        self.parent_paths.clear()
+        self.motion_scores.clear()
+        self.scores = None
+        self.stagnation = 0
+        self.current_learning_rate = c.learning_rate
+        self.mesh_level_iteration = self.iteration
+        self._store_paths(design, fine)
+        self.ensure_evaluated()
+        self.writer.add_scalar("mesh/segments", new, self.iteration)
 
     def step(self, method):
         scheduled = method == "hybrid"
@@ -1846,6 +1971,7 @@ class Search:
                 self.iteration,
             )
         self._advance_fidelity()
+        self._refine_beams()
         self.writer.flush()
         return self.snapshot()
 
@@ -1902,6 +2028,9 @@ class Search:
                 self.population, self.scores, config.population
             )
         if mechanics_changed:
+            self.mesh_level_iteration = self.iteration
+            self.mesh_last_check_iteration = self.iteration
+            self.mesh_report = {}
             self.path_cache.clear()
             self.parent_paths.clear()
             self.linearization_cache.clear()
@@ -1963,6 +2092,9 @@ class Search:
         if trajectory.poses.shape[1] != len(self.target):
             raise ValueError("Incorrect active pose dimension")
         self.input_trajectory = trajectory
+        self.mesh_report = {}
+        self.mesh_level_iteration = self.iteration
+        self.mesh_last_check_iteration = self.iteration
         self.scores = None
 
     def snapshot(self, index=0):
@@ -2051,6 +2183,7 @@ class Search:
             "trajectory_validated": self.analysis_level == "nonlinear"
             and path.converged,
             "fidelity": dict(self.fidelity_report),
+            "mesh_refinement": dict(self.mesh_report),
             "dimension": design.dimension,
             "device": self.device,
             "device_timings": self.device_timings,

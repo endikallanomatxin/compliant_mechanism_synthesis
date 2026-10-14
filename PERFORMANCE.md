@@ -328,3 +328,5 @@ uv run python -m compliant_mechanism_synthesis.search_benchmark --device cpu --p
 ```
 
 Each result records `analysis_level`; a run that transitioned during timing cannot be interpreted as a purely linear cycle. The benchmark defaults to non-staged analysis to keep previous nonlinear measurements comparable.
+
+Automatic spatial checks are bounded by the configured number of alternatives, use one mechanics batch and have a minimum dwell time and check interval. They do not subdivide all candidates every iteration. The selected candidates' finer equilibria are reused when a mesh change reevaluates the population. Check wall time is recorded in `mesh/seconds` and `mesh_refinement.seconds`; this excludes the subsequent full-population reevaluation. More segments increase the physical model cost and may reveal failure to continue a path that completed on the coarse model. No speedup over fixed single-segment nonlinear synthesis is claimed for this feature.

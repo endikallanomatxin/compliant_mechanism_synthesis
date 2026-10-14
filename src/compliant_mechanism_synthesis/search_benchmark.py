@@ -23,6 +23,7 @@ class BenchmarkConfig:
     warmups: int = 1
     steps: int = DEFAULT_CONTINUATION.steps
     staged_analysis: int = 0
+    adaptive_beam_resolution: int = 0
     beam_segments: int = DEFAULT_CONTINUATION.beam_segments
     gradient_steps: int = 1
     gradient_backtracks: int = 1
@@ -42,6 +43,7 @@ def run(config):
             SearchConfig(
                 device=config.device,
                 staged_analysis=config.staged_analysis,
+                adaptive_beam_resolution=config.adaptive_beam_resolution,
                 population=config.population,
                 elites=config.elites,
                 gradient_steps_per_evolution=config.gradient_steps,
